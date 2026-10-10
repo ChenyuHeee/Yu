@@ -9,7 +9,7 @@
 mod common;
 
 use common::{agent, journal_in, tempdir};
-use yu_journal::{EffectGuard, EffectLog, EventBody, Journal};
+use yu_journal::{EffectGuard, EffectLog, EventBody, Journal, EffectState};
 use yu_observe::AgentId;
 
 /// One attempt at an effect-bearing tool call, the way a live loop makes it:
@@ -34,6 +34,8 @@ async fn attempt(
             EventBody::Effect {
                 key: guard.key().to_owned(),
                 description: "charge the customer".into(),
+                state: EffectState::Done { result_seq: None },
+                tool_use_id: None,
             },
         )
         .await
@@ -118,6 +120,8 @@ async fn a_second_begin_on_a_committed_key_returns_none() {
             EventBody::Effect {
                 key: "send:msg-1".into(),
                 description: "send the message".into(),
+                state: EffectState::Done { result_seq: None },
+                tool_use_id: None,
             },
         )
         .await
@@ -156,4 +160,100 @@ async fn an_abandoned_effect_stays_uncommitted_and_is_retried() {
     assert!(attempt(&journal, &mut log, &mut runs, key, "ok").await);
     assert_eq!(runs, 1);
     assert!(!attempt(&journal, &mut log, &mut runs, key, "ok").await);
+}
+
+/// A replay seed built from the record must not mistake an interrupted effect
+/// for a finished one.
+///
+/// The window this discipline exists to cover is between "recorded the intent"
+/// and "did the thing". A seed that commits everything it sees treats an effect
+/// caught in that window as complete, skips it on replay, and says nothing —
+/// so the one failure the mechanism was built to catch is the one it hides.
+#[tokio::test]
+async fn an_interrupted_effect_is_not_treated_as_done() {
+    let dir = tempdir();
+    let journal = journal_in(dir.path(), "replay").await;
+
+    // Recorded the intent, performed the effect, recorded that it finished.
+    journal
+        .append(
+            agent(),
+            EventBody::Effect {
+                key: "charge-the-card".into(),
+                description: "take payment".into(),
+                state: EffectState::Intended,
+                tool_use_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            agent(),
+            EventBody::Effect {
+                key: "charge-the-card".into(),
+                description: "take payment".into(),
+                state: EffectState::Done { result_seq: None },
+                tool_use_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Recorded the intent and was interrupted before the act.
+    journal
+        .append(
+            agent(),
+            EventBody::Effect {
+                key: "send-the-email".into(),
+                description: "notify the customer".into(),
+                state: EffectState::Intended,
+                tool_use_id: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let events = journal.events().await.unwrap();
+    let seed = EffectLog::from_events(&events);
+
+    assert!(
+        seed.is_committed("charge-the-card"),
+        "a completed effect is skipped on replay"
+    );
+    assert!(
+        !seed.is_committed("send-the-email"),
+        "an effect that was only intended must not be skipped — nobody knows \
+         whether it happened"
+    );
+}
+
+#[tokio::test]
+async fn an_abandoned_effect_is_retryable() {
+    let dir = tempdir();
+    let journal = journal_in(dir.path(), "replay").await;
+    journal
+        .append(
+            agent(),
+            EventBody::Effect {
+                key: "rotate-the-key".into(),
+                description: "deliberately not performed".into(),
+                state: EffectState::Abandoned,
+                tool_use_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    let seed = EffectLog::from_events(&journal.events().await.unwrap());
+    assert!(
+        !seed.is_committed("rotate-the-key"),
+        "an effect that never happened may be attempted again"
+    );
+}
+
+#[test]
+fn only_done_may_be_skipped() {
+    assert!(EffectState::Done { result_seq: None }.may_skip());
+    assert!(!EffectState::Intended.may_skip());
+    assert!(!EffectState::Abandoned.may_skip());
 }

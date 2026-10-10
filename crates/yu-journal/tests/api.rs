@@ -11,7 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{agent, tempdir};
-use yu_journal::{ThinkingRecord, 
+use yu_journal::{EffectState, ThinkingRecord, 
     BlobStore, EffectGuard, EffectLog, Event, EventBody, Journal, JournalError, JournalIndex,
     SessionId,
 };
@@ -91,6 +91,8 @@ async fn events_and_the_journal_have_the_documented_shape() {
         EventBody::Effect {
             key: "charge:invoice-1".to_owned(),
             description: "charge the card".to_owned(),
+            state: EffectState::Done { result_seq: None },
+            tool_use_id: None,
         },
     ];
     for body in &bodies {

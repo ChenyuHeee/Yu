@@ -39,6 +39,29 @@ impl EffectLog {
     }
 
     /// Every committed key, in order.
+    /// Rebuild the committed set from a recorded branch.
+    ///
+    /// Only `Done` effects commit. An `Intended` effect is the ambiguous case —
+    /// the intent is recorded and the act is not — and treating it as complete
+    /// is exactly how an interrupted side effect vanishes from a replay while
+    /// looking finished. `Abandoned` does not commit either: the effect did not
+    /// happen, so a replay is free to try again.
+    ///
+    /// This is the seed a replay starts from, and getting it wrong is silent in
+    /// the worst way: the run continues, the effect is skipped, and nothing
+    /// anywhere says that a step was passed over.
+    pub fn from_events(events: &[crate::Event]) -> Self {
+        let mut log = Self::new();
+        for event in events {
+            if let crate::EventBody::Effect { key, state, .. } = &event.body
+                && state.may_skip()
+            {
+                log.commit(key.clone());
+            }
+        }
+        log
+    }
+
     pub fn committed(&self) -> Vec<String> {
         self.committed.iter().cloned().collect()
     }

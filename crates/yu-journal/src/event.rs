@@ -13,6 +13,34 @@ use yu_observe::{AgentId, TokenUsage};
 use crate::JournalError;
 use crate::blob::BlobStore;
 
+/// How far a recorded side effect got.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectState {
+    /// Recorded before performing. If the record ends here, the effect was
+    /// interrupted in the one window this discipline exists for — and the
+    /// correct reading is *unknown*, not *done*.
+    Intended,
+    /// Completed, with the seq of whatever it produced if that was recorded.
+    Done {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_seq: Option<u64>,
+    },
+    /// Deliberately not performed. Distinct from `Intended`, which is ambiguous.
+    Abandoned,
+}
+
+impl EffectState {
+    /// Whether a replay may skip this effect's side effect.
+    ///
+    /// Only `Done` may be skipped. `Intended` must not be: it is the ambiguous
+    /// case, and treating it as complete is how an interrupted effect vanishes
+    /// from a replay while looking finished.
+    pub fn may_skip(&self) -> bool {
+        matches!(self, EffectState::Done { .. })
+    }
+}
+
 /// One thinking block, its text and its signature held apart.
 ///
 /// CONSTRAINT 4, corrected. The first version of this stored the *signature*
@@ -163,7 +191,24 @@ pub enum EventBody {
     /// L3 "先记后做" (record before acting): the intent is in the record before
     /// the side effect happens, so a replay of this branch reads the recorded
     /// result instead of performing the effect again.
-    Effect { key: String, description: String },
+    /// A side effect, recorded before it happens ("先记后做").
+    ///
+    /// Carries its **state**, because an event's existence alone cannot say
+    /// whether the effect happened. The window this discipline exists to cover
+    /// is precisely the one between recording the intent and performing the act,
+    /// so a record that cannot distinguish "about to" from "did" makes the one
+    /// failure it was built to catch indistinguishable from success — and a
+    /// replay seed built from it would treat an interrupted effect as finished
+    /// and skip it silently.
+    Effect {
+        key: String,
+        description: String,
+        state: EffectState,
+        /// The tool call this effect was performed for, when there was one, so
+        /// the intent and its result can be tied together.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
+    },
 }
 
 impl EventBody {
@@ -338,12 +383,16 @@ impl PartialEq for EventBody {
                 EventBody::Effect {
                     key: k1,
                     description: d1,
+                    state: s1,
+                    tool_use_id: t1,
                 },
                 EventBody::Effect {
                     key: k2,
                     description: d2,
+                    state: s2,
+                    tool_use_id: t2,
                 },
-            ) => k1 == k2 && d1 == d2,
+            ) => k1 == k2 && d1 == d2 && s1 == s2 && t1 == t2,
             _ => false,
         }
     }
@@ -431,6 +480,8 @@ mod tests {
             EventBody::Effect {
                 key: "k".into(),
                 description: "d".into(),
+                state: EffectState::Intended,
+                tool_use_id: None,
             },
         ];
         for body in bodies {

@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use yu_journal::{EventBody, Journal};
-use yu_observe::{ContextComposition, ShapeSignal, TokenUsage};
+use yu_observe::{ContextComposition, ShapeSignal, SpanKind, Timeline, TokenUsage};
 use yu_wire::client::WireClient;
 use yu_wire::types::{CustomTool, ToolDefinition};
 
@@ -424,7 +424,7 @@ pub async fn run_delegation(
     client: Arc<WireClient>,
     journal: Arc<Journal>,
     tools: Arc<yu_tools::ToolRegistry>,
-    timeline: Arc<yu_observe::Timeline>,
+    timeline: Arc<Timeline>,
     cwd: PathBuf,
 ) -> Result<DelegateOutcome, crate::agent::LoopError> {
     // DESIGN: "验证用 fresh" — the executor starts clean. It is given the task
@@ -445,8 +445,21 @@ pub async fn run_delegation(
 
     let config = AgentConfig::new(yu_observe::AgentId::new("executor"), client.default_model())
         .max_steps(16);
+    // DESIGN lists `spawn` among the spans, and topology is meant to be chosen at
+    // run time on the strength of derivation being cheap. Neither claim is
+    // checkable while the span is never emitted: there was no way to see that a
+    // derivation had happened at all, let alone what it cost.
+    let spawn = timeline
+        .start(SpanKind::Spawn)
+        .label(format!("delegate:{}", args.question.is_some()));
     let mut agent = Agent::new(client, journal.clone(), tools, timeline, config, cwd);
-    let run = agent.run(&task).await?;
+    let run = agent.run(&task).await;
+    let spawned = spawn
+        .attr("task_chars", task.len() as i64)
+        .attr("ok", run.is_ok())
+        .finish();
+    tracing::debug!(elapsed_ms = spawned.elapsed_ms(), "spawn");
+    let run = run?;
     outcome_from_run(&run, &journal, args.expected_files.as_deref())
         .await
         .map_err(crate::agent::LoopError::Journal)
