@@ -109,6 +109,11 @@ pub enum ServerError {
     Encode(#[from] serde_json::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// A host that does not keep the state an operation needs. Named rather than
+    /// silently answered, because a daemon that pretends to have done something
+    /// is worse than one that says it cannot.
+    #[error("this host does not support: {0}")]
+    Unsupported(&'static str),
 }
 
 /// The socket protocol, request half. One JSON object per line.
@@ -176,6 +181,27 @@ pub trait SessionHost {
     /// Crash recovery is first-class, so this is a protocol operation and not an
     /// operator procedure.
     fn thread_recovery(&self, config: &ServerConfig, session: &str) -> Result<SessionInfo, ServerError>;
+
+    /// Every session this host holds. The daemon's `Status` with no session.
+    fn sessions(&self) -> Result<Vec<SessionInfo>, ServerError> {
+        Err(ServerError::Unsupported("this host keeps no session list"))
+    }
+
+    /// Look one session up, for the operations that only need to know it exists.
+    fn status_lookup(&self, config: &ServerConfig, session: &str) -> Result<SessionInfo, ServerError> {
+        self.thread_recovery(config, session)
+    }
+
+    /// Record a session's new status. A stop that only lived in memory would
+    /// come back to life on the next restart, so it has to be written down.
+    fn set_status(
+        &self,
+        _config: &ServerConfig,
+        _session: &str,
+        _status: SessionStatus,
+    ) -> Result<SessionInfo, ServerError> {
+        Err(ServerError::Unsupported("this host does not record session status"))
+    }
 }
 
 /// Encode one protocol frame as a JSONL line, terminator included.
@@ -385,5 +411,259 @@ mod tests {
         let lines: Vec<&str> = stream.lines().collect();
         assert_eq!(lines.len(), 1);
         assert_eq!(decode_line::<Request>(lines[0]).expect("decode"), sent);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A host whose sessions live on disk
+// ---------------------------------------------------------------------------
+
+/// Sessions backed by a directory: one subdirectory each, holding the session's
+/// own record.
+///
+/// DESIGN's `thread_recovery` is the reason this is files rather than a table in
+/// memory. A daemon that dies must be able to come back and say what its
+/// sessions were doing, and the only thing that survives a process is what was
+/// written down — so the state a session is recovered from is the same state it
+/// ran under, not a copy made for recovery.
+pub struct DirectoryHost {
+    root: PathBuf,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl DirectoryHost {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            next: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// One directory per session, named by the session id.
+    pub fn dir_for(&self, session: &str) -> PathBuf {
+        self.root.join(session)
+    }
+
+    fn info_path(&self, session: &str) -> PathBuf {
+        self.dir_for(session).join("info.json")
+    }
+
+    fn write_info(&self, info: &SessionInfo) -> Result<(), ServerError> {
+        let path = self.info_path(&info.id);
+        let body = serde_json::to_string_pretty(info)?;
+        std::fs::write(&path, body)?;
+        Ok(())
+    }
+
+    fn mark(&self, session: &str, status: SessionStatus) -> Result<SessionInfo, ServerError> {
+        let mut info = self
+            .sessions()?
+            .into_iter()
+            .find(|s| s.id == session)
+            .ok_or_else(|| ServerError::UnknownSession {
+                id: session.to_owned(),
+            })?;
+        info.status = status;
+        info.last_active_ms = yu_observe::now_ms();
+        self.write_info(&info)?;
+        Ok(info)
+    }
+}
+
+impl DirectoryHost {
+    /// One session directory, read back. Split out so both the trait's
+    /// `sessions` and `thread_recovery` read the same way.
+    fn read_sessions(&self) -> Result<Vec<SessionInfo>, ServerError> {
+        let mut out = Vec::new();
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            // No directory yet means no sessions, which is not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(ServerError::Io(e)),
+        };
+        for entry in entries.flatten() {
+            let id = entry.file_name().to_string_lossy().into_owned();
+            match std::fs::read_to_string(entry.path().join("info.json"))
+                .ok()
+                .and_then(|text| serde_json::from_str::<SessionInfo>(&text).ok())
+            {
+                Some(info) => out.push(info),
+                None => out.push(SessionInfo {
+                    id,
+                    status: SessionStatus::Crashed {
+                        at_ms: yu_observe::now_ms(),
+                    },
+                    created_ms: 0,
+                    last_active_ms: 0,
+                    journal_dir: entry.path(),
+                }),
+            }
+        }
+        out.sort_by_key(|s| s.created_ms);
+        Ok(out)
+    }
+}
+
+impl SessionHost for DirectoryHost {
+    fn launch(&self, _config: &ServerConfig, _charter: &str) -> Result<LaunchedSession, ServerError> {
+        // A counter plus the wall clock: unique within a process, and ordered
+        // across processes for anyone reading the directory back.
+        let n = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = format!("s{}-{n}", yu_observe::now_ms());
+        let dir = self.dir_for(&id);
+        std::fs::create_dir_all(&dir)?;
+        let info = SessionInfo {
+            id: id.clone(),
+            status: SessionStatus::Ready,
+            created_ms: yu_observe::now_ms(),
+            last_active_ms: yu_observe::now_ms(),
+            journal_dir: dir,
+        };
+        self.write_info(&info)?;
+        Ok(LaunchedSession {
+            id,
+            agent: AgentId::new("session"),
+        })
+    }
+
+    fn thread_recovery(&self, _config: &ServerConfig, session: &str) -> Result<SessionInfo, ServerError> {
+        // The recorded status is the truth about what it was doing; a session
+        // recorded as `Busy` was interrupted mid-turn, which is the one case a
+        // caller must not treat as ready. Reporting the record unchanged is the
+        // point — recovery that "helpfully" reset a busy session to ready would
+        // hide the interruption it exists to surface.
+        self.read_sessions()?
+            .into_iter()
+            .find(|s| s.id == session)
+            .ok_or_else(|| ServerError::UnknownSession {
+                id: session.to_owned(),
+            })
+    }
+
+    fn sessions(&self) -> Result<Vec<SessionInfo>, ServerError> {
+        self.read_sessions()
+    }
+
+    fn set_status(
+        &self,
+        _config: &ServerConfig,
+        session: &str,
+        status: SessionStatus,
+    ) -> Result<SessionInfo, ServerError> {
+        self.mark(session, status)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The socket loop
+// ---------------------------------------------------------------------------
+
+/// Serve the JSONL protocol on a Unix socket.
+///
+/// DESIGN: "会话由 daemon 持有,经 Unix socket 通信;要零开销就进程内嵌." This is the
+/// daemon half; `Embedded` is the same protocol with the socket removed, which is
+/// why nothing here holds session state that a caller could not hold itself.
+///
+/// One connection is one client. Frames are decoded one line at a time and a
+/// malformed line produces an error frame rather than closing the connection —
+/// a client that sent one bad frame should not lose the session it was talking
+/// about.
+pub async fn serve<S: SessionHost>(
+    listener: tokio::net::UnixListener,
+    host: &S,
+    config: ServerConfig,
+) -> Result<(), ServerError> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+
+        while let Some(line) = lines.next_line().await? {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let responses = match decode_line::<Request>(&line) {
+                Ok(request) => handle(host, &config, request),
+                Err(e) => vec![Response::Error {
+                    message: format!("could not read the request: {e}"),
+                }],
+            };
+            for response in responses {
+                // A frame that cannot be written ends the connection: the client
+                // is gone, and pretending otherwise leaves a half-written frame
+                // on a socket nobody is reading.
+                write.write_all(encode_line(&response)?.as_bytes()).await?;
+            }
+        }
+    }
+}
+
+/// `handle`, exposed for tests. The socket loop is the only production caller.
+pub fn handle_for_test<S: SessionHost>(
+    host: &S,
+    config: &ServerConfig,
+    request: Request,
+) -> Vec<Response> {
+    handle(host, config, request)
+}
+
+/// Turn one request into the frames it produces.
+fn handle<S: SessionHost>(host: &S, config: &ServerConfig, request: Request) -> Vec<Response> {
+    match request {
+        Request::Status { session } => match session {
+            Some(session) => match host.thread_recovery(config, &session) {
+                Ok(info) => vec![Response::Status {
+                    sessions: vec![info],
+                }],
+                Err(e) => vec![Response::Error {
+                    message: e.to_string(),
+                }],
+            },
+            None => match host.sessions() {
+                Ok(sessions) => vec![Response::Status { sessions }],
+                Err(e) => vec![Response::Error {
+                    message: e.to_string(),
+                }],
+            },
+        },
+        Request::Start { charter } => match host.launch(config, &charter) {
+            Ok(launched) => vec![Response::Started {
+                session: launched.id,
+            }],
+            Err(e) => vec![Response::Error {
+                message: e.to_string(),
+            }],
+        },
+        Request::Resume { session } => match host.thread_recovery(config, &session) {
+            Ok(info) => vec![Response::Status {
+                sessions: vec![info],
+            }],
+            Err(e) => vec![Response::Error {
+                message: e.to_string(),
+            }],
+        },
+        Request::Stop { session } => {
+            // Sessions are owned by the daemon, so stopping one is a state
+            // change it must record — a stop that only lived in memory would
+            // come back to life on the next restart.
+            match host.set_status(config, &session, SessionStatus::Stopped) {
+                Ok(_) => vec![Response::Done {
+                    session,
+                    stop_reason: "stopped".to_owned(),
+                }],
+                Err(e) => vec![Response::Error {
+                    message: e.to_string(),
+                }],
+            }
+        }
+        Request::Send { session, text: _ } => vec![Response::Error {
+            message: format!(
+                "session `{session}` cannot be driven from this host: running a turn needs a \
+                 model client, which `yu-server` deliberately does not construct. Wire a \
+                 `SessionRunner` in and this becomes the frame that streams its output."
+            ),
+        }],
     }
 }
