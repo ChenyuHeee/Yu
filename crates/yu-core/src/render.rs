@@ -75,6 +75,15 @@ pub struct Charter {
     /// execution layer.
     pub acceptance: Vec<String>,
     pub human_words: Vec<HumanUtterance>,
+    /// The shape the work is to take, when one was declared.
+    ///
+    /// L0 rather than a field on the loop, because DESIGN's constraint 0 puts
+    /// topology among the things that come from an external resource, and its
+    /// derived principle 3 puts constraints *injected* rather than remembered.
+    /// A topology the layer is told each round is a constraint; one compiled
+    /// into the loop is a structure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<crate::topology::TopologySpec>,
 }
 
 impl Charter {
@@ -636,6 +645,18 @@ fn render_l0(charter: &Charter) -> String {
             out.push_str(&format!("- ({}) {}\n", u.source, u.text));
         }
     }
+    if let Some(topology) = &charter.topology {
+        out.push_str(&format!(
+            "\n## Declared topology: {}\n",
+            topology.kind.as_str()
+        ));
+        if let Some(role) = &topology.child_role {
+            out.push_str(&format!("Derived agents take the role: {role}\n"));
+        }
+        for (key, value) in &topology.params {
+            out.push_str(&format!("- {key} = {value}\n"));
+        }
+    }
     out
 }
 
@@ -756,6 +777,7 @@ mod tests {
                 text: "just make it work, but don't touch release".into(),
                 source: "terminal".into(),
             }],
+            topology: None,
         }
     }
 

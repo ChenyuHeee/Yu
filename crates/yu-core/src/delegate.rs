@@ -465,6 +465,28 @@ pub async fn run_delegation(
         .map_err(crate::agent::LoopError::Journal)
 }
 
+/// Fixtures for tests that exercise what gets derived rather than what comes
+/// back. Gated on `cfg(test)` so it cannot become a production shortcut.
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use super::*;
+
+    pub fn outcome_for(task: &str) -> DelegateOutcome {
+        DelegateOutcome {
+            report: format!("did: {task}"),
+            evidence: Vec::new(),
+            shape: Vec::new(),
+            omitted: Vec::new(),
+            steps: 1,
+            tool_calls: 0,
+            usage: TokenUsage::default(),
+            completed: true,
+            executor_composition: ContextComposition::default(),
+            report_address: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

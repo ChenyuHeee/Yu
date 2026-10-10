@@ -17,8 +17,10 @@ pub mod decision;
 pub mod delegate;
 pub mod gate;
 pub mod render;
+pub mod topology;
 pub mod traits;
 
 pub use decision::{DecisionConfig, DecisionLayer, DecisionOutcome};
 pub use delegate::{DelegateArgs, DelegateOutcome};
 pub use render::{render, Charter, Ledger, NotLoaded, RenderInput, View};
+pub use topology::{Derivation, TopologyKind, TopologySpec};
