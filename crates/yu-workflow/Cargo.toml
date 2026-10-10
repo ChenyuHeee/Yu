@@ -1,0 +1,20 @@
+[package]
+name = "yu-workflow"
+description = "Generation change (换代), workbench, human interaction."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+yu-core = { workspace = true }
+yu-journal = { workspace = true }
+yu-observe = { workspace = true }
+yu-tools = { workspace = true }
+yu-wire = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

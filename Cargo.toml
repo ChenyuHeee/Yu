@@ -1,0 +1,63 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+description = "Yu — an agent harness built around a decision layer."
+
+[workspace.dependencies]
+# ---- internal -------------------------------------------------------------
+# Dependency direction is one-way and enforced by review, not by the compiler:
+#   cli -> workflow -> core -> {wire, journal, tools, observe}
+#   server wraps core;  policy injects into core's traits.
+# `observe` is a leaf so that the wire layer can time itself.
+yu-wire = { path = "crates/yu-wire" }
+yu-journal = { path = "crates/yu-journal" }
+yu-core = { path = "crates/yu-core" }
+yu-tools = { path = "crates/yu-tools" }
+yu-policy = { path = "crates/yu-policy" }
+yu-observe = { path = "crates/yu-observe" }
+yu-server = { path = "crates/yu-server" }
+yu-workflow = { path = "crates/yu-workflow" }
+yu-cli = { path = "crates/yu-cli" }
+
+# ---- external -------------------------------------------------------------
+anyhow = "1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "sync",
+    "time",
+    "fs",
+    "io-util",
+    "process",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+# DESIGN's process model claims per-step overhead is the thing to kill. Keep
+# release builds honest about inlining so measurements mean something.
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+# Profiles are the only lever here; strategy/behaviour lives in yu-policy.

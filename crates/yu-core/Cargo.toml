@@ -1,0 +1,25 @@
+[package]
+name = "yu-core"
+description = "Loop, agent lifecycle, render(), topology, scheduling, cancellation, parallel gate."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+yu-journal = { workspace = true }
+yu-observe = { workspace = true }
+yu-tools = { workspace = true }
+yu-wire = { workspace = true }
+futures-util = { workspace = true }
+hex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

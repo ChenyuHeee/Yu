@@ -1,0 +1,1 @@
+{"error":{"message":"Failed to deserialize the JSON body into the target type: tools[0]: unknown variant `bash_20250124`, expected `web_search_20250305` or `web_search_20260209` at line 1 column 94 (request_id: 28c13699-22d5-4d57-b958-b84294704c72)","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}

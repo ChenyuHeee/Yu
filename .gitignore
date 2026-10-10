@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+.DS_Store
+
+# Probe scratch: measured capability output. The scripts are checked in (they are
+# the provenance for docs/WIRE-FACTS.md); their raw captures are not.
+/.probe/out/
+
+# Local run artifacts: journals, blobs, session state.
+/.yu/

@@ -1,0 +1,4 @@
+{"model":"deepseek-flash[1m]","max_tokens":60,"tools":[{"name":"get_time","description":"Return the current time in a named timezone.","input_schema":{"type":"object","properties":{"tz":{"type":"string"}},"required":["tz"]}}],"messages":[
+    {"role":"user","content":"What time is it in Tokyo? Use the tool."},
+    {"role":"assistant","content":[{"type":"tool_use","id":"call_00_ZZZZzzzz1111AAAA9999","name":"get_time","input":{"tz":"Asia/Tokyo"}}]},
+    {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_00_ZZZZzzzz1111AAAA9999","content":"14:32 JST"}]}]}
