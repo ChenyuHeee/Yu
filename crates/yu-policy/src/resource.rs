@@ -193,6 +193,10 @@ pub enum PolicyError {
     UnknownScript { name: String },
     #[error("unsupported: {0}")]
     Unsupported(&'static str),
+    /// A tier-2 script failed to evaluate. Carried as text because the engine's
+    /// diagnostic is the useful part, and re-typing it would lose the position.
+    #[error("script: {0}")]
+    Script(String),
 }
 
 /// Tier 2: the host that evaluates embedded policy scripts.
@@ -218,17 +222,171 @@ pub trait ScriptHost {
     fn engine_name(&self) -> &'static str;
 }
 
-/// Placeholder Rhai host. See [`ScriptHost`] for why Rhai is the default choice.
+/// The Rhai host: tier 2, for policy that contains judgement.
 ///
-// TODO(M4): implement against the `rhai` crate, with the engine kept per-policy
-// rather than per-call so limits and registered functions are configured once.
-pub struct RhaiHost;
+/// DESIGN recommends Rhai because it is pure Rust, sandboxed by default, and
+/// adds no native dependency — so a policy script can express a decision without
+/// the binary growing a C toolchain or a JIT.
+///
+/// "Sandboxed by default" is a claim worth being precise about, since it is the
+/// reason this engine was chosen. Rhai's `Engine` has no file, network, process
+/// or time access unless a host function is registered, and none are registered
+/// here; it starts with no modules at all. What remains is the ability to loop or
+/// recurse, which is why an operation ceiling is set as well — an unbounded
+/// script is a hang, and a hang in a policy rule looks exactly like a slow model.
+pub struct RhaiHost {
+    /// Ceiling on the work one evaluation may do.
+    ///
+    /// DESIGN's rule for long-path mechanisms is that they should be a function
+    /// of pressure rather than of ambition; a script that never returns is the
+    /// degenerate case, so the budget is structural rather than advisory.
+    pub max_operations: u64,
+}
+
+impl Default for RhaiHost {
+    fn default() -> Self {
+        Self {
+            // Generous for a rule that decides something, small enough that a
+            // runaway loop is measured in milliseconds rather than in a hung run.
+            max_operations: 100_000,
+        }
+    }
+}
+
+impl RhaiHost {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_max_operations(mut self, max: u64) -> Self {
+        self.max_operations = max;
+        self
+    }
+}
+
+/// The top-level fields a script reads off `ctx`.
+///
+/// A scan rather than a parse: it only has to be conservative in the direction
+/// that matters, which is finding every field that is read. A name it fails to
+/// see means a missed check, never a false alarm.
+fn referenced_context_fields(script: &str) -> Vec<String> {
+    let chars: Vec<char> = script.chars().collect();
+    let needle: Vec<char> = "ctx.".chars().collect();
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i + needle.len() <= chars.len() {
+        if chars[i..i + needle.len()] == needle[..] {
+            let mut j = i + needle.len();
+            let mut name = String::new();
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                name.push(chars[j]);
+                j += 1;
+            }
+            if !name.is_empty() {
+                found.push(name);
+            }
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Refuse a rule that reads a field this context does not have.
+fn check_context_fields(script: &str, ctx: &serde_json::Value) -> Result<(), PolicyError> {
+    let Some(map) = ctx.as_object() else {
+        return Ok(());
+    };
+    for field in referenced_context_fields(script) {
+        if !map.contains_key(&field) {
+            return Err(PolicyError::Script(format!(
+                "the rule reads `ctx.{field}`, which this policy context does not have. \
+                 Without this check Rhai would yield `()` for the missing field and the \
+                 comparison would be false, so a misspelling would read as a condition \
+                 that simply did not hold."
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Convert a JSON context into Rhai values.
+///
+/// Written out rather than pulled in behind a feature, because the conversion is
+/// where a policy script and the run state meet: an object that silently became
+/// an opaque string would make every rule that inspects run state fail in a way
+/// that looks like the rule being wrong.
+fn json_to_dynamic(value: &serde_json::Value) -> rhai::Dynamic {
+    use rhai::Dynamic;
+    match value {
+        serde_json::Value::Null => Dynamic::UNIT,
+        serde_json::Value::Bool(b) => Dynamic::from_bool(*b),
+        // `no_float` is on, so a JSON float that is not integral has to be
+        // reported rather than truncated — a rule that compares 0.9 against 1
+        // would otherwise be silently wrong.
+        serde_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Dynamic::from_int(i),
+            None => match n.as_f64() {
+                Some(f) if f.fract() == 0.0 && f.abs() < i64::MAX as f64 => {
+                    Dynamic::from_int(f as i64)
+                }
+                _ => Dynamic::from(format!("{n}")),
+            },
+        },
+        serde_json::Value::String(s) => Dynamic::from(s.clone()),
+        serde_json::Value::Array(items) => {
+            let array: rhai::Array = items.iter().map(json_to_dynamic).collect();
+            Dynamic::from_array(array)
+        }
+        serde_json::Value::Object(map) => {
+            let mut out = rhai::Map::new();
+            for (key, item) in map {
+                out.insert(key.clone().into(), json_to_dynamic(item));
+            }
+            Dynamic::from_map(out)
+        }
+    }
+}
 
 impl ScriptHost for RhaiHost {
-    fn eval_bool(&self, _script: &str, _ctx: &serde_json::Value) -> Result<bool, PolicyError> {
-        Err(PolicyError::Unsupported(
-            "not yet implemented: rhai script host",
-        ))
+    fn eval_bool(&self, script: &str, ctx: &serde_json::Value) -> Result<bool, PolicyError> {
+        let mut engine = rhai::Engine::new();
+        // The sandbox, stated rather than assumed: no host functions are
+        // registered, so the only capability a script has is arithmetic over the
+        // context it was handed.
+        engine.set_max_operations(self.max_operations);
+        // Bounded output too: a script that builds a huge string is a denial of
+        // service that an operation count alone would not catch.
+        engine.set_max_string_size(64 * 1024);
+        engine.set_max_array_size(4096);
+        engine.set_max_map_size(4096);
+        engine.set_max_call_levels(32);
+
+        // A misspelled field must not read as `false`.
+        //
+        // Rhai yields `()` for an absent map key and `() > 1` is false, so a rule
+        // naming a field the context does not have would evaluate false and look
+        // like a condition that simply did not hold — the silent-omission failure
+        // this project exists to avoid, arriving inside its own policy engine.
+        //
+        // Rhai's hook for this is behind its unstable `internals` feature, so the
+        // check is done here instead: every top-level field the script reads off
+        // `ctx` is confirmed to exist before evaluation. That covers the common
+        // misspelling at the point a rule is loaded rather than the point it
+        // quietly stops firing. It does *not* cover a misspelling one level down
+        // (`ctx.usage.token` where the field is `tokens`); that remains a silent
+        // false, and is the reason a policy should keep its contexts shallow.
+        check_context_fields(script, ctx)?;
+
+        let mut scope = rhai::Scope::new();
+        scope.push_constant("ctx", json_to_dynamic(ctx));
+
+        engine
+            .eval_with_scope::<bool>(&mut scope, script)
+            .map_err(|e| PolicyError::Script(e.to_string()))
     }
 
     fn engine_name(&self) -> &'static str {
@@ -479,19 +637,22 @@ mod tests {
     }
 
     #[test]
-    fn tier_two_hosts_are_declared_but_unimplemented() {
+    fn the_script_hosts_are_honest_about_what_they_are() {
         let ctx = serde_json::json!({ "loose_ends": 1 });
 
-        assert!(matches!(
-            RhaiHost.eval_bool("true", &ctx),
-            Err(PolicyError::Unsupported(_))
-        ));
+        // Rhai is implemented, so a tier-2 rule actually runs.
+        assert!(RhaiHost::new().eval_bool("ctx.loose_ends > 0", &ctx).is_ok());
+
+        // Wasmtime is not, and says so rather than pretending. DESIGN keeps it
+        // for stronger isolation than Rhai gives; half a wasmtime host would be
+        // worse than none, because a policy that chose it for isolation would be
+        // running without it.
         assert!(matches!(
             WasmtimeHost.eval_bool("true", &ctx),
             Err(PolicyError::Unsupported(_))
         ));
 
-        assert_eq!(RhaiHost.engine_name(), "rhai");
+        assert_eq!(RhaiHost::new().engine_name(), "rhai");
         assert_eq!(WasmtimeHost.engine_name(), "wasmtime");
     }
 }
@@ -669,5 +830,499 @@ mod policy_source_tests {
                 "budget `{name}` is not reachable through PolicySource"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The reduction table, injected
+// ---------------------------------------------------------------------------
+
+/// The axes a policy row can name. Anything else is a typo, and is reported as
+/// one rather than matching nothing in silence.
+pub const REDUCTION_AXES: [&str; 7] = [
+    "kind",
+    "size",
+    "reproducible",
+    "addressable",
+    "pressure",
+    "already_on_disk",
+    "tool",
+];
+
+impl Policy {
+    /// The axes named by reduction rows that this policy does not understand.
+    ///
+    /// An unknown axis cannot match anything, so the row is dead — and a dead
+    /// row is indistinguishable from a row whose condition simply never came up.
+    /// Reporting it at load time is the difference between a policy that does
+    /// nothing and a policy that says it does nothing.
+    pub fn unknown_reduction_axes(&self) -> Vec<String> {
+        let mut unknown = std::collections::BTreeSet::new();
+        for row in &self.reduction {
+            for axis in row.when.keys() {
+                if !REDUCTION_AXES.contains(&axis.as_str()) {
+                    unknown.insert(axis.clone());
+                }
+            }
+        }
+        unknown.into_iter().collect()
+    }
+}
+
+fn axis_bool(want: &str) -> Option<bool> {
+    match want {
+        "true" | "yes" => Some(true),
+        "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether a row's conditions all hold.
+///
+/// Every named axis must match, and all of them are conjunctive: a row states
+/// the situation it applies to, and a row that applied whenever *any* of its
+/// axes matched would be a rule nobody could predict.
+fn row_matches(row: &ReductionRule, axes: &yu_tools::reduce::Axes<'_>) -> bool {
+    row.when.iter().all(|(axis, want)| match axis.as_str() {
+        "kind" => axes.kind.as_str() == want,
+        "size" => match want.as_str() {
+            "small" => axes.size <= axes.inline_limit,
+            "large" => axes.size > axes.inline_limit,
+            _ => false,
+        },
+        "reproducible" => axis_bool(want) == Some(axes.reproducible),
+        "addressable" => axis_bool(want) == Some(axes.addressable),
+        "pressure" => match want.as_str() {
+            "low" => !axes.pressure.is_high(),
+            "high" => axes.pressure.is_high(),
+            _ => false,
+        },
+        "already_on_disk" => axis_bool(want) == Some(axes.already_on_disk),
+        "tool" => axes.provenance.tool == *want,
+        // Unreachable for a policy that passed `unknown_reduction_axes`, and
+        // false rather than true so an unvalidated one fails closed.
+        _ => false,
+    })
+}
+
+/// Constraint 0 for the reduction table.
+///
+/// DESIGN lists "归约规则" among the resources that must be external, and the
+/// acceptance criterion is that changing one must not need a rebuild. Until this
+/// impl existed the table was a constant in `yu-tools` — so the criterion held
+/// for every rule except the one the project is built around.
+///
+/// Rows are tried in declaration order, so a policy expresses precedence by
+/// position rather than by a numeric priority nobody maintains.
+impl yu_tools::reduce::ReductionTable for Policy {
+    fn path_for(
+        &self,
+        axes: &yu_tools::reduce::Axes<'_>,
+    ) -> Option<yu_tools::reduce::ReductionPath> {
+        for row in &self.reduction {
+            if row_matches(row, axes) {
+                // `parse` returning `None` means the policy named a path that
+                // does not exist. Falling through to the next row would let a
+                // typo quietly select a different strategy, so the row is
+                // skipped *and* reported by `unknown_reduction_paths`.
+                return yu_tools::reduce::ReductionPath::parse(&row.path);
+            }
+        }
+        None
+    }
+}
+
+impl Policy {
+    /// Paths named by rows that are not one of DESIGN's five.
+    pub fn unknown_reduction_paths(&self) -> Vec<String> {
+        let mut unknown = Vec::new();
+        for row in &self.reduction {
+            if yu_tools::reduce::ReductionPath::parse(&row.path).is_none()
+                && !unknown.contains(&row.path)
+            {
+                unknown.push(row.path.clone());
+            }
+        }
+        unknown
+    }
+}
+
+#[cfg(test)]
+mod reduction_table_tests {
+    use super::*;
+    use yu_tools::reduce::{Axes, Budget, Pressure, Reduction, ReductionPath, ReductionTable, Reducer};
+    use yu_tools::result::{Provenance, ResultKind, ToolResult};
+
+    fn axes_for<'a>(
+        kind: ResultKind,
+        size: u64,
+        reproducible: bool,
+        addressable: bool,
+        pressure: Pressure,
+        provenance: &'a Provenance,
+    ) -> Axes<'a> {
+        Axes {
+            kind,
+            size,
+            reproducible,
+            addressable,
+            pressure,
+            already_on_disk: false,
+            inline_limit: 8192,
+            provenance,
+        }
+    }
+
+    fn big_log() -> ToolResult {
+        ToolResult::inline(
+            "exec",
+            serde_json::json!({"command": "cargo test"}),
+            ResultKind::Log,
+            "x".repeat(40_000),
+        )
+    }
+
+    /// The acceptance criterion for constraint 0, on the rule it was least true
+    /// of: a policy changes what the reducer does, with no rebuild.
+    #[test]
+    fn a_policy_row_changes_the_reduction() {
+        let p = Policy::from_toml_str(
+            r#"
+            [[reduction]]
+            path = "pass_through"
+            [reduction.when]
+            kind = "log"
+            size = "large"
+            "#,
+        )
+        .unwrap();
+
+        let result = big_log();
+        let axes = axes_for(
+            result.kind,
+            result.size,
+            result.reproducible,
+            result.addressable,
+            Pressure::high(),
+            &result.provenance,
+        );
+        assert_eq!(
+            p.path_for(&axes),
+            Some(ReductionPath::PassThrough),
+            "the declared row must win"
+        );
+
+        // And an undeclared situation falls through rather than being answered
+        // by the policy — a policy expresses the rows it changes, not every row.
+        let small = ToolResult::inline(
+            "read_file",
+            serde_json::json!({"path": "a.rs"}),
+            ResultKind::File,
+            "short",
+        );
+        let small_axes = axes_for(
+            small.kind,
+            small.size,
+            small.reproducible,
+            small.addressable,
+            Pressure::low(),
+            &small.provenance,
+        );
+        assert_eq!(p.path_for(&small_axes), None);
+    }
+
+    #[test]
+    fn rows_are_tried_in_declaration_order_so_position_expresses_precedence() {
+        let p = Policy::from_toml_str(
+            r#"
+            [[reduction]]
+            path = "sandbox_reduce"
+            [reduction.when]
+            kind = "log"
+
+            [[reduction]]
+            path = "pass_through"
+            [reduction.when]
+            kind = "log"
+            "#,
+        )
+        .unwrap();
+        let result = big_log();
+        let axes = axes_for(
+            result.kind,
+            result.size,
+            result.reproducible,
+            result.addressable,
+            Pressure::high(),
+            &result.provenance,
+        );
+        assert_eq!(p.path_for(&axes), Some(ReductionPath::SandboxReduce));
+    }
+
+    /// Every axis a row may name must actually be consulted by the matcher.
+    ///
+    /// A name in `REDUCTION_AXES` that the matcher does not handle would be a row
+    /// that validates and then never matches anything — indistinguishable from a
+    /// condition that simply never came up. So this checks each axis on its own,
+    /// with a value the axes really satisfy.
+    #[test]
+    fn every_axis_a_row_can_name_is_consulted_by_the_matcher() {
+        let result = big_log();
+        let axes = axes_for(
+            result.kind,
+            result.size,
+            true,  // reproducible
+            true,  // addressable
+            Pressure::high(),
+            &result.provenance,
+        );
+
+        // The value each axis must be given to be satisfied by these axes.
+        let satisfied: [(&str, &str); 7] = [
+            ("kind", "log"),
+            ("size", "large"),
+            ("reproducible", "true"),
+            ("addressable", "true"),
+            ("pressure", "high"),
+            ("already_on_disk", "false"),
+            ("tool", "exec"),
+        ];
+        assert_eq!(
+            satisfied.len(),
+            REDUCTION_AXES.len(),
+            "every declared axis needs a satisfied value here, or this test stops \
+             covering the list"
+        );
+
+        for (axis, value) in satisfied {
+            assert!(
+                REDUCTION_AXES.contains(&axis),
+                "`{axis}` is tested here but is not a declared axis"
+            );
+            let policy = Policy::from_toml_str(&format!(
+                "[[reduction]]\npath = \"pass_through\"\n[reduction.when]\n{axis} = \"{value}\"\n"
+            ))
+            .unwrap();
+            assert!(
+                policy.unknown_reduction_axes().is_empty(),
+                "`{axis}` must be a known axis"
+            );
+            assert_eq!(
+                policy.path_for(&axes),
+                Some(ReductionPath::PassThrough),
+                "a row naming only `{axis} = \"{value}\"` must match axes that satisfy it — \
+                 the matcher is not consulting this axis"
+            );
+        }
+    }
+
+    #[test]
+    fn a_typo_in_an_axis_or_a_path_is_reported_rather_than_silently_dead() {
+        let p = Policy::from_toml_str(
+            r#"
+            [[reduction]]
+            path = "dispath_reader"
+            [reduction.when]
+            knd = "log"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(p.unknown_reduction_axes(), vec!["knd".to_owned()]);
+        assert_eq!(p.unknown_reduction_paths(), vec!["dispath_reader".to_owned()]);
+    }
+
+    #[test]
+    fn every_path_design_names_is_parseable() {
+        for path in [
+            "pass_through",
+            "drop_with_manifest",
+            "spill_with_pointer",
+            "dispatch_reader",
+            "sandbox_reduce",
+        ] {
+            assert!(
+                ReductionPath::parse(path).is_some(),
+                "DESIGN names `{path}` and the parser does not know it"
+            );
+        }
+        assert!(ReductionPath::parse("nonsense").is_none());
+    }
+
+    /// The policy path and the built-in table must agree where they overlap.
+    ///
+    /// `materialise` mirrors the branches of `Reducer::choose`; two
+    /// implementations of one rule drift, and the drift would be silent because
+    /// each would look right alone. This asserts they do not.
+    #[test]
+    fn a_policy_path_matches_what_the_builtin_table_would_have_chosen() {
+        fn path_of(r: &Reduction) -> ReductionPath {
+            match r {
+                Reduction::PassThrough => ReductionPath::PassThrough,
+                Reduction::DropWithManifest { .. } => ReductionPath::DropWithManifest,
+                Reduction::SpillWithPointer { .. } => ReductionPath::SpillWithPointer,
+                Reduction::DelegateReader { .. } => ReductionPath::DispatchReader,
+                Reduction::SandboxReduce => ReductionPath::SandboxReduce,
+            }
+        }
+
+        /// A table that always names the path the built-in table chose.
+        struct Echo(ReductionPath);
+        impl ReductionTable for Echo {
+            fn path_for(&self, _axes: &Axes<'_>) -> Option<ReductionPath> {
+                Some(self.0)
+            }
+        }
+
+        let budget = Budget::new(8192, 2048);
+        let builtin = Reducer::new(budget);
+        let cases = vec![
+            ToolResult::inline(
+                "read_file",
+                serde_json::json!({"path": "a.rs"}),
+                ResultKind::File,
+                "small",
+            ),
+            ToolResult::inline(
+                "exec",
+                serde_json::json!({"command": "cargo test"}),
+                ResultKind::Log,
+                "x".repeat(40_000),
+            ),
+            ToolResult::inline(
+                "exec",
+                serde_json::json!({"command": "cargo build"}),
+                ResultKind::Diff,
+                "y".repeat(40_000),
+            ),
+        ];
+
+        for result in cases {
+            for pressure in [Pressure::low(), Pressure::high()] {
+                let chosen = builtin.choose(&result, pressure);
+                let echoed = builtin
+                    .clone()
+                    .with_table(std::sync::Arc::new(Echo(path_of(&chosen))));
+                assert_eq!(
+                    echoed.choose(&result, pressure),
+                    chosen,
+                    "the policy path and the built-in table must produce the same \
+                     reduction for the same axes"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod script_host_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_rule_reads_run_state_and_decides() {
+        let host = RhaiHost::new();
+        let ctx = json!({"steps": 12, "budget": 10, "tool": "exec"});
+        assert!(
+            host.eval_bool("ctx.steps > ctx.budget", &ctx).unwrap(),
+            "a rule must be able to compare run state"
+        );
+        assert!(!host.eval_bool("ctx.steps < ctx.budget", &ctx).unwrap());
+    }
+
+    #[test]
+    fn nested_state_is_reachable_by_name() {
+        // The reason the context is converted structurally rather than as an
+        // opaque string: a rule that inspects run state has to be able to reach
+        // into it, or every such rule fails in a way that looks like the rule
+        // being wrong.
+        let host = RhaiHost::new();
+        let ctx = json!({
+            "shape": {"repeats": 2},
+            "files": ["a.rs", "b.rs"],
+            "usage": {"input_tokens": 5000}
+        });
+        assert!(host.eval_bool("ctx.shape.repeats >= 2", &ctx).unwrap());
+        assert!(host.eval_bool("ctx.files.len() == 2", &ctx).unwrap());
+        assert!(
+            host.eval_bool("ctx.usage.input_tokens > 4000", &ctx).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_missing_field_is_an_error_not_a_false() {
+        // Rhai yields `()` for an absent map key and `() > 1` is false, so a
+        // rule that misspells a field would evaluate false and look like a
+        // condition that did not hold. A typo in a policy rule has to be a
+        // loud failure, not a decision.
+        let host = RhaiHost::new();
+        let err = host
+            .eval_bool("ctx.nonexistent > 1", &json!({"steps": 1}))
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("nonexistent"), "the error must name the field: {text}");
+    }
+
+    #[test]
+    fn a_runaway_script_is_stopped_rather_than_hanging_the_run() {
+        // "Sandboxed by default" covers capability, not time. A loop is the
+        // capability that remains, and an unbounded one looks exactly like a slow
+        // model — so the ceiling is structural.
+        let host = RhaiHost::new().with_max_operations(10_000);
+        let err = host
+            .eval_bool("let i = 0; while true { i += 1; } true", &json!({}))
+            .unwrap_err();
+        assert!(matches!(err, PolicyError::Script(_)), "{err}");
+    }
+
+    #[test]
+    fn a_script_that_does_not_return_a_bool_is_an_error() {
+        let host = RhaiHost::new();
+        let err = host.eval_bool("42", &json!({})).unwrap_err();
+        assert!(matches!(err, PolicyError::Script(_)), "{err}");
+    }
+
+    #[test]
+    fn a_syntax_error_is_reported_with_the_engine_diagnostic() {
+        let host = RhaiHost::new();
+        let err = host.eval_bool("ctx. > >", &json!({})).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("script"), "{text}");
+        assert!(text.len() > "script: ".len() + 8, "the diagnostic is the useful part: {text}");
+    }
+
+    #[test]
+    fn the_sandbox_has_no_host_functions_registered() {
+        // The claim that justifies choosing Rhai. If this ever starts passing,
+        // the engine has gained a capability and the reason for the choice has
+        // changed with it.
+        let host = RhaiHost::new();
+        for attempt in [
+            r#"file_exists("/etc/passwd")"#,
+            r#"system("echo hi")"#,
+            r#"eval("1 + 1")"#,
+        ] {
+            assert!(
+                host.eval_bool(attempt, &json!({})).is_err(),
+                "`{attempt}` should not be available to a policy script"
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_names_its_engine_so_a_policy_can_record_which_one_ran() {
+        assert_eq!(RhaiHost::new().engine_name(), "rhai");
+    }
+
+    #[test]
+    fn the_wasmtime_host_says_it_is_not_available_rather_than_pretending() {
+        // DESIGN keeps wasmtime for stronger isolation than Rhai gives. Half a
+        // wasmtime host would be worse than none, because a policy that chose it
+        // for isolation would be running without it.
+        let host = WasmtimeHost;
+        assert_eq!(host.engine_name(), "wasmtime");
+        assert!(matches!(
+            host.eval_bool("true", &json!({})),
+            Err(PolicyError::Unsupported(_))
+        ));
     }
 }

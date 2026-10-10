@@ -35,6 +35,8 @@
 //!    exists precisely for payloads that cannot be obtained again, so a silent
 //!    drop would destroy the only copy.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::result::{Manifest, Payload, Provenance, ResultKind, ToolResult};
@@ -138,18 +140,156 @@ pub enum Reduction {
     SandboxReduce,
 }
 
+/// Which of DESIGN's five paths applies.
+///
+/// A vocabulary rather than a `Reduction`, because a `Reduction` carries
+/// payload-specific data — the re-run command, the digest, the reader prompt —
+/// that a policy cannot know and should not have to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReductionPath {
+    PassThrough,
+    DropWithManifest,
+    SpillWithPointer,
+    DispatchReader,
+    SandboxReduce,
+}
+
+impl ReductionPath {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReductionPath::PassThrough => "pass_through",
+            ReductionPath::DropWithManifest => "drop_with_manifest",
+            ReductionPath::SpillWithPointer => "spill_with_pointer",
+            ReductionPath::DispatchReader => "dispatch_reader",
+            ReductionPath::SandboxReduce => "sandbox_reduce",
+        }
+    }
+
+    /// The path a policy named, or `None` if it named something else.
+    ///
+    /// `None` rather than a default: an unrecognised name in a policy is a
+    /// mistake, and silently reducing it to `PassThrough` would turn a typo into
+    /// a decision nobody made.
+    pub fn parse(name: &str) -> Option<Self> {
+        Some(match name {
+            "pass_through" => ReductionPath::PassThrough,
+            "drop_with_manifest" => ReductionPath::DropWithManifest,
+            "spill_with_pointer" => ReductionPath::SpillWithPointer,
+            "dispatch_reader" | "delegate_reader" => ReductionPath::DispatchReader,
+            "sandbox_reduce" => ReductionPath::SandboxReduce,
+            _ => return None,
+        })
+    }
+}
+
 /// Chooses and applies reductions.
 ///
-/// Stateless apart from its budget, so it can be shared behind an `Arc` by every
-/// tool context in a process.
-#[derive(Debug, Clone)]
+/// Shared behind an `Arc` by every tool context in a process. `Clone` is derived
+/// and `Debug` is written out, because the policy's table is a trait object and a
+/// derived `Debug` cannot see through it.
+#[derive(Clone)]
 pub struct Reducer {
     budget: Budget,
+    /// A policy's table, consulted before the built-in one.
+    table: Option<Arc<dyn ReductionTable>>,
+}
+
+impl std::fmt::Debug for Reducer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Reducer")
+            .field("budget", &self.budget)
+            .field("policy_table", &self.table.is_some())
+            .finish()
+    }
+}
+
+/// The axes DESIGN's table is indexed by.
+///
+/// Passed to a policy so it can select a row without reaching into the reducer —
+/// the policy sees the same facts the built-in table does, and no others.
+#[derive(Debug)]
+pub struct Axes<'a> {
+    pub kind: ResultKind,
+    pub size: u64,
+    pub reproducible: bool,
+    pub addressable: bool,
+    pub pressure: Pressure,
+    pub already_on_disk: bool,
+    /// The threshold a policy needs in order to interpret "large".
+    pub inline_limit: u64,
+    pub provenance: &'a Provenance,
+}
+
+/// A reduction policy supplied from outside.
+///
+/// DESIGN lists "归约规则" among the things that must be external resources
+/// (constraint 0), and the acceptance criterion is that changing one must not
+/// need a rebuild. Until this trait existed, the reduction table was a constant
+/// in this crate — so constraint 0 held for every rule except the one the whole
+/// project is built around.
+///
+/// Returning `None` falls through to the built-in table, so a policy expresses
+/// only the rows it wants to change.
+pub trait ReductionTable: Send + Sync {
+    fn path_for(&self, axes: &Axes<'_>) -> Option<ReductionPath>;
 }
 
 impl Reducer {
+    /// Attach a policy's table. Consulted before the built-in one.
+    pub fn with_table(mut self, table: Arc<dyn ReductionTable>) -> Self {
+        self.table = Some(table);
+        self
+    }
+
+    /// The facts a policy row is selected by.
+    fn axes<'a>(&self, result: &'a ToolResult, pressure: Pressure) -> Axes<'a> {
+        Axes {
+            kind: result.kind,
+            size: result.size,
+            reproducible: result.reproducible,
+            addressable: result.addressable,
+            pressure,
+            already_on_disk: result.provenance.from_spill.is_some()
+                || result.payload.is_on_disk(),
+            inline_limit: self.budget.inline_limit,
+            provenance: &result.provenance,
+        }
+    }
+
+    /// Build the reduction for a policy-chosen path.
+    ///
+    /// Mirrors the branches of [`Reducer::choose`]. Kept in step by
+    /// `a_policy_path_matches_what_the_builtin_table_would_have_chosen`, which
+    /// asserts the two agree for the same axes rather than trusting that they do.
+    fn materialise(&self, path: ReductionPath, result: &ToolResult) -> Reduction {
+        let already_on_disk =
+            result.provenance.from_spill.is_some() || result.payload.is_on_disk();
+        match path {
+            ReductionPath::PassThrough => Reduction::PassThrough,
+            ReductionPath::SandboxReduce => Reduction::SandboxReduce,
+            ReductionPath::DropWithManifest => Reduction::DropWithManifest {
+                rerun: rerun_command(&result.provenance),
+            },
+            ReductionPath::SpillWithPointer if already_on_disk => {
+                Reduction::DropWithManifest { rerun: None }
+            }
+            ReductionPath::SpillWithPointer => {
+                let digest = content_digest(payload_bytes(result).unwrap_or_default());
+                Reduction::SpillWithPointer {
+                    digest: digest.clone(),
+                    pointer: spill_pointer(&digest, result.size),
+                }
+            }
+            ReductionPath::DispatchReader => self.delegate(result),
+        }
+    }
+
     pub fn new(budget: Budget) -> Self {
-        Self { budget }
+        Self {
+            budget,
+            table: None,
+        }
     }
 
     pub fn budget(&self) -> Budget {
@@ -181,6 +321,17 @@ impl Reducer {
     ///    so the payload is handed to a reader: the one path that reduces without
     ///    claiming something false.
     pub fn choose(&self, result: &ToolResult, pressure: Pressure) -> Reduction {
+        // The policy's table first, so a declared rule wins over the built-in
+        // one. `None` means the policy said nothing about these axes, which
+        // falls through rather than stopping — a policy expresses the rows it
+        // wants to change, not every row.
+        if let Some(table) = &self.table {
+            let axes = self.axes(result, pressure);
+            if let Some(path) = table.path_for(&axes) {
+                return self.materialise(path, result);
+            }
+        }
+
         if result.size <= self.budget.inline_limit {
             return Reduction::PassThrough;
         }

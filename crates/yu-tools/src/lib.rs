@@ -30,5 +30,5 @@ pub mod reduce;
 pub mod result;
 
 pub use native::{Exec, ListDir, ReadFile, Tool, ToolContext, ToolRegistry, WriteFile};
-pub use reduce::{Budget, Pressure, Reducer, Reduction};
+pub use reduce::{Axes, Budget, Pressure, Reduction, ReductionPath, ReductionTable, Reducer};
 pub use result::{Manifest, Payload, Provenance, ResultKind, ToolResult};
