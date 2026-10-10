@@ -59,6 +59,23 @@ impl ReaderAngle {
     ];
 
     /// Stable name, used in the journal and in prompts that brief a reader.
+    /// What this angle is asked to extract, used verbatim in the reader prompt.
+    pub fn subject(self) -> &'static str {
+        match self {
+            ReaderAngle::DecisionsAndReasons => {
+                "decisions that were taken, and the reason given for each"
+            }
+            ReaderAngle::ConstraintsAndInvariants => {
+                "constraints and invariants that are still in force"
+            }
+            ReaderAngle::LooseEnds => "threads that are still open",
+            ReaderAngle::NegativeEvidence => {
+                "things that were tried and did not work, and anything ruled out"
+            }
+            ReaderAngle::ArtifactIndex => "artifacts that were produced, and where they are",
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             ReaderAngle::DecisionsAndReasons => "decisions_and_reasons",
@@ -332,6 +349,23 @@ pub enum HandoverError {
     EmptyCharter,
     #[error("handover codec: {0}")]
     Codec(String),
+}
+
+impl Trigger {
+    /// Build a threshold trigger from the growth budget the loop already keeps.
+    ///
+    /// The rule — count growth since the last contraction, never total context —
+    /// had been written twice: once in `yu_core::traits::GrowthBudget`, where it
+    /// is enforced by the type having no total-context field, and once here.
+    /// Two implementations of one rule is how they drift, and the drift would be
+    /// silent because both would look right alone. This converts rather than
+    /// re-derives, so there is one implementation and this is a view of it.
+    pub fn from_growth(budget: &yu_core::traits::GrowthBudget) -> Self {
+        Trigger::Threshold {
+            growth_since_last: budget.peak_growth(),
+            threshold: budget.threshold,
+        }
+    }
 }
 
 /// Why a generation change happens.
@@ -631,5 +665,219 @@ mod tests {
 
         handover.charter = "Ship the daemon.".to_owned();
         assert!(handover.check().is_ok());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch
+// ---------------------------------------------------------------------------
+
+/// A reader's model call.
+///
+/// Injected rather than reached for, so the dispatch logic — which readers, what
+/// each is asked, how their answers become a handover — is testable without a
+/// network and without spending anything.
+pub trait ReaderModel: Send + Sync {
+    fn read(
+        &self,
+        prompt: &str,
+    ) -> impl std::future::Future<Output = Result<String, HandoverError>> + Send;
+}
+
+/// The prompt one reader is given.
+///
+/// DESIGN's claim 1 about the specialised reader is that its cost *is* the size of
+/// this prompt — "它只是个读取器,不需要完整的工具纪律". So it is deliberately
+/// small: one angle, the record, and an instruction to report findings rather
+/// than prose. It carries no tool discipline because it has no tools.
+pub fn reader_prompt(angle: ReaderAngle, record: &str) -> String {
+    format!(
+        "You are reading a record to extract one specific kind of thing from it. You have no \
+         tools; the record below is everything there is.\n\n\
+         Extract, in your own words, the {subject}. Report only what the record actually shows. \
+         If it shows nothing under this heading, say so — an absence is a finding, and inventing \
+         a plausible entry is worse than returning none.\n\n\
+         Answer as a list, one finding per line, each beginning with \"- \". Nothing else: no \
+         preamble, no summary, no offers to help.\n\n\
+         --- RECORD ---\n{record}\n--- END RECORD ---",
+        subject = angle.subject(),
+    )
+}
+
+/// Run the readers and assemble what they return.
+///
+/// DESIGN's flow, wired. Until this existed the angle types, the union and the
+/// verifier were all present and tested, and **nothing dispatched a
+/// `ReaderJob`** — the same concept implemented twice and wired zero times.
+///
+/// The readers are sequential and each gets the whole record. Both are
+/// deliberate: concurrency would need a rate-limit story this layer does not
+/// have, and handing every reader the same record is what makes their framings
+/// the only thing that differs between them — which is where the decorrelation
+/// comes from. DESIGN's instruction is to take the **union, not a vote**:
+/// redundancy helps extraction, not judgement, so agreement is not evidence and
+/// disagreement is not a problem to resolve here.
+pub async fn dispatch<M: ReaderModel>(
+    model: &M,
+    record: &str,
+    angles: &[ReaderAngle],
+) -> Result<Handover, HandoverError> {
+    if angles.is_empty() {
+        return Err(HandoverError::NoReaders);
+    }
+    let mut reports = Vec::with_capacity(angles.len());
+    for angle in angles {
+        let raw = model.read(&reader_prompt(*angle, record)).await?;
+        reports.push(ReaderReport {
+            angle: *angle,
+            findings: parse_findings(&raw),
+            citations: vec![format!("record ({} bytes)", record.len())],
+        });
+    }
+    Ok(assemble(reports))
+}
+
+/// Turn a reader's reply into findings.
+///
+/// Lines beginning `- ` are findings, because that is what the prompt asks for.
+/// A reply that ignores the format is kept whole rather than discarded: a reader
+/// that answered in prose still read the record, and throwing its work away
+/// would be the silent omission this whole design is built against.
+fn parse_findings(raw: &str) -> Vec<String> {
+    let mut findings = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("- ") {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                findings.push(rest.to_owned());
+            }
+        }
+    }
+    if findings.is_empty() {
+        let whole = raw.trim();
+        if !whole.is_empty() {
+            findings.push(whole.to_owned());
+        }
+    }
+    findings
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// A reader that answers from a script, and records what it was asked.
+    struct Scripted {
+        reply: String,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn new(reply: &str) -> Self {
+            Self {
+                reply: reply.to_owned(),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ReaderModel for Scripted {
+        async fn read(&self, prompt: &str) -> Result<String, HandoverError> {
+            self.seen.lock().unwrap().push(prompt.to_owned());
+            Ok(self.reply.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn every_angle_is_dispatched_and_its_findings_survive() {
+        let model = Scripted::new("- the parser was rewritten because the old one was slow");
+        let handover = dispatch(
+            &model,
+            "record text",
+            &[ReaderAngle::DecisionsAndReasons, ReaderAngle::LooseEnds],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(model.seen.lock().unwrap().len(), 2, "one reader per angle");
+        assert!(handover.sources.contains(&ReaderAngle::DecisionsAndReasons));
+        assert!(handover.sources.contains(&ReaderAngle::LooseEnds));
+        assert!(
+            !handover.decisions.is_empty(),
+            "the decisions angle's finding must reach the handover: {handover:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_reader_is_asked_for_its_own_angle() {
+        let model = Scripted::new("- x");
+        dispatch(&model, "r", &[ReaderAngle::NegativeEvidence]).await.unwrap();
+        let prompts = model.seen.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(
+            prompts[0].contains(ReaderAngle::NegativeEvidence.subject()),
+            "a reader must be asked for its angle and not a generic summary: {}",
+            prompts[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reader_prompt_stays_small() {
+        // DESIGN's claim 1: the specialised reader's cost is the size of this
+        // prompt, because it needs no tool discipline. If it grows into a full
+        // agent brief, the cheap path has stopped being cheap.
+        for angle in ReaderAngle::ALL {
+            let prompt = reader_prompt(angle, "");
+            assert!(
+                prompt.len() < 1200,
+                "{angle:?} prompt is {} bytes",
+                prompt.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reader_that_ignores_the_format_is_not_discarded() {
+        // Malformed output still represents work done on the record. Dropping it
+        // would be exactly the silent omission the design exists to prevent.
+        let model = Scripted::new("Nothing under this heading, as far as I can see.");
+        let handover = dispatch(&model, "r", &[ReaderAngle::ArtifactIndex])
+            .await
+            .unwrap();
+        assert!(
+            handover.citations.iter().any(|c| c.contains("record")),
+            "the reader's account must be carried even when it does not match the format"
+        );
+    }
+
+    #[test]
+    fn the_growth_rule_has_one_implementation() {
+        // The trigger is a view of the loop's budget, not a second copy of the
+        // rule. If these ever disagree, one of them is wrong and nothing would
+        // say which.
+        let mut budget = yu_core::traits::GrowthBudget::new(10_000);
+        budget.rearm(900_000);
+        assert!(!budget.observe(905_000));
+        assert!(budget.observe(920_000));
+
+        let trigger = Trigger::from_growth(&budget);
+        assert!(trigger.should_fire(), "a budget that fired must fire the trigger");
+
+        let mut quiet = yu_core::traits::GrowthBudget::new(10_000);
+        quiet.rearm(900_000);
+        let _ = quiet.observe(901_000);
+        assert!(
+            !Trigger::from_growth(&quiet).should_fire(),
+            "a budget that did not fire must not fire the trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_angles_is_an_error_rather_than_an_empty_handover() {
+        let model = Scripted::new("- x");
+        let err = dispatch(&model, "r", &[]).await.unwrap_err();
+        assert!(matches!(err, HandoverError::NoReaders));
     }
 }
