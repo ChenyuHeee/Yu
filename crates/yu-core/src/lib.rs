@@ -13,6 +13,12 @@
 //! implementations. `core` must not depend on `yu-policy`.
 
 pub mod agent;
+pub mod decision;
+pub mod delegate;
 pub mod gate;
 pub mod render;
 pub mod traits;
+
+pub use decision::{DecisionConfig, DecisionLayer, DecisionOutcome};
+pub use delegate::{DelegateArgs, DelegateOutcome};
+pub use render::{render, Charter, Ledger, NotLoaded, RenderInput, View};

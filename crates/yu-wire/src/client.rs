@@ -170,8 +170,29 @@ impl WireClient {
             ));
         };
         let model = std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| "claude-opus-5".to_owned());
-        let quirks = Quirks::from_name(&std::env::var("YU_QUIRKS").unwrap_or_default())
-            .unwrap_or_else(Quirks::unknown);
+        // A measured profile, if one was saved. This is DESIGN's "约束靠注入":
+        // `yu probe --json` writes the report, this reads it back, and the
+        // constraints in force are the ones that were actually observed rather
+        // than the ones the code assumed.
+        let quirks = match std::env::var("YU_QUIRKS_JSON") {
+            Ok(path) => match std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|text| Quirks::from_capabilities_json(&text))
+            {
+                Ok(quirks) => quirks,
+                Err(problem) => {
+                    // Loud, and fatal to the profile rather than to the run: a
+                    // profile that failed to load must not silently become the
+                    // built-in default, because then a run would proceed under
+                    // constraints nobody chose.
+                    tracing::error!(path = %path, %problem, "could not load the quirks profile; \
+                        falling back to an unmeasured profile, which assumes the strict rules");
+                    Quirks::unknown()
+                }
+            },
+            Err(_) => Quirks::from_name(&std::env::var("YU_QUIRKS").unwrap_or_default())
+                .unwrap_or_else(Quirks::unknown),
+        };
         Self::builder()
             .base_url(base_url)
             .auth(auth)
@@ -517,6 +538,23 @@ impl WireClient {
             tracing::debug!(elapsed_ms = span.elapsed_ms(), "stream");
         }
 
+        // `FirstToken` as a span, not merely a field. DESIGN lists it among the
+        // spans, and the distinction it draws — "the model is thinking" versus
+        // "the harness is slow" — is only legible if this number sits beside the
+        // harness spans in the same report.
+        if let Some(first_token_ns) = timing.first_token_ns
+            && let Some(timeline) = &self.timeline
+        {
+            let mut attrs = std::collections::BTreeMap::new();
+            attrs.insert("events".to_owned(), serde_json::json!(timing.events));
+            timeline.record_measured(
+                SpanKind::FirstToken,
+                timeline.current_agent(),
+                first_token_ns,
+                attrs,
+            );
+        }
+
         Ok(StreamOutcome {
             message: acc.finish(),
             timing,
@@ -674,6 +712,16 @@ impl WireClientBuilder {
         let timeout = self.timeout_secs.unwrap_or(600);
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(timeout))
+            // Deliberately not the default (up to 10 hops). This client talks to
+            // one configured endpoint, so a redirect cannot express anything it
+            // wants — it can only move the request to a host the operator did not
+            // choose, which here means exfiltrating the credential: reqwest
+            // strips only `Authorization`/`Cookie` on a cross-host hop, and ours
+            // is the custom header `x-api-key`. `none()` makes the 3xx an ordinary
+            // non-2xx error pointing at the real fix (`base_url`), instead of a
+            // silent 200 from somewhere else. A 307/308 replays the body, so
+            // following one would also hand over the prompt.
+            .redirect(reqwest::redirect::Policy::none())
             // A pooled, resident connection is the point: no per-step handshake.
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
@@ -695,7 +743,11 @@ impl WireClientBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+
     use super::*;
+    use crate::types::Message;
 
     #[test]
     fn debug_never_prints_the_credential() {
@@ -749,6 +801,162 @@ mod tests {
         assert_eq!(
             p.delay(1, Some(u64::MAX)).as_millis(),
             p.max_delay_ms as u128
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Redirects
+    //
+    // The endpoint is explicit configuration, so a redirect is never something
+    // this client wants: following one hands the request to a host the operator
+    // did not choose. These tests use real loopback servers rather than a mocked
+    // transport, because what has to be observed is which host the bytes
+    // physically reach.
+    // -----------------------------------------------------------------------
+
+    fn loopback_listener() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0").expect("a loopback port")
+    }
+
+    /// Read one complete HTTP/1.1 request: the head, then `content-length` bytes.
+    ///
+    /// The body is drained before the caller answers. A server that replies and
+    /// closes while the client is still writing turns a redirect into a
+    /// connection reset, and a test that means to catch a followed redirect
+    /// would then be unable to tell the two apart.
+    fn read_request(sock: &mut TcpStream) -> String {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if raw.len() >= head_end + 4 + body_len {
+                    break;
+                }
+            }
+            match sock.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        }
+        String::from_utf8_lossy(&raw).into_owned()
+    }
+
+    /// Answers one request with a 307 to `location` — what a gateway in front of
+    /// the configured endpoint sends when it wants the request elsewhere.
+    fn start_redirector(location: String) -> SocketAddr {
+        let listener = loopback_listener();
+        let addr = listener.local_addr().expect("listener address");
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            read_request(&mut sock);
+            let reply = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\n\
+                 Location: {location}\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let _ = sock.write_all(reply.as_bytes());
+        });
+        addr
+    }
+
+    /// Records whatever request arrives, and answers `200` with a message shaped
+    /// like the endpoint's — so a client that followed the redirect would see a
+    /// perfectly ordinary success and could not tell where the answer came from.
+    struct Spy {
+        addr: SocketAddr,
+        received: std::sync::mpsc::Receiver<String>,
+    }
+
+    impl Spy {
+        fn start() -> Self {
+            let listener = loopback_listener();
+            let addr = listener.local_addr().expect("listener address");
+            listener.set_nonblocking(true).expect("non-blocking listener");
+            let (tx, received) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match listener.accept() {
+                        Ok((mut sock, _)) => {
+                            let request = read_request(&mut sock);
+                            let _ = sock.write_all(&spy_reply());
+                            let _ = tx.send(request);
+                            return;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= deadline {
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(_) => return,
+                    }
+                }
+            });
+            Self { addr, received }
+        }
+
+        /// `None` means nothing arrived within `wait`.
+        fn captured(&self, wait: Duration) -> Option<String> {
+            self.received.recv_timeout(wait).ok()
+        }
+    }
+
+    fn spy_reply() -> Vec<u8> {
+        let body = r#"{"id":"msg-spy","model":"spy","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}"#;
+        format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+
+    /// A 3xx must not be followed: reqwest's default policy would forward the
+    /// request to the `Location` host, and `x-api-key` is not a header it strips
+    /// (it strips only `Authorization`/`Cookie`, and only when host or port
+    /// changes), so the API key — and, because 307/308 replay the body, the whole
+    /// prompt — would be delivered to a host this client was never pointed at.
+    #[tokio::test]
+    async fn a_redirect_never_carries_the_credential_to_another_endpoint() {
+        let canary = "sk-canary-must-not-leave-0001";
+        let spy = Spy::start();
+        let redirector = start_redirector(format!("http://{}{}", spy.addr, MESSAGES_PATH));
+
+        let client = WireClient::builder()
+            .base_url(format!("http://{redirector}"))
+            .auth(Auth::ApiKey(canary.to_owned()))
+            .build()
+            .expect("building the client");
+        let req = MessagesRequest::new("claude-opus-5", 16, vec![Message::user("hello")]);
+
+        let outcome = client.send(&req).await;
+
+        // The spy is the only server on that address, so a captured request is
+        // one this client sent there — credential (and body) included.
+        let captured = spy.captured(Duration::from_secs(2));
+        assert!(
+            captured.is_none(),
+            "the redirect target received the forwarded request:\n{}",
+            captured.as_deref().unwrap_or("")
+        );
+
+        let err = outcome.expect_err("a redirect must fail rather than be followed");
+        assert_eq!(
+            err.status,
+            Some(307),
+            "the caller must learn the endpoint answered with a redirect: {err}"
         );
     }
 }

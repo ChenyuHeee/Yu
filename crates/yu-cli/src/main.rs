@@ -19,10 +19,12 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use yu_core::agent::{Agent, AgentConfig};
+use yu_core::decision::{DecisionConfig, DecisionLayer};
+use yu_core::render::{Charter, HumanUtterance};
 use yu_journal::{EventBody, Journal, SessionId};
-use yu_observe::{AgentId, Timeline};
+use yu_observe::{AgentId, ContextComposition, SpanKind, Timeline};
 use yu_tools::ToolRegistry;
 use yu_wire::capability::Capabilities;
 use yu_wire::client::{StreamSink, WireClient};
@@ -30,6 +32,19 @@ use yu_wire::types::{Message, MessagesRequest, Thinking, ThinkingDisplay};
 
 #[global_allocator]
 static ALLOC: yu_observe::Allocator = yu_observe::Allocator;
+
+/// Which tools an executor is given.
+///
+/// DESIGN's premise is that an agent's tool surface is a decision rather than a
+/// default. `exec` runs arbitrary model-chosen shell commands, so it is opted
+/// into explicitly and is never what an unqualified run gets.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum ToolSet {
+    /// `read_file` and `list_dir`. Cannot change anything.
+    ReadOnly,
+    /// Adds `write_file` and `exec`. Can change anything the process can.
+    Full,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "yu", version, about = "A decision-layer agent harness.")]
@@ -92,6 +107,31 @@ enum Command {
         model: Option<String>,
         #[arg(long, default_value_t = 12)]
         max_steps: u32,
+        #[arg(long, value_enum, default_value_t = ToolSet::ReadOnly)]
+        tools: ToolSet,
+    },
+
+    /// Run the decision layer on a charter. The thin vertical slice.
+    ///
+    /// DESIGN's acceptance question is answered by the number this prints: after
+    /// a real task, what fraction of the decision layer's context is tool
+    /// machinery? Near zero means the design holds. More than a tenth or two
+    /// means the premise is wrong, and it is much better to learn that here than
+    /// six months from now.
+    Decide {
+        /// The charter: what is to be achieved, in the human's own words.
+        #[arg(short, long)]
+        charter: String,
+        #[arg(long, default_value = ".yu")]
+        dir: PathBuf,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(short, long)]
+        model: Option<String>,
+        #[arg(long, default_value_t = 4)]
+        max_rounds: u32,
+        #[arg(long, value_enum, default_value_t = ToolSet::ReadOnly)]
+        tools: ToolSet,
     },
 
     /// Summarise a recorded session.
@@ -128,7 +168,16 @@ async fn main() -> ExitCode {
             cwd,
             model,
             max_steps,
-        } => cmd_run(&task, &dir, cwd, model, max_steps).await,
+            tools,
+        } => cmd_run(&task, &dir, cwd, model, max_steps, tools).await,
+        Command::Decide {
+            charter,
+            dir,
+            cwd,
+            model,
+            max_rounds,
+            tools,
+        } => cmd_decide(&charter, &dir, cwd, model, max_rounds, tools).await,
         Command::Metrics { dir } => cmd_metrics(&dir).await,
     };
 
@@ -260,6 +309,7 @@ async fn cmd_run(
     cwd: Option<PathBuf>,
     model: Option<String>,
     max_steps: u32,
+    tools: ToolSet,
 ) -> anyhow::Result<()> {
     let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let timeline = Timeline::new();
@@ -275,7 +325,11 @@ async fn cmd_run(
         "run-{}",
         chrono::Utc::now().format("%Y%m%dT%H%M%S")
     ));
-    let journal = Arc::new(Journal::open(dir, session.clone()).await?);
+    let journal = Arc::new(
+        Journal::open(dir, session.clone())
+            .await?
+            .with_timeline(timeline.clone()),
+    );
 
     journal
         .append(
@@ -288,7 +342,8 @@ async fn cmd_run(
         )
         .await?;
 
-    let tools = Arc::new(ToolRegistry::native(cwd.clone()));
+    let tools = Arc::new(build_tools(tools, cwd.clone()));
+    eprintln!("--- tool surface: {}", describe_tools(&tools));
     let config = AgentConfig::new(AgentId::new("exec"), model).max_steps(max_steps);
     let mut agent = Agent::new(
         client.clone(),
@@ -359,6 +414,145 @@ async fn cmd_run(
         // *reported* here rather than judged.
         eprintln!("--- shape: {signal:?}");
     }
+    report_ratio("executor", &outcome.composition);
+    Ok(())
+}
+
+fn build_tools(set: ToolSet, cwd: PathBuf) -> ToolRegistry {
+    match set {
+        ToolSet::ReadOnly => ToolRegistry::read_only(cwd),
+        ToolSet::Full => ToolRegistry::native(cwd),
+    }
+}
+
+/// State the tool surface rather than leaving it to be inferred from a flag.
+///
+/// An executor that can run commands and one that cannot produce the same
+/// looking transcript, so the run has to say which it was.
+fn describe_tools(registry: &ToolRegistry) -> String {
+    let mut names = registry.names();
+    names.sort();
+    names.join(", ")
+}
+
+/// Report DESIGN's acceptance metric for one layer's context.
+///
+/// `None` means nothing was measured, which is reported as such rather than as
+/// zero — a layer with no measured context and a layer with a perfectly lean one
+/// are different findings.
+fn report_ratio(label: &str, composition: &ContextComposition) {
+    match composition.tool_machinery_ratio() {
+        Some(ratio) => eprintln!(
+            "--- {label} context: tool machinery {:.1}% of {} chars \
+             (calls {} + results {} + definitions {})",
+            ratio * 100.0,
+            composition.total_chars,
+            composition.tool_call_chars,
+            composition.tool_result_chars,
+            composition.tool_definition_chars,
+        ),
+        None => eprintln!("--- {label} context: NOT MEASURED (no context was recorded)"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// decide — the vertical slice
+// ---------------------------------------------------------------------------
+
+async fn cmd_decide(
+    charter_text: &str,
+    dir: &PathBuf,
+    cwd: Option<PathBuf>,
+    model: Option<String>,
+    max_rounds: u32,
+    tool_set: ToolSet,
+) -> anyhow::Result<()> {
+    let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let timeline = Timeline::new();
+    timeline.enter(AgentId::decision());
+    // DESIGN lists `init` among the spans. It is here rather than nowhere
+    // because process start-up is exactly the cost flower paid per step.
+    let init = timeline.start(SpanKind::Init);
+
+    let client = Arc::new(WireClient::from_env()?.with_timeline(timeline.clone()));
+    let model = model.unwrap_or_else(|| client.default_model().to_owned());
+    let session = SessionId::new(format!(
+        "decide-{}",
+        chrono::Utc::now().format("%Y%m%dT%H%M%S")
+    ));
+    let journal = Arc::new(
+        Journal::open(dir, session.clone())
+            .await?
+            .with_timeline(timeline.clone()),
+    );
+    let tools = Arc::new(build_tools(tool_set, cwd.clone()));
+    init.finish();
+
+    let charter = Charter {
+        text: charter_text.to_owned(),
+        // DESIGN: "人类原话原样存活". The charter arrives as the human typed it
+        // and is kept that way; there is no summarising step between them and
+        // the decision layer.
+        human_words: vec![HumanUtterance {
+            at_ms: chrono::Utc::now().timestamp_millis(),
+            text: charter_text.to_owned(),
+            source: "cli".to_owned(),
+        }],
+        ..Charter::default()
+    };
+
+    let surface = describe_tools(&tools);
+    let mut config = DecisionConfig::new(model);
+    config.max_rounds = max_rounds;
+    let mut layer = DecisionLayer::new(
+        client,
+        journal,
+        tools,
+        timeline.clone(),
+        config,
+        charter,
+        cwd,
+    );
+
+    eprintln!(
+        "session {} — journal in {} — executor tool surface: {}",
+        session.as_str(),
+        dir.display(),
+        surface
+    );
+    let started = std::time::Instant::now();
+    let outcome = layer.run().await?;
+    let elapsed = started.elapsed();
+
+    println!("{}", outcome.final_text);
+
+    eprintln!(
+        "\n--- {} round(s), {} delegation(s) in {:.1}s",
+        outcome.rounds,
+        outcome.delegations,
+        elapsed.as_secs_f64()
+    );
+    eprintln!(
+        "--- tokens in={} out={} cache_read={}",
+        outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.usage.cache_read_input_tokens
+    );
+
+    // The comparison the whole design rests on, from one run.
+    report_ratio("decision layer", &outcome.composition);
+    for (i, d) in outcome.outcomes.iter().enumerate() {
+        report_ratio(&format!("executor #{i}"), &d.executor_composition);
+    }
+
+    let mut metrics = yu_observe::Metrics::default();
+    metrics.observe_spans(&timeline.spans());
+    let mut parts: Vec<String> = metrics
+        .elapsed_ns_by_kind
+        .iter()
+        .map(|(k, v)| format!("{k}={:.1}ms", *v as f64 / 1e6))
+        .collect();
+    parts.sort();
+    eprintln!("--- spans: {}", parts.join(" "));
     Ok(())
 }
 
@@ -390,6 +584,7 @@ async fn cmd_metrics(dir: &PathBuf) -> anyhow::Result<()> {
         let mut responses = 0usize;
         let mut thinking_blobs = 0usize;
         let mut signatures = 0usize;
+        let mut assistant_texts = 0usize;
         let mut inline_bytes = 0u64;
         let mut blob_bytes = 0u64;
         let mut reductions: std::collections::BTreeMap<String, usize> = Default::default();
@@ -425,11 +620,18 @@ async fn cmd_metrics(dir: &PathBuf) -> anyhow::Result<()> {
                 "model_response" => {
                     responses += 1;
                     let b = &event["body"];
-                    if b.get("thinking_blob").is_some_and(|v| !v.is_null()) {
-                        thinking_blobs += 1;
+                    // Each thinking block is a record holding two digests: the
+                    // text's and the signature's, kept apart because either can
+                    // be the larger of the two.
+                    if let Some(records) = b.get("thinking").and_then(|v| v.as_array()) {
+                        thinking_blobs += records.len();
+                        signatures += records
+                            .iter()
+                            .filter(|r| r.get("signature_blob").is_some_and(|v| !v.is_null()))
+                            .count();
                     }
-                    if b.get("thinking_signature").is_some_and(|v| !v.is_null()) {
-                        signatures += 1;
+                    if b.get("text_blob").is_some_and(|v| !v.is_null()) {
+                        assistant_texts += 1;
                     }
                     if let Some(u) = b.get("usage") {
                         input += u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -457,7 +659,8 @@ async fn cmd_metrics(dir: &PathBuf) -> anyhow::Result<()> {
                 cache_read as f64 / total_cacheable as f64 * 100.0
             );
         }
-        println!("  thinking blobs    {thinking_blobs} (signatures kept separately: {signatures})");
+        println!("  thinking blocks   {thinking_blobs} (signatures kept separately: {signatures})");
+        println!("  assistant texts   {assistant_texts} recorded (the turn's own words, as blobs)");
         if !reductions.is_empty() {
             println!("  reductions        {reductions:?}");
         }

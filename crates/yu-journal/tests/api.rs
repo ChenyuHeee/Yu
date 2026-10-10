@@ -11,7 +11,7 @@ mod common;
 use std::path::{Path, PathBuf};
 
 use common::{agent, tempdir};
-use yu_journal::{
+use yu_journal::{ThinkingRecord, 
     BlobStore, EffectGuard, EffectLog, Event, EventBody, Journal, JournalError, JournalIndex,
     SessionId,
 };
@@ -59,8 +59,11 @@ async fn events_and_the_journal_have_the_documented_shape() {
             // wire layer's `Usage::to_observed()` produces it.
             usage: yyusage(),
             blocks: vec!["text-block".to_owned()],
-            thinking_blob: None,
-            thinking_signature: Some("69164b36-fbed-4709-adfd-d6871900f038".to_owned()),
+            thinking: vec![ThinkingRecord {
+                text_blob: "e".repeat(64),
+                signature_blob: Some("f".repeat(64)),
+            }],
+            text_blob: Some("d".repeat(64)),
         },
         EventBody::ToolCall {
             tool_use_id: "call_00_4Ykgo3t3AxTqrrfx12mk4590".to_owned(),

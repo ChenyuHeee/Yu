@@ -13,6 +13,25 @@ use yu_observe::{AgentId, TokenUsage};
 use crate::JournalError;
 use crate::blob::BlobStore;
 
+/// One thinking block, its text and its signature held apart.
+///
+/// CONSTRAINT 4, corrected. The first version of this stored the *signature*
+/// inline on the JSONL line and the thinking text in a blob — exactly backwards.
+/// Measured here the signature is a 36-byte UUID, which is why it looked
+/// harmless; on a real Anthropic endpoint signatures are kilobytes, and inlining
+/// them bloats the one line that L2 constraint 2 exists to keep small. That the
+/// shim's signature is small is a fact about the shim, not about the format this
+/// record has to outlive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThinkingRecord {
+    /// Digest of the thinking text.
+    pub text_blob: String,
+    /// Digest of the signature, held separately because it can outweigh the text
+    /// it accompanies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_blob: Option<String>,
+}
+
 /// Identifies one session's record.
 ///
 /// It is part of every event's envelope rather than of the file it happens to
@@ -75,9 +94,10 @@ pub enum EventBody {
         digest: String,
         est_input_tokens: Option<u64>,
     },
-    /// Constraint 4: `thinking_blob` holds the text, `thinking_signature` is
-    /// separate. Measured on this endpoint a signature is a 36-byte UUID and is
-    /// replayed verbatim (Quirk 1), so it is never folded into the text.
+    /// Constraint 4: the thinking text and its signature are held separately,
+    /// each as its own blob, and are never folded together. The signature is
+    /// replayed verbatim (Quirk 1), so it must survive; and it can be kilobytes
+    /// on a real endpoint, so it must not sit inline on the line.
     ///
     /// `blocks` holds one reference per content block, in wire order — a blob
     /// digest or a short inline string. Keeping them as references is what keeps
@@ -86,9 +106,27 @@ pub enum EventBody {
         id: String,
         stop_reason: String,
         usage: TokenUsage,
+        /// Ordered content-block type names — the shape of the turn.
         blocks: Vec<String>,
-        thinking_blob: Option<String>,
-        thinking_signature: Option<String>,
+        /// Ordered thinking, each block with its own text and signature.
+        ///
+        /// A list rather than a concatenation, for two reasons that both bite.
+        /// The endpoint interleaves `thinking → text → server_tool_use → …
+        /// → thinking` (WIRE-FACTS), so collapsing them loses the order; and
+        /// Quirk 1 requires thinking to be replayed byte-exact, so welding two
+        /// blocks together attaches one block's signature to another's text —
+        /// which replays as a corrupted turn.
+        #[serde(default)]
+        thinking: Vec<ThinkingRecord>,
+        /// The assistant's own words, as a blob digest.
+        ///
+        /// This is the most important product of a turn, and an earlier version
+        /// recorded only the block *type names* — `["thinking","text"]` — so the
+        /// text never reached the record at all. Three promises rest on it: L2's
+        /// completeness, the decision layer's "每轮最终答复", and the next
+        /// generation's verifier reading the primary record rather than a report.
+        #[serde(default)]
+        text_blob: Option<String>,
     },
     ToolCall {
         tool_use_id: String,
@@ -220,16 +258,16 @@ impl PartialEq for EventBody {
                     stop_reason: s1,
                     usage: u1,
                     blocks: b1,
-                    thinking_blob: t1,
-                    thinking_signature: g1,
+                    thinking: t1,
+                    text_blob: x1,
                 },
                 EventBody::ModelResponse {
                     id: i2,
                     stop_reason: s2,
                     usage: u2,
                     blocks: b2,
-                    thinking_blob: t2,
-                    thinking_signature: g2,
+                    thinking: t2,
+                    text_blob: x2,
                 },
             ) => {
                 i1 == i2
@@ -237,7 +275,7 @@ impl PartialEq for EventBody {
                     && same_usage(u1, u2)
                     && b1 == b2
                     && t1 == t2
-                    && g1 == g2
+                    && x1 == x2
             }
             (
                 EventBody::ToolCall {
@@ -366,8 +404,8 @@ mod tests {
                 stop_reason: "end_turn".into(),
                 usage: usage(1),
                 blocks: vec![],
-                thinking_blob: None,
-                thinking_signature: None,
+                thinking: Vec::new(),
+                text_blob: None,
             },
             EventBody::ToolCall {
                 tool_use_id: "t".into(),
@@ -408,8 +446,11 @@ mod tests {
             stop_reason: "tool_use".into(),
             usage: usage(17),
             blocks: vec!["a".into(), "b".into()],
-            thinking_blob: Some("f".repeat(64)),
-            thinking_signature: Some("sig".into()),
+            thinking: vec![ThinkingRecord {
+                text_blob: "f".repeat(64),
+                signature_blob: Some("a".repeat(64)),
+            }],
+            text_blob: Some("e".repeat(64)),
         };
         let text = serde_json::to_string(&body).unwrap();
         assert_eq!(serde_json::from_str::<EventBody>(&text).unwrap(), body);
@@ -422,8 +463,8 @@ mod tests {
             stop_reason: "end_turn".into(),
             usage: usage(5),
             blocks: vec![],
-            thinking_blob: None,
-            thinking_signature: None,
+            thinking: Vec::new(),
+            text_blob: None,
         };
         let mut b = a.clone();
         assert_eq!(a, b);

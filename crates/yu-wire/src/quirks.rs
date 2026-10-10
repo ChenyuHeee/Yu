@@ -200,6 +200,14 @@ impl Quirks {
         }
     }
 
+    /// Look up a built-in profile by name.
+    ///
+    /// Only the profiles compiled in here are reachable. A name produced by
+    /// probing is `probed:<url>` and is deliberately *not* answered from a
+    /// table: the whole point of measuring is that the answer depends on the
+    /// endpoint, and re-deriving it from a name would substitute a guess for a
+    /// measurement. Persisted profiles come back through
+    /// [`Quirks::from_capabilities_json`] instead.
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "anthropic" => Some(Self::anthropic()),
@@ -207,6 +215,28 @@ impl Quirks {
             "unknown" => Some(Self::unknown()),
             _ => None,
         }
+    }
+
+    /// Recover a measured profile from a persisted capability report.
+    ///
+    /// Closes the round trip that was open: `yu probe --json > caps.json` writes
+    /// a profile whose name is `probed:<url>`, and `from_name` could never
+    /// answer it — so the constraints could be measured and then not injected.
+    /// DESIGN's derived principle 3 is that constraints are *injected* rather
+    /// than remembered, and this is the injection point.
+    pub fn from_capabilities_json(json: &str) -> Result<Self, String> {
+        #[derive(serde::Deserialize)]
+        struct Report {
+            quirks: Quirks,
+        }
+        let report: Report =
+            serde_json::from_str(json).map_err(|e| format!("not a capability report: {e}"))?;
+        Ok(report.quirks)
+    }
+
+    /// Whether a name came from probing rather than from the built-in table.
+    pub fn is_probed_name(name: &str) -> bool {
+        name.starts_with("probed:")
     }
 
     /// Whether `cache_control` is worth emitting at all.
@@ -567,6 +597,50 @@ mod tests {
         assert!(notes.iter().any(|n| n.contains("tool_search")));
         assert!(notes.iter().any(|n| n.contains("schema-less")));
         assert!(notes.iter().any(|n| n.contains("inert")));
+    }
+
+    /// The injection path, end to end.
+    ///
+    /// `yu probe --json` writes a report whose profile is named `probed:<url>`,
+    /// and nothing could read it back — so the constraints could be measured and
+    /// then not injected, which is the one place DESIGN's derived principle 3
+    /// actually bears weight.
+    #[test]
+    fn a_measured_profile_survives_the_round_trip() {
+        let mut measured = Quirks::deepseek_anthropic();
+        measured.name = "probed:https://example.test".to_owned();
+        measured.cache_breakpoints = Support::No;
+        measured.automatic_prefix_cache = Support::Yes;
+        measured.thinking_signature_validated = false;
+        measured.unsupported_is_422 = true;
+
+        let report = serde_json::json!({
+            "base_url": "https://example.test",
+            "model": "m",
+            "probed_at_ms": 0,
+            "entries": [],
+            "quirks": measured,
+        });
+
+        let recovered = Quirks::from_capabilities_json(&report.to_string()).unwrap();
+        assert_eq!(recovered, measured, "a measured profile must survive intact");
+        // Including the fields the old `infer_quirks` never set at all.
+        assert_eq!(recovered.automatic_prefix_cache, Support::Yes);
+        assert!(!recovered.thinking_signature_validated);
+        assert!(recovered.unsupported_is_422);
+
+        // And the name is one the built-in table cannot answer — which is
+        // precisely why this path has to exist rather than a name lookup.
+        assert!(Quirks::is_probed_name(&recovered.name));
+        assert!(Quirks::from_name(&recovered.name).is_none());
+    }
+
+    #[test]
+    fn a_profile_that_will_not_load_is_an_error_not_a_default() {
+        // Silently substituting the built-in profile would mean running under
+        // constraints nobody chose, while believing they were measured.
+        assert!(Quirks::from_capabilities_json("not json at all").is_err());
+        assert!(Quirks::from_capabilities_json("{}").is_err());
     }
 
     #[test]

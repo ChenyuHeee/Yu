@@ -26,23 +26,38 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use yu_journal::{BlobStore, EventBody, Journal};
+use yu_journal::{BlobStore, EventBody, Journal, ThinkingRecord};
 use yu_observe::{
-    AgentId, ShapeSignal, ShapeTracker, SpanKind, StepObservation, Timeline, TokenUsage,
+    AgentId, ContextComposition, ShapeSignal, ShapeTracker, SpanKind, StepObservation, Timeline,
+    TokenUsage,
 };
 use yu_tools::{Payload, Pressure, Reduction, ResultKind, ToolContext, ToolRegistry, ToolResult};
 use yu_wire::client::{StreamSink, WireClient};
 use yu_wire::sse::StreamedMessage;
 use yu_wire::types::{
     ContentBlock, Effort, Message, MessagesRequest, StopDisposition, StopReason, SystemBlock,
-    Thinking, ToolUseBlock,
+    Thinking, ToolDefinition, ToolUseBlock,
 };
 
 use crate::gate::{AdmissionGate, spawn_abortable};
+use crate::render::CompositionMeter;
 
 /// DESIGN's default for the decision layer is `xhigh`; the execution layer runs
 /// degraded, since it is doing bounded work under supervision.
 pub const EXECUTOR_EFFORT: Effort = Effort::Medium;
+
+/// The executor's own prompt.
+///
+/// DESIGN: the execution layer is "被给予约束,不记得约束" — given its constraints,
+/// never remembering them — so its prompt is short on purpose. It carries the
+/// reporting discipline and nothing else, because everything task-specific
+/// belongs in the task.
+///
+/// It existed as a file for a while before anything loaded it, which meant the
+/// executor ran with **no system prompt at all**: the discipline below was
+/// written down and never given to anyone. A resource nothing reads is a
+/// comment.
+pub const EXECUTOR_PROMPT: &str = include_str!("../prompts/executor.md");
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -66,7 +81,9 @@ impl AgentConfig {
             max_tokens: 8192,
             effort: EXECUTOR_EFFORT,
             thinking: Thinking::adaptive(),
-            system: Vec::new(),
+            // The reporting discipline is not optional and is not something a
+            // caller should have to remember to attach, so it is the default.
+            system: vec![SystemBlock::text(EXECUTOR_PROMPT)],
             max_steps: 40,
         }
     }
@@ -124,6 +141,13 @@ pub struct LoopOutcome {
     pub signals: Vec<ShapeSignal>,
     /// Which reduction each tool result took, for M1's accounting.
     pub reductions: Vec<Reduction>,
+    /// What this executor's context was made of.
+    ///
+    /// The other half of DESIGN's acceptance criterion. The decision layer's
+    /// ratio is meant to approach zero; this one is meant to be large, because
+    /// this is where the tool stream actually lives. Reported together they make
+    /// the contrast a measurement rather than a claim.
+    pub composition: ContextComposition,
 }
 
 /// Accumulates the streamed response.
@@ -326,6 +350,7 @@ impl Agent {
                         tool_calls,
                         signals,
                         reductions,
+                        composition: self.measure_context(),
                     });
                 }
                 StopDisposition::Truncated => return Err(LoopError::Truncated { steps: step }),
@@ -338,6 +363,24 @@ impl Agent {
         }
 
         Err(LoopError::StepCeiling(self.config.max_steps))
+    }
+
+    /// What this agent's context is made of, measured over the whole of it.
+    ///
+    /// Everything the request carries counts: the tool definitions and system
+    /// prompt are as much a part of the context as the messages are, and leaving
+    /// them out would understate the machinery in exactly the direction that
+    /// flatters the design.
+    fn measure_context(&self) -> ContextComposition {
+        let mut meter = CompositionMeter::new();
+        meter.add_tools(&self.tools.definitions());
+        if !self.config.system.is_empty() {
+            meter.add_system(&self.config.system);
+        }
+        for message in &self.messages {
+            meter.add_message(message);
+        }
+        meter.snapshot()
     }
 
     fn build_request(&self) -> MessagesRequest {
@@ -360,25 +403,41 @@ impl Agent {
 
     /// Record the response, honouring DESIGN's L2 constraint 4.
     async fn journal_response(&self, msg: &StreamedMessage) -> Result<(), LoopError> {
-        let thinking: String = msg
-            .content
-            .iter()
-            .filter_map(|b| b.as_thinking())
-            .map(|t| t.thinking.as_str())
-            .collect::<Vec<_>>()
-            .join("");
-        let signature = msg
-            .content
-            .iter()
-            .filter_map(|b| b.as_thinking())
-            .find_map(|t| t.signature.clone());
+        let blobs = self.journal.blobs();
+        let mut thinking: Vec<ThinkingRecord> = Vec::new();
+        let mut text = String::new();
 
-        // Text to a blob, signature as its own field — never joined. Measured: a
-        // signature is 36 bytes and can outweigh the text beside it.
-        let thinking_blob = if thinking.is_empty() {
+        for block in &msg.content {
+            match block {
+                ContentBlock::Thinking(t) => {
+                    // One record per block, in order. The endpoint interleaves
+                    // `thinking → text → server_tool_use → … → thinking`, and
+                    // Quirk 1 requires each to replay byte-exact — so welding two
+                    // blocks into one string would attach the signature of one to
+                    // the text of another, and that replays as a corrupted turn.
+                    let text_blob = blobs.put_str(&t.thinking)?;
+                    let signature_blob = match &t.signature {
+                        Some(signature) => Some(blobs.put_str(signature)?),
+                        None => None,
+                    };
+                    thinking.push(ThinkingRecord {
+                        text_blob,
+                        signature_blob,
+                    });
+                }
+                ContentBlock::Text(t) => text.push_str(&t.text),
+                _ => {}
+            }
+        }
+
+        // The turn's actual product. An earlier version recorded only the block
+        // *type names* here, so the words themselves never reached the record —
+        // which broke L2's completeness, the decision layer's "每轮最终答复", and
+        // the next generation's ability to verify against the primary record.
+        let text_blob = if text.is_empty() {
             None
         } else {
-            Some(self.journal.blobs().put_str(&thinking)?)
+            Some(blobs.put_str(&text)?)
         };
 
         self.journal
@@ -393,8 +452,8 @@ impl Agent {
                         .unwrap_or_else(|| "<absent>".to_owned()),
                     usage: msg.usage.to_observed(),
                     blocks: msg.content.iter().map(|b| b.type_name().to_owned()).collect(),
-                    thinking_blob,
-                    thinking_signature: signature,
+                    thinking,
+                    text_blob,
                 },
             )
             .await?;
@@ -431,11 +490,12 @@ impl Agent {
             let registry = self.tools.clone();
             let ctx = self.ctx.clone();
             let journal = self.journal.clone();
+            let timeline = self.timeline.clone();
             handles.push((
                 index,
                 spawn_abortable(async move {
                     let _admission = gate.admit(true).await;
-                    run_one(registry, ctx, journal, tu, pressure).await
+                    run_one(registry, ctx, journal, tu, pressure, timeline).await
                 }),
             ));
         }
@@ -458,6 +518,7 @@ impl Agent {
                 self.journal.clone(),
                 tu,
                 pressure,
+                self.timeline.clone(),
             )
             .await?;
             slots[index] = Some(outcome);
@@ -483,6 +544,7 @@ async fn run_one(
     journal: Arc<Journal>,
     tu: ToolUseBlock,
     pressure: Pressure,
+    timeline: Arc<Timeline>,
 ) -> Result<(ContentBlock, Reduction), yu_wire::WireError> {
     let name = tu.name.clone();
     let input = tu.input.clone();
@@ -490,6 +552,7 @@ async fn run_one(
     // `ctx` is needed both inside the blocking task and afterwards, for
     // reduction, so the task gets its own clone.
     let ctx_for_tool = ctx.clone();
+    let tool_timer = timeline.start(SpanKind::ToolExec).label(name.clone());
     let raw = tokio::task::spawn_blocking(move || match registry.get(&name) {
         Some(tool) => tool.execute(&input, &ctx_for_tool),
         None => ToolResult::inline(
@@ -501,18 +564,48 @@ async fn run_one(
     })
     .await
     .map_err(|e| yu_wire::WireError::transport(format!("tool panicked: {e}")))?;
+    let executed = tool_timer
+        .attr("bytes", raw.size as i64)
+        .attr("kind", raw.kind.as_str())
+        .finish();
+    tracing::debug!(
+        elapsed_us = executed.elapsed_ns / 1000,
+        tool = %tu.name,
+        bytes = raw.size,
+        "tool_exec"
+    );
 
     // Spilling goes through the journal's content-addressed store, so a re-read
     // of a spilled payload is the same digest and the reducer can refuse to
-    // spill it twice.
+    // spill it twice. A store that fails answers with the empty string, which is
+    // the reducer's "not stored": it passes the payload through rather than
+    // handing the model an address that would not resolve, and the refusal is
+    // recorded rather than smoothed over.
     let blobs: &BlobStore = journal.blobs();
+    let mut refused = false;
     let mut spill = |bytes: &[u8]| -> String {
-        blobs.put(bytes).unwrap_or_else(|e| {
-            tracing::error!(error = %e, "spill failed; the pointer will be dangling");
-            String::new()
-        })
+        match blobs.put(bytes) {
+            Ok(digest) => digest,
+            Err(error) => {
+                refused = true;
+                tracing::error!(
+                    error = %error,
+                    bytes = bytes.len(),
+                    "spill refused; the payload will be passed through"
+                );
+                String::new()
+            }
+        }
     };
+    let raw_bytes = raw.size;
+    let reduce_timer = timeline.start(SpanKind::Reduce).label(tu.name.clone());
     let (reduction, reduced) = ctx.reduce(raw, pressure, &mut spill);
+    let reduced_span = reduce_timer
+        .attr("path", reduction_name(&reduction, refused))
+        .attr("bytes_in", raw_bytes as i64)
+        .attr("bytes_out", reduced.render().len() as i64)
+        .finish();
+    tracing::debug!(elapsed_us = reduced_span.elapsed_ns / 1000, "reduce");
 
     // L2 constraint 1: the payload is recorded exactly once, and which of the
     // two fields carries it is decided here rather than left to chance.
@@ -536,7 +629,7 @@ async fn run_one(
                 addressable: reduced.addressable,
                 inline,
                 blob,
-                reduction: Some(reduction_name(&reduction).to_owned()),
+                reduction: Some(reduction_name(&reduction, refused).to_owned()),
             },
         )
         .await
@@ -558,8 +651,14 @@ fn supports_parallel(name: &str) -> bool {
     matches!(name, "read_file" | "list_dir")
 }
 
-fn reduction_name(r: &Reduction) -> &'static str {
+/// The name recorded for a reduction is the path the result actually took.
+///
+/// Not always the one `choose` proposed: a spill the store refused comes back as
+/// a pass-through (see `Reducer::apply`), and a journal that kept the proposed
+/// name would record a spill that never happened.
+fn reduction_name(r: &Reduction, spill_refused: bool) -> &'static str {
     match r {
+        Reduction::SpillWithPointer { .. } if spill_refused => "spill_failed_pass_through",
         Reduction::PassThrough => "pass_through",
         Reduction::DropWithManifest { .. } => "drop_with_manifest",
         Reduction::SpillWithPointer { .. } => "spill_with_pointer",
@@ -602,12 +701,67 @@ fn pressure_from(usage: &yu_wire::types::Usage) -> Pressure {
     Pressure::with_fill(occupied as f64 / WINDOW as f64)
 }
 
-fn request_digest(req: &MessagesRequest) -> String {
+pub(crate) fn request_digest(req: &MessagesRequest) -> String {
     let mut hasher = Sha256::new();
     hasher.update(req.model.as_bytes());
     hasher.update(req.max_tokens.to_le_bytes());
-    for m in &req.messages {
-        hasher.update(m.content.concat_text().as_bytes());
+
+    // Everything that shapes the request has to be in here. On an endpoint whose
+    // caching is purely prefix-based and whose `cache_control` is inert
+    // (WIRE-FACTS Quirk 3), an invisible prefix is an invisible cache: two
+    // requests with entirely different system prompts would otherwise share a
+    // digest and be recorded as "the same view re-sent", which is the opposite
+    // of what the journal is for.
+    if let Some(system) = &req.system {
+        for block in system {
+            hasher.update(block.text.as_bytes());
+            hasher.update([0]);
+        }
+    }
+    if let Some(tools) = &req.tools {
+        for tool in tools {
+            hasher.update(tool.name().as_bytes());
+            match tool {
+                ToolDefinition::Custom(c) => {
+                    hasher.update(c.description.as_deref().unwrap_or("").as_bytes());
+                    hasher.update(c.input_schema.to_string().as_bytes());
+                }
+                ToolDefinition::Server(server) => hasher.update(server.kind.as_bytes()),
+            }
+            hasher.update([0]);
+        }
+    }
+    if let Some(thinking) = &req.thinking {
+        hasher.update(
+            serde_json::to_string(thinking)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
+    if let Some(output) = &req.output_config {
+        hasher.update(
+            serde_json::to_string(output)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+    }
+
+    for message in &req.messages {
+        // Walk the blocks, not just the concatenated text: a turn's thinking and
+        // tool calls are part of what is sent, and on this endpoint replaying
+        // them is mandatory rather than optional.
+        for block in message.blocks() {
+            hasher.update(block.type_name().as_bytes());
+            match &block {
+                ContentBlock::ToolUse(t) => {
+                    hasher.update(t.id.as_bytes());
+                    hasher.update(t.input.to_string().as_bytes());
+                }
+                ContentBlock::ToolResult(t) => hasher.update(t.tool_use_id.as_bytes()),
+                _ => {}
+            }
+        }
+        hasher.update(message.content.concat_text().as_bytes());
         hasher.update([0]);
     }
     hex::encode(&hasher.finalize()[..16])
@@ -616,7 +770,10 @@ fn request_digest(req: &MessagesRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+    use yu_journal::{SessionId, digest_of};
+    use yu_tools::{Provenance, Tool};
+    use yu_wire::types::{CustomTool, ToolDefinition};
 
     #[test]
     fn unknown_tools_are_serial_by_default() {
@@ -713,10 +870,272 @@ mod tests {
         assert_ne!(request_digest(&a), request_digest(&c));
     }
 
+    /// The digest has to cover the whole *prefix*, not just the messages.
+    ///
+    /// The previous version hashed model, max_tokens and message text only, so
+    /// two requests whose system prompts were completely different shared a
+    /// digest — and the journal recorded them as the same view re-sent. On an
+    /// endpoint where caching is purely prefix-based (WIRE-FACTS Quirk 3), that
+    /// is a cache you cannot see.
+    #[test]
+    fn the_digest_covers_the_prefix_and_not_only_the_messages() {
+        let base = MessagesRequest::new("m", 100, vec![Message::user("hello")]);
+
+        let terse = base
+            .clone()
+            .system(vec![SystemBlock::text("Answer in one word.")]);
+        let verbose = base
+            .clone()
+            .system(vec![SystemBlock::text("Explain your reasoning at length.")]);
+        assert_ne!(
+            request_digest(&terse),
+            request_digest(&verbose),
+            "two different system prompts must not share a digest"
+        );
+        assert_ne!(
+            request_digest(&base),
+            request_digest(&terse),
+            "adding a system prompt must change the digest"
+        );
+
+        let with_tools = base.clone().tools(vec![crate::delegate::delegate_tool()]);
+        assert_ne!(
+            request_digest(&base),
+            request_digest(&with_tools),
+            "the tool set is part of the prefix"
+        );
+
+        let mut with_thinking = base.clone();
+        with_thinking.thinking = Some(Thinking::adaptive());
+        assert_ne!(
+            request_digest(&base),
+            request_digest(&with_thinking),
+            "the thinking configuration changes what is sent"
+        );
+
+        let with_effort = base.clone().effort(Effort::Xhigh);
+        assert_ne!(
+            request_digest(&base),
+            request_digest(&with_effort),
+            "effort changes what is sent"
+        );
+    }
+
+    /// Replaying a turn is part of the request, so it is part of the digest.
+    ///
+    /// A tool result carries the id it answers, and on this endpoint those ids
+    /// must be replayed verbatim (Quirk 2) — so two histories that differ only in
+    /// which call a result answers are genuinely different requests.
+    #[test]
+    fn the_digest_sees_tool_results_and_their_ids() {
+        let blocks = |id: &str| {
+            vec![ContentBlock::ToolResult(yu_wire::types::ToolResultBlock::text(
+                id, "14:32 JST",
+            ))]
+        };
+        let a = MessagesRequest::new("m", 100, vec![Message::user(blocks("call_00_a"))]);
+        let b = MessagesRequest::new("m", 100, vec![Message::user(blocks("call_00_b"))]);
+        assert_ne!(request_digest(&a), request_digest(&b));
+    }
+
     #[test]
     fn executor_effort_is_below_the_decision_layer_default() {
         // DESIGN: the decision layer runs `xhigh`; the execution layer is
         // deliberately degraded.
         assert_eq!(EXECUTOR_EFFORT, Effort::Medium);
+    }
+
+    // -----------------------------------------------------------------------
+    // A spill the store refused must not become a pointer
+    // -----------------------------------------------------------------------
+
+    /// A tool whose payload is large enough, and irreproducible enough, to take
+    /// the spill path.
+    struct BigResult;
+
+    const BIG_BYTES: usize = 20_000;
+
+    fn big_payload() -> String {
+        "x".repeat(BIG_BYTES)
+    }
+
+    impl Tool for BigResult {
+        fn name(&self) -> &str {
+            "big_result"
+        }
+
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition::Custom(CustomTool::new(
+                self.name(),
+                "Return a large, irreproducible payload.",
+                json!({"type": "object", "properties": {}}),
+            ))
+        }
+
+        fn execute(&self, _input: &Value, _ctx: &ToolContext) -> ToolResult {
+            ToolResult {
+                payload: Payload::Inline(big_payload()),
+                kind: ResultKind::File,
+                size: BIG_BYTES as u64,
+                reproducible: false,
+                addressable: true,
+                provenance: Provenance::new(self.name(), json!({})),
+            }
+        }
+    }
+
+    fn big_call() -> ToolUseBlock {
+        ToolUseBlock {
+            id: "call_00_big".to_owned(),
+            name: "big_result".to_owned(),
+            input: json!({}),
+        }
+    }
+
+    fn registry() -> Arc<ToolRegistry> {
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(BigResult));
+        Arc::new(registry)
+    }
+
+    /// A scratch directory this test owns. `tempfile` is not a dependency of
+    /// this crate, and the directory is re-created empty, so a leftover from a
+    /// failed run can never be read as part of a passing one.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("yu-core-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The text the model receives — the place a pointer would lie in.
+    fn block_text(block: &ContentBlock) -> String {
+        let ContentBlock::ToolResult(block) = block else {
+            panic!("expected a tool_result block, got {block:?}");
+        };
+        block
+            .content
+            .as_ref()
+            .and_then(|content| content.as_text())
+            .expect("a tool result carries text")
+            .to_owned()
+    }
+
+    /// A short prefix of `text` for a failure message; payloads are tens of KB.
+    fn snippet(text: &str) -> &str {
+        let mut end = text.len().min(200);
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    }
+
+    #[tokio::test]
+    async fn a_refused_spill_is_passed_through_and_never_named_as_a_blob() {
+        let dir = scratch_dir("spill-refused");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let payload = big_payload();
+
+        // A file where the payload's shard directory would have to be created:
+        // the store cannot file these bytes, which is the failure under test.
+        let shard = dir.join("blobs").join(&digest_of(payload.as_bytes())[..2]);
+        std::fs::write(&shard, b"in the way").unwrap();
+
+        let (block, _) = run_one(
+            registry(),
+            ToolContext::with_default_budget(&dir),
+            journal.clone(),
+            big_call(),
+            Pressure::high(),
+            Timeline::new(),
+        )
+        .await
+        .unwrap();
+
+        // The model gets the bytes themselves and no address at all: the
+        // provisional `fnv1a64:` digest resolves in no store.
+        let text = block_text(&block);
+        assert!(
+            text.contains(&payload),
+            "a refused spill must pass the payload through; the model got: {}",
+            snippet(&text)
+        );
+        assert!(
+            !text.contains("fnv1a64:")
+                && !text.contains("saved as blob")
+                && !text.contains("on disk"),
+            "a refused spill must not claim an address that does not resolve: {}",
+            snippet(&text)
+        );
+
+        // And the journal records where the bytes actually are.
+        let events = journal.events().await.unwrap();
+        let mut recorded = 0;
+        for event in &events {
+            if let EventBody::ToolResult {
+                inline,
+                blob,
+                reduction,
+                ..
+            } = &event.body
+            {
+                recorded += 1;
+                assert_eq!(
+                    blob.as_deref(),
+                    None,
+                    "the journal must not name a blob the store does not hold"
+                );
+                assert_eq!(inline.as_deref(), Some(payload.as_str()));
+                assert_eq!(reduction.as_deref(), Some("spill_failed_pass_through"));
+            }
+        }
+        assert_eq!(recorded, 1, "exactly one tool result is recorded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stored_spill_names_the_blob_the_store_actually_holds() {
+        // The pair to the test above: when the store accepts, the pointer names
+        // a digest that resolves — so a refusal test cannot pass by the spill
+        // path simply never running.
+        let dir = scratch_dir("spill-stored");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let payload = big_payload();
+        let digest = digest_of(payload.as_bytes());
+
+        let (block, _) = run_one(
+            registry(),
+            ToolContext::with_default_budget(&dir),
+            journal.clone(),
+            big_call(),
+            Pressure::high(),
+            Timeline::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            journal.blobs().has(&digest),
+            "the named blob must be in the store"
+        );
+        assert!(block_text(&block).contains(&digest));
+
+        let events = journal.events().await.unwrap();
+        let mut recorded = 0;
+        for event in &events {
+            if let EventBody::ToolResult {
+                inline,
+                blob,
+                reduction,
+                ..
+            } = &event.body
+            {
+                recorded += 1;
+                assert_eq!(blob.as_deref(), Some(digest.as_str()));
+                assert_eq!(inline.as_deref(), None);
+                assert_eq!(reduction.as_deref(), Some("spill_with_pointer"));
+            }
+        }
+        assert_eq!(recorded, 1, "exactly one tool result is recorded");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

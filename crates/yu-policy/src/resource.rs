@@ -495,3 +495,179 @@ mod tests {
         assert_eq!(WasmtimeHost.engine_name(), "wasmtime");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Injection
+// ---------------------------------------------------------------------------
+
+/// The wire that makes constraint 0 true rather than aspirational.
+///
+/// DESIGN: "**约束靠注入,不靠记忆**" — every layer, every turn, is *given* its
+/// constraints. `yu-core` defines the trait and must not depend on this crate;
+/// this is the other half, where a parsed policy becomes something the loop can
+/// ask. Until this impl existed, the acceptance criterion ("changing one policy
+/// rule must not require recompiling Rust") held only for parsing a file: the
+/// rules could be read and nothing could read them.
+impl yu_core::traits::PolicySource for Policy {
+    fn prompt(&self, name: &str) -> Option<String> {
+        self.prompts.get(name).cloned()
+    }
+
+    fn budget(&self, name: &str) -> Option<u64> {
+        // Budgets are named fields rather than a map, so a typo in a policy is a
+        // parse error instead of a silently-unset rule. The cost is this
+        // translation, which is exhaustive by construction — a new budget field
+        // without an arm here is a compile error, not a lookup that quietly
+        // returns `None`.
+        let Budgets {
+            max_steps,
+            max_input_tokens,
+            max_output_tokens,
+            max_tool_calls,
+        } = &self.budgets;
+        match name {
+            "max_steps" => *max_steps,
+            "max_input_tokens" => *max_input_tokens,
+            "max_output_tokens" => *max_output_tokens,
+            "max_tool_calls" => *max_tool_calls,
+            _ => None,
+        }
+    }
+
+    fn rule(&self, name: &str) -> Option<serde_json::Value> {
+        // One namespace across the tables, so a caller asks for a rule by name
+        // without having to know which table it was declared in — the thing that
+        // lets topology be chosen at run time rather than compiled in.
+        if let Some(topology) = self.topology.get(name) {
+            return serde_json::to_value(topology).ok();
+        }
+        if name == "reduction" {
+            return serde_json::to_value(&self.reduction).ok();
+        }
+        self.hooks
+            .iter()
+            .find(|h| h.on == name)
+            .and_then(|h| serde_json::to_value(h).ok())
+    }
+}
+
+#[cfg(test)]
+mod policy_source_tests {
+    use super::*;
+    use yu_core::traits::{EmptyPolicy, PolicySource};
+
+    /// The acceptance criterion for constraint 0, stated as a test.
+    ///
+    /// Two policies that differ only in their TOML must produce two different
+    /// answers through the *same* compiled code path. If any decision were
+    /// compiled into Rust, these would have to agree.
+    #[test]
+    fn two_policies_answer_differently_through_the_same_code() {
+        let a = Policy::from_toml_str(
+            r#"
+            [prompts]
+            decision_charter = "Ship the smallest change that works."
+
+            [budgets]
+            max_steps = 10
+            "#,
+        )
+        .unwrap();
+        let b = Policy::from_toml_str(
+            r#"
+            [prompts]
+            decision_charter = "Stop at the first sign of trouble."
+
+            [budgets]
+            max_steps = 999
+            "#,
+        )
+        .unwrap();
+
+        assert_ne!(
+            PolicySource::prompt(&a, "decision_charter"),
+            PolicySource::prompt(&b, "decision_charter")
+        );
+        assert_eq!(PolicySource::budget(&a, "max_steps"), Some(10));
+        assert_eq!(PolicySource::budget(&b, "max_steps"), Some(999));
+    }
+
+    /// The injection boundary is a trait object, so a loop can hold a policy
+    /// without knowing which crate it came from.
+    #[test]
+    fn a_policy_is_usable_as_a_trait_object() {
+        let p = Policy::from_toml_str(
+            r#"
+            [prompts]
+            executor = "Do the work."
+
+            [budgets]
+            max_output_tokens = 4096
+            "#,
+        )
+        .unwrap();
+        let source: &dyn PolicySource = &p;
+        assert_eq!(source.prompt("executor").as_deref(), Some("Do the work."));
+        assert_eq!(source.budget("max_output_tokens"), Some(4096));
+    }
+
+    #[test]
+    fn an_absent_rule_is_none_rather_than_a_default() {
+        // A missing constraint must be visible as missing. Returning a default
+        // here would let an unconfigured budget look like an unlimited one.
+        let p = Policy::default();
+        assert_eq!(PolicySource::prompt(&p, "nope"), None);
+        assert_eq!(PolicySource::budget(&p, "max_steps"), None);
+        assert_eq!(PolicySource::rule(&p, "nope"), None);
+        // And the empty source agrees, so "unconfigured" reads the same however
+        // it is reached.
+        assert_eq!(PolicySource::prompt(&EmptyPolicy, "nope"), None);
+    }
+
+    #[test]
+    fn rules_are_reachable_by_name_across_tables() {
+        let p = Policy::from_toml_str(
+            r#"
+            [topology.chain]
+            kind = "chain"
+            child_role = "executor"
+
+            [[hooks]]
+            on = "before_tool_call"
+            "#,
+        )
+        .unwrap();
+        let topology = PolicySource::rule(&p, "chain").expect("topology reachable by name");
+        assert_eq!(topology["kind"], "chain");
+        let hook = PolicySource::rule(&p, "before_tool_call").expect("hook reachable by event");
+        assert_eq!(hook["on"], "before_tool_call");
+    }
+
+    #[test]
+    fn every_budget_name_the_loop_asks_for_is_answered() {
+        // Guards the translation above: a budget field that exists but is not
+        // reachable by name would read as unconfigured.
+        let p = Policy::from_toml_str(
+            r#"
+            [budgets]
+            max_steps = 1
+            max_input_tokens = 2
+            max_output_tokens = 3
+            max_tool_calls = 4
+            "#,
+        )
+        .unwrap();
+        for (name, expected) in [
+            ("max_steps", 1),
+            ("max_input_tokens", 2),
+            ("max_output_tokens", 3),
+            ("max_tool_calls", 4),
+        ] {
+            assert_eq!(
+                PolicySource::budget(&p, name),
+                Some(expected),
+                "budget `{name}` is not reachable through PolicySource"
+            );
+        }
+    }
+}

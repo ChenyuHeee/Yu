@@ -38,6 +38,14 @@ pub struct Journal {
     blobs: BlobStore,
     writer: Mutex<Writer>,
     index: RwLock<JournalIndex>,
+    /// Records the cost of journal IO.
+    ///
+    /// Held here rather than timed at each call site because DESIGN's headline
+    /// measurement — per-step overhead with model time removed — is *defined* as
+    /// the sum of the non-model spans. Journal IO is one of them, and a call
+    /// site that forgot to time itself would understate the harness's own cost
+    /// while reporting a smaller number as though it were better.
+    timeline: Option<std::sync::Arc<yu_observe::Timeline>>,
 }
 
 #[derive(Debug)]
@@ -46,6 +54,85 @@ struct Writer {
     /// Byte offset just past the last committed record: where the next line starts.
     offset: u64,
     next_seq: u64,
+    /// Why this writer no longer appends: a write failed and cutting its
+    /// fragment back out of the file failed too. The file may end inside a
+    /// record and this process can no longer tell where the boundary is, so
+    /// nothing more may be appended; reopening repairs the tail.
+    poisoned: Option<String>,
+    /// Test-only: the next append's staged failure. See [`Fault`].
+    #[cfg(test)]
+    fault: Fault,
+}
+
+/// A staged write failure for the tests.
+///
+/// The failure that matters here — a disk that takes a prefix of the line and
+/// then refuses the rest — cannot be produced on demand with a healthy file, so
+/// the test arms it at the seam.
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct Fault {
+    /// Accept this many bytes of the next write, then fail it.
+    write_after: Option<usize>,
+    /// Also fail the cut-back that follows: the only way to reach a poisoned
+    /// writer.
+    cut_back: bool,
+}
+
+impl Writer {
+    /// Write the line and hand it to the OS.
+    ///
+    /// The error may leave a prefix of the line in the file — that is what a
+    /// full disk does — which is why the caller rolls back rather than only
+    /// reporting.
+    async fn write_line(&mut self, line: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(bytes) = self.fault.write_after.take() {
+            self.file.write_all(&line[..bytes.min(line.len())]).await?;
+            return Err(std::io::Error::other("staged write failure"));
+        }
+        self.file.write_all(line).await?;
+        // Reaches the OS, so a process that dies now still has this record.
+        // Machine-level durability (fsync) is a checkpoint's job, not the job of
+        // every append.
+        self.file.flush().await
+    }
+
+    /// Cut a failed append back to the last committed record, and report why the
+    /// append failed.
+    ///
+    /// The file is O_APPEND, so the kernel — not `offset` — chose where the
+    /// fragment landed; cutting to `offset` is the only way back to the
+    /// boundary. A fragment left in place welds the next line onto itself into
+    /// one line that decodes as nothing — the corruption `repair_torn_tail`
+    /// drops at open time, prevented here at write time.
+    ///
+    /// If even the cut fails, the writer poisons itself: it cannot know where
+    /// the boundary is any more, so it must not append again. The fragment is
+    /// then an ordinary torn record, which the next open repairs.
+    async fn rollback(&mut self, offset: u64, cause: std::io::Error) -> JournalError {
+        match self.cut_back_to(offset).await {
+            Ok(()) => JournalError::Io(cause),
+            Err(cut) => {
+                let reason = format!(
+                    "append failed ({cause}), and cutting the fragment back to byte {offset} \
+                     failed too ({cut}); no further append is possible until the journal is reopened"
+                );
+                tracing::warn!("{reason}");
+                self.poisoned = Some(reason.clone());
+                JournalError::Io(std::io::Error::new(cause.kind(), reason))
+            }
+        }
+    }
+
+    /// Truncate the file to `len`: the end of the last committed record.
+    async fn cut_back_to(&mut self, len: u64) -> std::io::Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fault.cut_back) {
+            return Err(std::io::Error::other("staged cut-back failure"));
+        }
+        self.file.set_len(len).await
+    }
 }
 
 impl Journal {
@@ -94,12 +181,20 @@ impl Journal {
                 file,
                 offset,
                 next_seq,
+                poisoned: None,
+                #[cfg(test)]
+                fault: Fault::default(),
             }),
             index: RwLock::new(index),
+            timeline: None,
         })
     }
 
     /// Append one event. Returns it with its assigned `seq` and timestamp.
+    ///
+    /// An append commits the whole line or leaves the file as it was: a write
+    /// that fails partway is cut back to the last committed record, so a failure
+    /// never strands a fragment for the next line to weld onto.
     ///
     /// Blob references are not resolved here. Append is a write, and the store
     /// answers "does this reference point at anything" on read, where the answer
@@ -107,7 +202,33 @@ impl Journal {
     pub async fn append(&self, agent: AgentId, body: EventBody) -> Result<Event, JournalError> {
         body.check_stored_once()?;
 
+        let timer = self
+            .timeline
+            .as_ref()
+            .map(|t| t.start_for(yu_observe::SpanKind::Journal, agent.clone()));
+        let kind = body.kind();
+        let result = self.append_inner(agent, body).await;
+        if let Some(t) = timer {
+            let span = t
+                .attr("event", kind)
+                .attr("ok", result.is_ok())
+                .finish();
+            tracing::trace!(elapsed_us = span.elapsed_ns / 1000, kind, "journal append");
+        }
+        result
+    }
+
+    /// Attach a timeline, so journal IO is charged to the harness's own cost.
+    pub fn with_timeline(mut self, timeline: std::sync::Arc<yu_observe::Timeline>) -> Self {
+        self.timeline = Some(timeline);
+        self
+    }
+
+    async fn append_inner(&self, agent: AgentId, body: EventBody) -> Result<Event, JournalError> {
         let mut writer = self.writer.lock().await;
+        if let Some(reason) = &writer.poisoned {
+            return Err(JournalError::Io(std::io::Error::other(reason.clone())));
+        }
         let seq = writer.next_seq;
         let event = Event {
             seq,
@@ -124,11 +245,9 @@ impl Journal {
         line.push(b'\n');
 
         let offset = writer.offset;
-        writer.file.write_all(&line).await?;
-        // Reaches the OS, so a process that dies now still has this record.
-        // Machine-level durability (fsync) is a checkpoint's job, not the job of
-        // every append.
-        writer.file.flush().await?;
+        if let Err(err) = writer.write_line(&line).await {
+            return Err(writer.rollback(offset, err).await);
+        }
         writer.offset = offset + line.len() as u64;
         writer.next_seq = seq + 1;
         drop(writer);
@@ -156,6 +275,45 @@ impl Journal {
         file.seek(std::io::SeekFrom::Start(start)).await?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).await?;
+        parse_events(&bytes, start)
+    }
+
+    /// Read a bounded range of events, `from` inclusive and `until` exclusive.
+    ///
+    /// `read_from` seeks to the offset and then reads to the end of the file, so
+    /// reading event 3 of a million materialises the other 999 997 — which makes
+    /// addressing a range pointless, because the cost of addressing it is the
+    /// cost of reading everything. Both offsets are already in the index, so the
+    /// only missing piece was stopping.
+    ///
+    /// This is the precondition for `delegate_read`: a reader is sent at a
+    /// *range* of the record, and a range that costs the whole record is not a
+    /// reduction.
+    pub async fn read_range(&self, from: u64, until: u64) -> Result<Vec<Event>, JournalError> {
+        if until <= from {
+            return Ok(Vec::new());
+        }
+        let (start, end) = {
+            let index = self.index_read();
+            let Some(start) = index.offset_at_or_after(from) else {
+                return Ok(Vec::new());
+            };
+            // Exclusive upper bound: where `until` begins, or the end of what has
+            // been committed. Falling back to the file end rather than to
+            // "unbounded" keeps the read bounded even for a range that runs past
+            // the last event.
+            let end = index.offset_of(until).unwrap_or_else(|| index.committed_len());
+            (start, end)
+        };
+        if end <= start {
+            return Ok(Vec::new());
+        }
+
+        let mut file = tokio::fs::File::open(&self.path).await?;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        // Exactly the span, so the tail is never touched.
+        let mut bytes = vec![0u8; (end - start) as usize];
+        file.read_exact(&mut bytes).await?;
         parse_events(&bytes, start)
     }
 
@@ -256,6 +414,120 @@ mod tests {
 
     async fn open(dir: &Path, session: &str) -> Journal {
         Journal::open(dir, SessionId::new(session)).await.unwrap()
+    }
+
+    /// Arm the write path's failure for the next append: `bytes` of the line are
+    /// accepted and the rest refused, and the rollback that follows fails too if
+    /// `cut_back`.
+    async fn fail_next_write(journal: &Journal, bytes: usize, cut_back: bool) {
+        journal.writer.lock().await.fault = Fault {
+            write_after: Some(bytes),
+            cut_back,
+        };
+    }
+
+    /// Make the log readable through a fresh descriptor.
+    ///
+    /// macOS updates a file's size lazily for descriptors other than the one
+    /// that wrote it, so a read through a new descriptor can miss bytes that are
+    /// already in the file. fsync settles the size; a test that reads the log
+    /// behind the writer's back has to ask for that.
+    async fn sync(journal: &Journal) {
+        journal.writer.lock().await.file.sync_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_write_that_fails_partway_is_cut_back_so_the_log_still_opens() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = open(dir.path(), "s").await;
+        journal
+            .append(agent(), EventBody::Note { text: "a".into() })
+            .await
+            .unwrap();
+        sync(&journal).await;
+        let before = std::fs::read(journal.path()).unwrap();
+
+        // ENOSPC's shape: the disk accepts a prefix of the line, then refuses.
+        fail_next_write(&journal, 5, false).await;
+        let err = journal
+            .append(agent(), EventBody::Note { text: "b".into() })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JournalError::Io(_)));
+
+        // The fragment was cut back, so the file is byte-for-byte what it was
+        // before the failed append, and the index did not move either.
+        assert_eq!(std::fs::read(journal.path()).unwrap(), before);
+        assert_eq!(journal.len(), 1);
+
+        // The failed seq was never consumed, and the retry lands as a clean line.
+        let event = journal
+            .append(agent(), EventBody::Note { text: "b".into() })
+            .await
+            .unwrap();
+        assert_eq!(event.seq, 1);
+        sync(&journal).await;
+        assert_eq!(
+            std::fs::read_to_string(journal.path())
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+
+        // The property a left-behind fragment would destroy: a reopen that finds
+        // only whole records.
+        let reopened = open(dir.path(), "s").await;
+        assert_eq!(reopened.events().await.unwrap().len(), 2);
+        assert_eq!(reopened.read_from(1).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_append_that_cannot_be_cut_back_refuses_the_next_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = open(dir.path(), "s").await;
+        journal
+            .append(agent(), EventBody::Note { text: "a".into() })
+            .await
+            .unwrap();
+
+        fail_next_write(&journal, 5, true).await;
+        let err = journal
+            .append(agent(), EventBody::Note { text: "b".into() })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JournalError::Io(_)));
+
+        // The fragment is still in the file, so the writer must refuse instead of
+        // welding the next line onto it: the file is untouched by the attempt.
+        sync(&journal).await;
+        let fragment = std::fs::read_to_string(journal.path()).unwrap();
+        assert!(!fragment.ends_with('\n'));
+        let err = journal
+            .append(agent(), EventBody::Note { text: "c".into() })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, JournalError::Io(_)));
+        sync(&journal).await;
+        assert_eq!(std::fs::read_to_string(journal.path()).unwrap(), fragment);
+
+        // Reopening repairs the torn tail — the fragment is dropped, not welded —
+        // and appends resume where the last committed record ended.
+        let reopened = open(dir.path(), "s").await;
+        assert_eq!(reopened.len(), 1);
+        let event = reopened
+            .append(agent(), EventBody::Note { text: "c".into() })
+            .await
+            .unwrap();
+        assert_eq!(event.seq, 1);
+        sync(&reopened).await;
+        assert_eq!(
+            std::fs::read_to_string(journal.path())
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
     }
 
     #[tokio::test]

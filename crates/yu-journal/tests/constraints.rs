@@ -7,7 +7,7 @@
 mod common;
 
 use common::{agent, blob_files, journal_in, log_text, occurrences_under, tempdir};
-use yu_journal::{EventBody, JournalError};
+use yu_journal::{EventBody, JournalError, ThinkingRecord};
 use yu_observe::TokenUsage;
 
 /// Constraint 1: a tool result payload is stored exactly once — inline (small) or
@@ -180,8 +180,8 @@ async fn one_line_per_event_even_with_many_content_blocks() {
                     cache_creation_input_tokens: 0,
                 },
                 blocks: blocks.clone(),
-                thinking_blob: None,
-                thinking_signature: None,
+                thinking: Vec::new(),
+                text_blob: None,
             },
         )
         .await
@@ -291,12 +291,17 @@ async fn thinking_text_and_signature_round_trip_separately() {
     let journal = journal_in(dir.path(), "s").await;
 
     // The measured case DESIGN calls out: the signature is *longer* than the
-    // thinking text, and a design that concatenates them cannot tell them apart.
+    // thinking text, and a format that concatenates them cannot tell them apart.
     let thinking = "ok";
     let signature = "69164b36-fbed-4709-adfd-d6871900f038";
     assert!(signature.len() > thinking.len());
 
-    let digest = journal.blobs().put_str(thinking).unwrap();
+    // Both go to the store. The first version of this kept the signature inline
+    // and the text in a blob — backwards, because on a real Anthropic endpoint a
+    // signature is kilobytes and the JSONL line is the thing that has to stay
+    // small. The shim's 36-byte signature is a fact about the shim.
+    let text_digest = journal.blobs().put_str(thinking).unwrap();
+    let signature_digest = journal.blobs().put_str(signature).unwrap();
     journal
         .append(
             agent(),
@@ -305,34 +310,101 @@ async fn thinking_text_and_signature_round_trip_separately() {
                 stop_reason: "end_turn".into(),
                 usage: TokenUsage::default(),
                 blocks: vec![],
-                thinking_blob: Some(digest.clone()),
-                thinking_signature: Some(signature.to_owned()),
+                thinking: vec![ThinkingRecord {
+                    text_blob: text_digest.clone(),
+                    signature_blob: Some(signature_digest.clone()),
+                }],
+                text_blob: None,
             },
         )
         .await
         .unwrap();
 
     let line = log_text(&journal);
-    assert!(line.contains("thinking_blob"), "the text is referenced");
-    assert!(line.contains("thinking_signature"), "the signature is a field");
-    // The signature is on the event (it must survive replay verbatim, WIRE-FACTS
-    // Quirk 1); the text is not, and neither field contains the other.
-    assert!(line.contains(signature));
-    assert!(!line.contains(&format!("\"thinking\":\"{thinking}\"")));
-    assert_eq!(journal.blobs().get_str(&digest).unwrap(), thinking);
-    assert!(!digest.contains(signature));
-    assert!(!signature.contains(&digest));
 
-    let EventBody::ModelResponse {
-        thinking_blob,
-        thinking_signature,
-        ..
-    } = &journal.events().await.unwrap()[0].body
-    else {
+    // Neither the text nor the signature is written into the line itself. That
+    // is constraint 4, and the line's size is what it protects.
+    assert!(
+        !line.contains(signature),
+        "the signature must not be inline on the record"
+    );
+    assert!(
+        !line.contains(&format!("\"thinking\":\"{thinking}\"")),
+        "the thinking text must not be inline on the record"
+    );
+    // Both are referenced, and neither reference contains the other.
+    assert!(line.contains(&text_digest));
+    assert!(line.contains(&signature_digest));
+    assert!(!text_digest.contains(signature));
+    assert!(!signature.contains(&text_digest));
+    assert_eq!(journal.blobs().get_str(&text_digest).unwrap(), thinking);
+    assert_eq!(journal.blobs().get_str(&signature_digest).unwrap(), signature);
+
+    let EventBody::ModelResponse { thinking, .. } = &journal.events().await.unwrap()[0].body else {
         panic!("expected a model response");
     };
-    assert_eq!(thinking_blob.as_deref(), Some(digest.as_str()));
-    assert_eq!(thinking_signature.as_deref(), Some(signature));
+    assert_eq!(thinking.len(), 1, "one record per thinking block, in order");
+    assert_eq!(thinking[0].text_blob, text_digest);
+    assert_eq!(thinking[0].signature_blob.as_deref(), Some(signature_digest.as_str()));
+}
+
+/// Two thinking blocks must stay two records, in order.
+///
+/// Measured on this endpoint: a turn interleaves
+/// `thinking → text → server_tool_use → … → thinking`. An earlier version
+/// concatenated every thinking block into one string and took the *first*
+/// signature, which attaches one block's signature to another block's text —
+/// and Quirk 1 replays thinking byte-exact, so that replays as a corrupted turn.
+#[tokio::test]
+async fn interleaved_thinking_blocks_are_not_collapsed() {
+    let dir = tempdir();
+    let journal = journal_in(dir.path(), "s").await;
+
+    let first = journal.blobs().put_str("first thought").unwrap();
+    let first_sig = journal.blobs().put_str("sig-one").unwrap();
+    let second = journal.blobs().put_str("second thought").unwrap();
+    let second_sig = journal.blobs().put_str("sig-two").unwrap();
+
+    journal
+        .append(
+            agent(),
+            EventBody::ModelResponse {
+                id: "id-3".into(),
+                stop_reason: "end_turn".into(),
+                usage: TokenUsage::default(),
+                blocks: vec![
+                    "thinking".into(),
+                    "text".into(),
+                    "thinking".into(),
+                ],
+                thinking: vec![
+                    ThinkingRecord {
+                        text_blob: first.clone(),
+                        signature_blob: Some(first_sig.clone()),
+                    },
+                    ThinkingRecord {
+                        text_blob: second.clone(),
+                        signature_blob: Some(second_sig.clone()),
+                    },
+                ],
+                text_blob: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let EventBody::ModelResponse { thinking, .. } = &journal.events().await.unwrap()[0].body else {
+        panic!("expected a model response");
+    };
+    assert_eq!(thinking.len(), 2, "two blocks must stay two records");
+    assert_eq!(thinking[0].text_blob, first);
+    assert_eq!(thinking[0].signature_blob.as_deref(), Some(first_sig.as_str()));
+    assert_eq!(thinking[1].text_blob, second);
+    assert_eq!(
+        thinking[1].signature_blob.as_deref(),
+        Some(second_sig.as_str()),
+        "the second block must keep its own signature, not the first one's"
+    );
 }
 
 /// The signature-only response: DESIGN notes thinking text can be empty with the
@@ -342,6 +414,8 @@ async fn a_signature_without_thinking_text_is_still_recorded() {
     let dir = tempdir();
     let journal = journal_in(dir.path(), "s").await;
     let signature = "0".repeat(36);
+    let text_digest = journal.blobs().put_str("").unwrap();
+    let signature_digest = journal.blobs().put_str(&signature).unwrap();
 
     journal
         .append(
@@ -351,23 +425,24 @@ async fn a_signature_without_thinking_text_is_still_recorded() {
                 stop_reason: "tool_use".into(),
                 usage: TokenUsage::default(),
                 blocks: vec![],
-                thinking_blob: None,
-                thinking_signature: Some(signature.clone()),
+                thinking: vec![ThinkingRecord {
+                    text_blob: text_digest,
+                    signature_blob: Some(signature_digest.clone()),
+                }],
+                text_blob: None,
             },
         )
         .await
         .unwrap();
 
-    let events = journal.events().await.unwrap();
-    let EventBody::ModelResponse {
-        thinking_blob,
-        thinking_signature,
-        ..
-    } = &events[0].body
-    else {
+    let EventBody::ModelResponse { thinking, .. } = &journal.events().await.unwrap()[0].body else {
         panic!("expected a model response");
     };
-    assert_eq!(thinking_blob.as_deref(), None);
-    assert_eq!(thinking_signature.as_deref(), Some(signature.as_str()));
-    assert!(blob_files(journal.dir()).is_empty());
+    assert_eq!(thinking.len(), 1);
+    assert_eq!(
+        thinking[0].signature_blob.as_deref(),
+        Some(signature_digest.as_str()),
+        "a signature with no thinking text is still recorded"
+    );
+    assert_eq!(journal.blobs().get_str(&signature_digest).unwrap(), signature);
 }

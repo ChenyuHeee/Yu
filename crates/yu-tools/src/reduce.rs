@@ -11,7 +11,7 @@
 //! | unbounded shape (search / log / long thread) | dispatch a shape-specialised reader |
 //! | large structured | sandbox, return only the reduced result (PTC) |
 //!
-//! Three properties of this module are testable claims rather than prose:
+//! Four properties of this module are testable claims rather than prose:
 //!
 //! 1. [`Reducer::reader_prompt`] is *generated* from the shape and the question
 //!    and stays tiny — a reader is a reader, it does not need full tool
@@ -25,6 +25,15 @@
 //!    bytes it does not hold). flower's self-loop was reading a spilled file and
 //!    spilling the read back out; a payload that is already on disk is never
 //!    written to disk again.
+//! 4. A spill the store refuses is never rendered as a pointer. `apply` reads an
+//!    empty answer from the sink as "not stored" and passes the payload through
+//!    instead; the provisional `fnv1a64:` digest [`Reducer::choose`] computes is
+//!    not an address any store resolves, so building a pointer from it would
+//!    promise the model bytes nothing can hand it and record a blob that is not
+//!    there. The pass-through is the one downgrade that is both truthful
+//!    (nothing is omitted, so nothing is claimed) and lossless — and this path
+//!    exists precisely for payloads that cannot be obtained again, so a silent
+//!    drop would destroy the only copy.
 
 use serde::{Deserialize, Serialize};
 
@@ -225,10 +234,15 @@ impl Reducer {
     /// Apply the chosen reduction, producing the result the model will see.
     ///
     /// `spill` is called to persist bytes when the path requires it and returns
-    /// a digest; that digest is authoritative and replaces the provisional one
-    /// computed by [`Reducer::choose`]. `apply` is idempotent with respect to
-    /// spilling: a payload that carries no bytes (already dropped, already
-    /// spilled) is returned untouched rather than written out again.
+    /// the digest the store filed them under; an empty return means the store
+    /// refused them, and it is unambiguous because no store's digest is empty.
+    /// A digest the store assigned is authoritative and replaces the provisional
+    /// one computed by [`Reducer::choose`]; a refusal replaces nothing, because
+    /// that provisional digest addresses nothing — the payload is passed through
+    /// in full instead (see claim 4 in the module docs). `apply` is idempotent
+    /// with respect to spilling: a payload that carries no bytes (already
+    /// dropped, already spilled) is returned untouched rather than written out
+    /// again.
     ///
     /// `DelegateReader` and `SandboxReduce` cannot be completed here — running a
     /// subagent and running a sandbox are the caller's, not the reducer's. What
@@ -257,21 +271,32 @@ impl Reducer {
                 result
             }
 
-            Reduction::SpillWithPointer { digest, .. } => {
+            Reduction::SpillWithPointer { .. } => {
                 // No bytes to write, or the bytes are already on disk: refuse
                 // rather than spill a manifest or a second copy.
                 let Some(bytes) = payload_bytes(&result) else {
                     return result;
                 };
                 let stored = spill(bytes);
-                let digest = if stored.is_empty() {
-                    digest.clone()
-                } else {
-                    stored
-                };
-                let pointer = spill_pointer(&digest, result.size);
+
+                if stored.is_empty() {
+                    // The store refused the bytes. The provisional digest the
+                    // reduction carries is not an address it can resolve, so a
+                    // pointer built from it would send the model to bytes that
+                    // are not there while the manifest and the journal both
+                    // said "on disk". The bytes are still in hand, and this
+                    // path exists only for payloads nothing can re-obtain, so
+                    // they are passed through: the message then omits nothing,
+                    // claims nothing, and loses nothing.
+                    if let Some(text) = result.payload.text().map(str::to_owned) {
+                        result.payload = Payload::Inline(text);
+                    }
+                    return result;
+                }
+
+                let pointer = spill_pointer(&stored, result.size);
                 result.payload = Payload::Spilled {
-                    digest: digest.clone(),
+                    digest: stored.clone(),
                     pointer,
                     manifest: Manifest {
                         omitted_bytes: result.size,
@@ -283,7 +308,7 @@ impl Reducer {
                             "the full {} result is on disk; the pointer above says how to reach it, and the provenance records the call that produced it",
                             result.kind.as_str()
                         ),
-                        blob: Some(digest),
+                        blob: Some(stored),
                     },
                 };
                 result
@@ -523,7 +548,9 @@ fn payload_bytes(result: &ToolResult) -> Option<&[u8]> {
 /// The store's digest is authoritative — `apply` adopts whatever the spill
 /// closure returns. This one exists so that `choose` can return a self-contained
 /// [`Reduction`] that can be journalled *before* anything is written, which is
-/// what keeps the reduction an event rather than a side effect.
+/// what keeps the reduction an event rather than a side effect. It is never
+/// rendered as an address: when the store refuses, the payload is passed through
+/// rather than pointed at with this (see claim 4 in the module docs).
 fn content_digest(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in bytes {
@@ -754,6 +781,39 @@ mod tests {
         }
         assert!(!applied.is_complete());
         assert_eq!(applied.omitted_bytes(), 200);
+    }
+
+    #[test]
+    fn a_refused_spill_passes_the_payload_through_instead_of_naming_an_address() {
+        let mut r = result(ResultKind::File, 200);
+        r.addressable = true;
+        let reduction = Reducer::new(budget()).choose(&r, Pressure::high());
+        let Reduction::SpillWithPointer { digest, .. } = &reduction else {
+            panic!("a large, irreproducible, addressable file spills; got {reduction:?}");
+        };
+        let provisional = digest.clone();
+
+        // The store refused the write: the sink answers with the empty string,
+        // which is what the journal-backed sink returns when `BlobStore::put`
+        // fails. Nothing is in the store under any digest.
+        let mut refused = |_: &[u8]| String::new();
+        let applied = Reducer::new(budget()).apply(r, &reduction, &mut refused);
+
+        let text = applied.render();
+        assert!(
+            !text.contains(&provisional),
+            "the model must not be handed the provisional `{provisional}` digest: {text}"
+        );
+        assert!(!text.contains("fnv1a64:"), "{text}");
+        assert!(!text.contains("on disk"), "nothing was stored: {text}");
+
+        // The lossless downgrade: the model has the real bytes, and a payload
+        // with every byte present claims nothing was omitted.
+        let bytes = "x".repeat(200);
+        assert_eq!(applied.payload.text(), Some(bytes.as_str()));
+        assert!(applied.is_complete());
+        assert_eq!(applied.omitted_bytes(), 0);
+        assert_eq!(applied.payload.manifest(), None);
     }
 
     #[test]

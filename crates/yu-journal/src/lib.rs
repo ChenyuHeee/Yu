@@ -35,7 +35,7 @@ pub mod reader;
 
 pub use blob::{BlobStore, digest_of};
 pub use effect::{EffectGuard, EffectLog};
-pub use event::{Event, EventBody, SessionId};
+pub use event::{Event, EventBody, SessionId, ThinkingRecord};
 pub use log::Journal;
 pub use reader::JournalIndex;
 

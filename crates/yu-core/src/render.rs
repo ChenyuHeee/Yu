@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use yu_observe::{ContextComposition, ShapeSignal};
-use yu_wire::types::{Message, SystemBlock, TextBlock};
+use yu_wire::types::{CacheControl, ContentBlock, Message, SystemBlock, TextBlock, ToolDefinition};
 
 // ---------------------------------------------------------------------------
 // L0 — intent
@@ -117,6 +117,14 @@ pub struct Retired {
     pub item: String,
     pub reason: String,
     pub at_ms: i64,
+    /// How many active entries this actually removed.
+    ///
+    /// Recorded because "retired" and "removed something" are different claims.
+    /// A retirement that matched nothing leaves the item in state, and a reader
+    /// who assumes otherwise would believe the ledger had contracted when it had
+    /// not. Zero here says the item was not found — or had already gone.
+    #[serde(default)]
+    pub removed: usize,
 }
 
 /// L1: complete, never summarised. State is summarised only by lying.
@@ -131,15 +139,56 @@ pub struct Ledger {
 }
 
 impl Ledger {
-    /// Retire an item with a reason. DESIGN's `retire(item, reason)`: explicit,
-    /// auditable, reversible — and isomorphic to Codex's `new_context` in that
-    /// the agent may ask for it rather than only waiting for a threshold.
-    pub fn retire(&mut self, item: impl Into<String>, reason: impl Into<String>) {
+    /// Retire an item: **remove it from active state** and record why.
+    ///
+    /// DESIGN's `retire(item, reason)` — explicit, auditable, reversible, and
+    /// isomorphic to Codex's `new_context` in that the agent may ask for it
+    /// rather than only waiting for a threshold.
+    ///
+    /// The removal is the point. An earlier version only appended to `retired`,
+    /// which meant a finished item stayed in `decisions` *and* appeared under
+    /// `retired` — counted twice, and the view grew monotonically. That is the
+    /// exact failure the whole design exists to prevent: L1 contracts by
+    /// completion, not by compression, and completion means the item leaves.
+    ///
+    /// Returns how many active entries were removed, so a caller can tell
+    /// "retired" from "retired something".
+    pub fn retire(&mut self, item: impl Into<String>, reason: impl Into<String>) -> usize {
+        let item = item.into();
+        let before = self.active_len();
+
+        self.decisions.retain(|d| d.what != item);
+        self.open_questions.retain(|q| q != &item);
+        self.rejected.retain(|r| r.what != item);
+        self.roster.retain(|r| r != &item);
+
+        let removed = before - self.active_len();
         self.retired.push(Retired {
-            item: item.into(),
+            item,
             reason: reason.into(),
             at_ms: yu_observe::now_ms(),
+            removed,
         });
+        removed
+    }
+
+    /// Entries currently in state — the part that is supposed to stay bounded.
+    ///
+    /// `retired` is deliberately excluded: it is an audit trail, not state, and
+    /// counting it would hide the very growth this measures.
+    pub fn active_len(&self) -> usize {
+        self.decisions.len()
+            + self.open_questions.len()
+            + self.rejected.len()
+            + self.roster.len()
+    }
+
+    /// Whether the ledger has entries whose text this retirement would match.
+    pub fn holds(&self, item: &str) -> bool {
+        self.decisions.iter().any(|d| d.what == item)
+            || self.open_questions.iter().any(|q| q == item)
+            || self.rejected.iter().any(|r| r.what == item)
+            || self.roster.iter().any(|r| r == item)
     }
 }
 
@@ -227,20 +276,37 @@ impl NotLoaded {
         if self.entries.is_empty() {
             return String::new();
         }
-        let mut out = String::from(
-            "NOT LOADED — these exist in the record and are deliberately not in this view.\n\
-             This list is complete; nothing was silently dropped. To use any of it, delegate \
-             a fresh reader rather than loading it here.\n",
+        // One line per entry, with the standing instruction stated once.
+        //
+        // Measured: written out in full prose per entry, this manifest was the
+        // largest single consumer of the decision layer's context — larger than
+        // the tool results it was describing. Every entry repeated the same two
+        // sentences, and a reader does not need "delegate a reader rather than
+        // loading it here" twelve times to have read it once.
+        //
+        // What is *not* compressed: the list is still complete, each entry still
+        // names its size and its address, and it still says outright that
+        // nothing was dropped. DESIGN's rule is that a manifest must not lie
+        // about what it omitted — not that it must be verbose about it.
+        const DEFAULT_LOAD: &str = "delegate a reader for it";
+        let mut out = format!(
+            "NOT LOADED — {} entr{}, {} bytes, complete: nothing was silently dropped.\n\
+             Delegate a reader for any of these rather than loading it into this view.\n",
+            self.entries.len(),
+            if self.entries.len() == 1 { "y" } else { "ies" },
+            self.total_bytes()
         );
         for e in &self.entries {
             out.push_str(&format!(
-                "  - {} ({} bytes) at {}\n    left out because: {}\n    to load: {}\n",
-                e.what,
-                e.bytes,
-                e.address,
-                e.why,
-                e.how_to_load
+                "  - {} — {}B — {} — {}",
+                e.what, e.bytes, e.address, e.why
             ));
+            // Only when it differs from the standing instruction, so the
+            // exception is visible rather than buried in repetition.
+            if e.how_to_load != DEFAULT_LOAD {
+                out.push_str(&format!(" [load via: {}]", e.how_to_load));
+            }
+            out.push('\n');
         }
         out
     }
@@ -251,9 +317,24 @@ impl NotLoaded {
 // ---------------------------------------------------------------------------
 
 pub struct RenderInput<'a> {
+    /// The layer's own prompt.
+    ///
+    /// Constant for a given layer, so it sits at the very front of the request
+    /// where it is the most cacheable bytes there are. Passed in rather than
+    /// baked in because it is a resource, not code — DESIGN's constraint 0.
+    pub prompt: &'a str,
+    /// L0.
     pub charter: &'a Charter,
+    /// L1.
     pub ledger: &'a Ledger,
-    /// This turn's report from the executor.
+    /// The tools the layer may call.
+    ///
+    /// Part of the rendered prefix, and rendered *here*, because DESIGN fixes
+    /// the render order as `tools` → `system` → `messages`. Assembling tools
+    /// somewhere else splits the prefix across two authors, and a prefix with
+    /// two authors drifts.
+    pub tools: &'a [ToolDefinition],
+    /// This round's report from the executor.
     pub report: Option<&'a str>,
     pub evidence: &'a [Evidence],
     /// Cheap proxies the decision layer watches instead of reading the tool stream.
@@ -265,12 +346,14 @@ pub struct RenderInput<'a> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct View {
     pub system: Vec<SystemBlock>,
+    /// The tools, rendered into the prefix and cache-marked alongside it.
+    pub tools: Vec<ToolDefinition>,
     pub messages: Vec<Message>,
     pub not_loaded: NotLoaded,
     /// DESIGN's acceptance metric, computed at render time so it is always
     /// available rather than reconstructed afterwards.
     pub composition: ContextComposition,
-    /// SHA-256 over the rendered bytes.
+    /// SHA-256 over the whole rendered prefix and messages.
     ///
     /// DESIGN makes byte stability an iron law for cache reuse. This turns it
     /// into something that can be asserted in a test instead of assumed.
@@ -279,8 +362,23 @@ pub struct View {
 
 impl View {
     /// Recompute the digest from the current contents.
+    ///
+    /// Covers tools as well as system and messages: the render order puts tools
+    /// first, so a tool change invalidates everything after it, and a digest
+    /// that ignored tools would report a stable prefix across a change that
+    /// breaks the cache.
     pub fn compute_digest(&self) -> String {
         let mut hasher = Sha256::new();
+        for t in &self.tools {
+            hasher.update(t.name().as_bytes());
+            if let ToolDefinition::Custom(c) = t {
+                hasher.update(c.description.as_deref().unwrap_or("").as_bytes());
+                hasher.update(c.input_schema.to_string().as_bytes());
+            } else if let ToolDefinition::Server(s) = t {
+                hasher.update(s.kind.as_bytes());
+            }
+            hasher.update([0]);
+        }
         for b in &self.system {
             hasher.update(b.text.as_bytes());
             hasher.update([0]);
@@ -295,6 +393,120 @@ impl View {
     pub fn tool_machinery_ratio(&self) -> Option<f64> {
         self.composition.tool_machinery_ratio()
     }
+
+    /// Cache breakpoints in this view. Must never exceed the API's limit.
+    pub fn cache_breakpoints(&self) -> usize {
+        self.tools
+            .iter()
+            .filter(|t| matches!(t, ToolDefinition::Custom(c) if c.cache_control.is_some()))
+            .count()
+            + self
+                .system
+                .iter()
+                .filter(|b| b.cache_control.is_some())
+                .count()
+    }
+}
+
+/// Mark a tool as the end of a cacheable prefix.
+fn mark_tool_breakpoint(tool: &mut ToolDefinition) {
+    if let ToolDefinition::Custom(c) = tool {
+        c.cache_control = Some(CacheControl::ephemeral());
+    }
+}
+
+/// Bytes a tool definition occupies in the context.
+///
+/// Shared rather than reimplemented, so the prefix measurement here and the
+/// conversation measurement in the loops cannot disagree about what a tool
+/// costs.
+pub fn tool_definition_chars(tools: &[ToolDefinition]) -> u64 {
+    tools
+        .iter()
+        .map(|t| match t {
+            ToolDefinition::Custom(c) => (c.name.len()
+                + c.description.as_deref().unwrap_or("").len()
+                + c.input_schema.to_string().len()) as u64,
+            ToolDefinition::Server(s) => (s.kind.len() + s.name.len()) as u64,
+        })
+        .sum()
+}
+
+/// Accumulates what a context is actually made of, as it is built.
+///
+/// DESIGN's acceptance criterion names two numbers: the tool-machinery ratio in
+/// the **decision** layer's context and in the **executor's**. Both are measured
+/// with this, deliberately. Two implementations would drift, and the drift would
+/// be invisible — each number would look plausible on its own, and the comparison
+/// the whole design rests on would be between two different quantities.
+///
+/// The earlier version of this measurement lived in `render`, hardcoded
+/// `tool_call_chars` to zero and took `tool_result_chars` from the manifest's own
+/// prose. Applied to a decision-layer view — which by construction holds no tool
+/// output — it could only ever report approximately zero. A metric that cannot
+/// fail detects nothing, which is why the ratio is now computed where the
+/// conversation actually exists.
+#[derive(Debug, Default, Clone)]
+pub struct CompositionMeter {
+    tool_call_chars: u64,
+    tool_result_chars: u64,
+    tool_definition_chars: u64,
+    total_chars: u64,
+}
+
+impl CompositionMeter {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Charge the tool definitions, which occupy context on every request.
+    pub fn add_tools(&mut self, tools: &[ToolDefinition]) {
+        let chars = tool_definition_chars(tools);
+        self.tool_definition_chars += chars;
+        self.total_chars += chars;
+    }
+
+    pub fn add_system(&mut self, blocks: &[SystemBlock]) {
+        self.total_chars += blocks.iter().map(|b| b.text.len() as u64).sum::<u64>();
+    }
+
+    pub fn add_message(&mut self, message: &Message) {
+        for block in message.blocks() {
+            let chars = match &block {
+                ContentBlock::Text(t) => t.text.len() as u64,
+                ContentBlock::ToolUse(t) => serde_json::to_string(&t.input)
+                    .map(|s| s.len())
+                    .unwrap_or(0) as u64,
+                ContentBlock::ToolResult(t) => match &t.content {
+                    Some(yu_wire::types::ToolResultContent::Text(s)) => s.len() as u64,
+                    Some(yu_wire::types::ToolResultContent::Blocks(b)) => b
+                        .iter()
+                        .filter_map(|x| x.as_text())
+                        .map(|s| s.len() as u64)
+                        .sum(),
+                    None => 0,
+                },
+                ContentBlock::Thinking(t) => t.thinking.len() as u64,
+                ContentBlock::Other(v) => v.to_string().len() as u64,
+                _ => 0,
+            };
+            match &block {
+                ContentBlock::ToolUse(_) => self.tool_call_chars += chars,
+                ContentBlock::ToolResult(_) => self.tool_result_chars += chars,
+                _ => {}
+            }
+            self.total_chars += chars;
+        }
+    }
+
+    pub fn snapshot(&self) -> ContextComposition {
+        ContextComposition {
+            tool_call_chars: self.tool_call_chars,
+            tool_result_chars: self.tool_result_chars,
+            tool_definition_chars: self.tool_definition_chars,
+            total_chars: self.total_chars,
+        }
+    }
 }
 
 /// Build the view.
@@ -304,13 +516,45 @@ impl View {
 /// counter — a timestamp in the view would invalidate the cache on every turn,
 /// which is the classic silent invalidator.
 pub fn render(input: RenderInput<'_>) -> View {
-    let system = vec![SystemBlock::text(render_intent(input.charter, input.ledger))];
+    // The prefix, in the order the API renders it: tools, then system, then
+    // messages. A byte change anywhere in it invalidates everything after, so
+    // the stable parts go first and each gets a breakpoint. Four breakpoints is
+    // the API's ceiling and this uses at most four: last tool, prompt, L0, L1.
+    // Everything before the last breakpoint that still matches is reused when
+    // L1 changes — which is most turns.
+    let mut tools: Vec<ToolDefinition> = input.tools.to_vec();
+    if let Some(last) = tools.last_mut() {
+        mark_tool_breakpoint(last);
+    }
 
-    let mut volatile = String::new();
-    if let Some(report) = input.report {
-        volatile.push_str("\n## This turn\n");
-        volatile.push_str(report);
-        volatile.push('\n');
+    let system = vec![
+        // Constant for the life of the layer.
+        SystemBlock::text(input.prompt).with_cache(),
+        // L0: the charter. Changes only when the human changes their mind.
+        SystemBlock::text(render_l0(input.charter)).with_cache(),
+        // L1: the ledger. Changes whenever state changes, so it is the boundary
+        // that actually gets exercised.
+        SystemBlock::text(render_l1(input.ledger)).with_cache(),
+    ];
+
+    // The view always carries exactly one user turn, and it always says
+    // something. Two reasons, and the second is the one that bit:
+    //
+    // 1. The API requires at least one message; a request with only a system
+    //    prompt is a 400.
+    // 2. More importantly, a layer handed a view with no report has to be told
+    //    *that* — "nothing has been done yet" is information, and its absence
+    //    reads as "there is nothing to respond to".
+    let mut volatile = String::from("## This round\n");
+    match input.report {
+        Some(report) => {
+            volatile.push_str(report);
+            volatile.push('\n');
+        }
+        None => volatile.push_str(
+            "Nothing has been delegated or reported yet. Decide what to do, or \
+             delegate the work.\n",
+        ),
     }
     if !input.evidence.is_empty() {
         volatile.push_str("\n## Evidence\n");
@@ -345,20 +589,17 @@ pub fn render(input: RenderInput<'_>) -> View {
         volatile.push_str(&manifest);
     }
 
-    let messages = if volatile.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![Message::user(vec![TextBlock {
-            text: volatile.trim().to_owned(),
-            citations: None,
-        }
-        .into()])]
-    };
+    let messages = vec![Message::user(vec![TextBlock {
+        text: volatile.trim().to_owned(),
+        citations: None,
+    }
+    .into()])];
 
-    let composition = measure_composition(&system, &messages, &input);
+    let composition = measure_composition(&tools, &system, &messages, &input);
 
     let mut view = View {
         system,
+        tools,
         messages,
         not_loaded,
         composition,
@@ -368,7 +609,9 @@ pub fn render(input: RenderInput<'_>) -> View {
     view
 }
 
-fn render_intent(charter: &Charter, ledger: &Ledger) -> String {
+/// L0 — intent. Rendered as its own block so the boundary between it and L1 can
+/// carry a cache breakpoint: adding a decision must not reshuffle the charter.
+fn render_l0(charter: &Charter) -> String {
     let mut out = String::new();
     if !charter.text.is_empty() {
         out.push_str("# Charter\n");
@@ -393,6 +636,13 @@ fn render_intent(charter: &Charter, ledger: &Ledger) -> String {
             out.push_str(&format!("- ({}) {}\n", u.source, u.text));
         }
     }
+    out
+}
+
+/// L1 — state. Complete, never summarised; contracted by retirement, not by
+/// compression.
+fn render_l1(ledger: &Ledger) -> String {
+    let mut out = String::new();
     if !ledger.decisions.is_empty() {
         out.push_str("\n## Decisions\n");
         for d in &ledger.decisions {
@@ -445,33 +695,49 @@ fn describe_signal(s: &ShapeSignal) -> String {
     }
 }
 
-/// DESIGN's acceptance metric: how much of this view is tool machinery.
+/// What this *rendered prefix* is made of.
 ///
-/// The industry shape is that tool results dominate. The decision layer's target
-/// is near zero, and the point of computing it here is to make that claim
-/// falsifiable rather than aspirational.
+/// Scope matters here, and an earlier version got it wrong in a way worth
+/// recording. It hardcoded `tool_call_chars: 0` and took `tool_result_chars`
+/// from the manifest's own prose, then reported a ratio. For a decision-layer
+/// view — which by construction contains no tool output — that could only ever
+/// produce a number near zero, so the metric could not fail, and a metric that
+/// cannot fail detects nothing.
+///
+/// The rendered prefix genuinely has no tool calls or results: those arrive in
+/// the *conversation* afterwards. So this reports what the prefix does contain —
+/// the tool definitions, and the manifest, which is the one place tool output is
+/// even referred to. The ratio over a whole conversation, which is the number
+/// DESIGN's acceptance criterion actually names, is measured where the
+/// conversation exists: `crate::decision` for the decision layer and
+/// `crate::agent` for the executor.
 fn measure_composition(
+    tools: &[ToolDefinition],
     system: &[SystemBlock],
     messages: &[Message],
     input: &RenderInput<'_>,
 ) -> ContextComposition {
-    let total: u64 = system.iter().map(|b| b.text.len() as u64).sum::<u64>()
-        + messages
-            .iter()
-            .map(|m| m.content.concat_text().len() as u64)
-            .sum::<u64>();
+    let definition_chars = tool_definition_chars(tools);
 
-    // The manifest is the one place tool machinery is *supposed* to appear in a
-    // decision-layer view, and even there only as addresses rather than content.
+    // Addresses, not payloads: the manifest says what exists and how to reach
+    // it, and the payload stays where it is.
     let manifest_chars: u64 = input
         .omitted
         .iter()
         .map(|e| (e.what.len() + e.address.len() + e.why.len() + e.how_to_load.len()) as u64)
         .sum();
 
+    let total: u64 = definition_chars
+        + system.iter().map(|b| b.text.len() as u64).sum::<u64>()
+        + messages
+            .iter()
+            .map(|m| m.content.concat_text().len() as u64)
+            .sum::<u64>();
+
     ContextComposition {
         tool_call_chars: 0,
         tool_result_chars: manifest_chars,
+        tool_definition_chars: definition_chars,
         total_chars: total,
     }
 }
@@ -497,6 +763,25 @@ mod tests {
         Ledger::default()
     }
 
+    const TEST_PROMPT: &str = "You are the decision layer.";
+
+    /// The intent half of the prefix — L0 and L1, i.e. everything after the
+    /// layer's own prompt. Tests address the intent through this rather than
+    /// through `system[0]`, which is now the prompt and would silently make
+    /// every assertion here vacuous if the prompt block were ever dropped.
+    fn intent(view: &View) -> String {
+        view.system
+            .iter()
+            .skip(1)
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn delegate_tool() -> ToolDefinition {
+        crate::delegate::delegate_tool()
+    }
+
     fn render_with<'a>(
         charter: &'a Charter,
         ledger: &'a Ledger,
@@ -504,8 +789,10 @@ mod tests {
         evidence: &'a [Evidence],
     ) -> View {
         render(RenderInput {
+            prompt: TEST_PROMPT,
             charter,
             ledger,
+            tools: &[],
             report: Some("did the thing"),
             evidence,
             shape: &[],
@@ -592,9 +879,8 @@ mod tests {
             ..Ledger::default()
         };
         let view = render_with(&c, &l, &[], &[]);
-        let system = &view.system[0].text;
-        assert!(system.contains("do not re-propose"));
-        assert!(system.contains("rewrite it in Go"));
+        assert!(intent(&view).contains("do not re-propose"));
+        assert!(intent(&view).contains("rewrite it in Go"));
     }
 
     #[test]
@@ -603,9 +889,7 @@ mod tests {
         let l = empty_ledger();
         let view = render_with(&c, &l, &[], &[]);
         assert!(
-            view.system[0]
-                .text
-                .contains("just make it work, but don't touch release"),
+            intent(&view).contains("just make it work, but don't touch release"),
             "DESIGN: 人类原话原样存活"
         );
     }
@@ -620,14 +904,13 @@ mod tests {
         // auditable and reversible.
         let c = charter();
         let view = render_with(&c, &l, &[], &[]);
-        assert!(view.system[0].text.contains("done in commit 4f2a"));
+        assert!(intent(&view).contains("done in commit 4f2a"));
     }
 
     #[test]
-    fn view_size_does_not_grow_with_the_record() {
-        // DESIGN: the view is rendered, not accumulated, so it is bounded. What
-        // varies with the record is the manifest's *length*, not its content —
-        // so a large record produces addresses, never payloads.
+    fn a_large_record_costs_addresses_not_payloads() {
+        // What the *record* varies is the manifest's length, never its content:
+        // 50 entries of a megabyte each are described in a few kB of addresses.
         let c = charter();
         let l = empty_ledger();
         let small = render_with(&c, &l, &[], &[]);
@@ -643,10 +926,106 @@ mod tests {
         let large = render_with(&c, &l, &many, &[]);
         let small_len = small.messages[0].content.concat_text().len();
         let large_len = large.messages[0].content.concat_text().len();
-        // 50 entries at ~1 MB each are described in a few kB of addresses.
         assert!(large_len < 50 * 400);
         assert!(large_len > small_len);
         assert_eq!(large.messages.len(), 1, "the view stays one message");
+    }
+
+    /// The boundedness claim that actually matters, and that an earlier version
+    /// of this test suite did not check.
+    ///
+    /// The previous test here was named `view_size_does_not_grow_with_the_record`
+    /// and rendered with an **empty ledger** on both sides — so it varied the
+    /// manifest and never touched L1, which is the collection that grows
+    /// monotonically in production. It asserted a property it could not fail.
+    /// This one grows L1 for real, so it fails if the ledger stops contracting.
+    #[test]
+    fn l1_growth_is_visible_and_retirement_is_what_reverses_it() {
+        let c = charter();
+        let mut l = empty_ledger();
+
+        let size_with = |l: &Ledger| intent(&render_with(&c, l, &[], &[])).len();
+        let empty_size = size_with(&l);
+
+        // 40 decisions accumulate; the view must reflect that, or the metric
+        // below is measuring nothing.
+        for i in 0..40 {
+            l.decisions.push(Decision {
+                what: format!("decision number {i} with a reasonably long description"),
+                why: "because the alternative was worse in a way worth writing down".into(),
+                at_ms: 0,
+            });
+        }
+        let grown_size = size_with(&l);
+        assert!(
+            grown_size > empty_size,
+            "L1 growth must show up in the view, or nothing here is being measured"
+        );
+        assert_eq!(l.active_len(), 40);
+
+        // Retiring is the mechanism that reverses it — DESIGN: "靠完成收缩".
+        for i in 0..40 {
+            let removed = l.retire(
+                format!("decision number {i} with a reasonably long description"),
+                "superseded",
+            );
+            assert_eq!(removed, 1, "retire must remove the entry it names");
+        }
+        assert_eq!(l.active_len(), 0);
+        let shrunk_size = size_with(&l);
+        assert!(
+            shrunk_size < grown_size,
+            "retiring everything must shrink the view: {shrunk_size} vs {grown_size}"
+        );
+        // The audit trail survives even though the state is gone.
+        assert_eq!(l.retired.len(), 40);
+    }
+
+    #[test]
+    fn a_retired_item_leaves_state_and_is_not_counted_twice() {
+        let mut l = Ledger {
+            decisions: vec![Decision {
+                what: "rewrite the parser".into(),
+                why: "faster".into(),
+                at_ms: 0,
+            }],
+            open_questions: vec!["should we cache?".into()],
+            rejected: vec![Rejected {
+                what: "use a regex".into(),
+                why: "unreadable".into(),
+            }],
+            roster: vec!["executor-a".into()],
+            ..Ledger::default()
+        };
+        assert!(l.holds("rewrite the parser"));
+
+        assert_eq!(l.retire("rewrite the parser", "done"), 1);
+        assert!(!l.holds("rewrite the parser"));
+        // It appears once, under retired — not under both.
+        let c = charter();
+        let view = render_with(&c, &l, &[], &[]);
+        assert_eq!(
+            intent(&view).matches("rewrite the parser").count(),
+            1,
+            "a retired item must be stated once, not counted twice"
+        );
+
+        assert_eq!(l.retire("should we cache?", "answered by the load test"), 1);
+        assert_eq!(l.retire("use a regex", "reconsidering"), 1);
+        assert_eq!(l.retire("executor-a", "task finished"), 1);
+        assert_eq!(l.active_len(), 0);
+    }
+
+    #[test]
+    fn retiring_something_absent_removes_nothing_and_says_so() {
+        // "retired" and "removed something" are different claims. A retirement
+        // that matched nothing must not look like a contraction.
+        let mut l = empty_ledger();
+        let removed = l.retire("something that was never there", "tidying up");
+        assert_eq!(removed, 0);
+        assert_eq!(l.retired.len(), 1);
+        assert_eq!(l.retired[0].removed, 0);
+        assert_eq!(l.active_len(), 0);
     }
 
     #[test]
@@ -673,6 +1052,8 @@ mod tests {
         let c = charter();
         let l = empty_ledger();
         let a = render(RenderInput {
+            prompt: TEST_PROMPT,
+            tools: &[delegate_tool()],
             charter: &c,
             ledger: &l,
             report: Some("first"),
@@ -681,6 +1062,8 @@ mod tests {
             omitted: &[],
         });
         let b = render(RenderInput {
+            prompt: TEST_PROMPT,
+            tools: &[delegate_tool()],
             charter: &c,
             ledger: &l,
             report: Some("second"),
@@ -698,6 +1081,8 @@ mod tests {
         let c = charter();
         let l = empty_ledger();
         let a = render(RenderInput {
+            prompt: TEST_PROMPT,
+            tools: &[delegate_tool()],
             charter: &c,
             ledger: &l,
             report: Some("one"),
@@ -706,6 +1091,8 @@ mod tests {
             omitted: &[],
         });
         let b = render(RenderInput {
+            prompt: TEST_PROMPT,
+            tools: &[delegate_tool()],
             charter: &c,
             ledger: &l,
             report: Some("a completely different report"),
@@ -731,6 +1118,8 @@ mod tests {
             ShapeSignal::GrowthWithoutArtifact { tokens_delta: 900 },
         ];
         let view = render(RenderInput {
+            prompt: TEST_PROMPT,
+            tools: &[delegate_tool()],
             charter: &c,
             ledger: &l,
             report: None,

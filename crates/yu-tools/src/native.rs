@@ -442,6 +442,13 @@ impl ToolRegistry {
     }
 
     /// A registry with `read_file`, `write_file`, `list_dir`, `exec`.
+    /// Everything: reading, writing, and arbitrary command execution.
+    ///
+    /// This is the set an executor needs to do real work, and it is also the set
+    /// that can do real damage. It is named `native` rather than `default`
+    /// deliberately — DESIGN holds that an agent's tool surface is a decision,
+    /// and a caller should have to reach for `exec` rather than receive it by
+    /// omission.
     pub fn native(ctx_cwd: impl Into<PathBuf>) -> Self {
         let mut registry = Self::new();
         registry.cwd = ctx_cwd.into();
@@ -450,6 +457,21 @@ impl ToolRegistry {
             .register(Box::new(WriteFile))
             .register(Box::new(ListDir))
             .register(Box::new(Exec));
+        registry
+    }
+
+    /// Reading only: no `write_file`, no `exec`.
+    ///
+    /// For work that reasons about a tree without changing it, and for any run
+    /// that has not been explicitly authorised to execute commands. The
+    /// difference between this and [`Self::native`] is the whole of what an agent
+    /// can affect, so it is worth being able to state which one is in force.
+    pub fn read_only(ctx_cwd: impl Into<PathBuf>) -> Self {
+        let mut registry = Self::new();
+        registry.cwd = ctx_cwd.into();
+        registry
+            .register(Box::new(ReadFile))
+            .register(Box::new(ListDir));
         registry
     }
 

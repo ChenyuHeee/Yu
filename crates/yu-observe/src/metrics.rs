@@ -44,21 +44,38 @@ impl TokenUsage {
 /// "趋近于零". The value of this number is that it makes the claim falsifiable.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextComposition {
-    /// Characters of tool-call arguments in the rendered view.
+    /// Characters of tool-call arguments in the context.
     pub tool_call_chars: u64,
-    /// Characters of tool results in the rendered view.
+    /// Characters of tool results in the context.
     pub tool_result_chars: u64,
-    /// All characters in the rendered view.
+    /// Characters of tool *definitions* in the context.
+    ///
+    /// DESIGN's wording is "工具机制(tool 结果 + tool 调用)", which does not
+    /// name definitions — but they occupy context on every single request and
+    /// they are machinery, so a ratio that omits them under-reports precisely
+    /// the quantity the metric exists to expose. It is a separate field rather
+    /// than folded into the two above so the breakdown stays readable.
+    pub tool_definition_chars: u64,
+    /// All characters in the context, including everything above.
     pub total_chars: u64,
 }
 
 impl ContextComposition {
-    /// Tool machinery as a fraction of the view. `None` when the view is empty.
+    /// Every byte of the context that is tool machinery rather than intent,
+    /// state, or a result's prose.
+    pub fn tool_machinery_chars(&self) -> u64 {
+        self.tool_call_chars + self.tool_result_chars + self.tool_definition_chars
+    }
+
+    /// Tool machinery as a fraction of the context.
+    ///
+    /// `None` when the context is empty. Returning `Some(0.0)` there would let a
+    /// renderer that produced nothing at all look like a perfectly lean one.
     pub fn tool_machinery_ratio(&self) -> Option<f64> {
         if self.total_chars == 0 {
             return None;
         }
-        Some((self.tool_call_chars + self.tool_result_chars) as f64 / self.total_chars as f64)
+        Some(self.tool_machinery_chars() as f64 / self.total_chars as f64)
     }
 }
 

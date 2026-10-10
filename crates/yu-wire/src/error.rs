@@ -118,6 +118,10 @@ impl WireError {
                 }
             });
 
+        // Every copy of `message` — logged, journaled, serialized — is made
+        // from here, so this is the only place key material has to be stopped.
+        let message = redact_key_material(&message);
+
         // `request_id` appears either inside the message or alongside it.
         let request_id = parsed
             .get("request_id")
@@ -187,6 +191,136 @@ pub fn parse_expected_variants(message: &str) -> Vec<String> {
     out
 }
 
+/// Remove key material an error body echoed back, before it is stored anywhere.
+///
+/// WIRE-FACTS Quirk 6 measured the shape this exists for:
+///
+/// ```text
+/// Authentication Fails, Your api key: ****0000 is invalid
+/// ```
+///
+/// The endpoint masks the key but prints the characters the mask preserves —
+/// the key's real last four. `message` is public and is copied into `Display`,
+/// `Debug`, serde output and the capability profile, so the credentials are
+/// stripped at ingestion, where every copy is made from, rather than in each
+/// consumer: a consumer that forgets cannot leak what was never stored, and a
+/// consumer that does not exist yet cannot either.
+pub fn redact_key_material(message: &str) -> String {
+    redact_named_values(&redact_masked_suffix(message))
+}
+
+/// Longest run of characters that can be the preserved tail of a masked key.
+///
+/// Measured as four (`****0000`). Asterisks followed by something longer are a
+/// word that happens to follow asterisks, not a key's tail, and are left alone
+/// — redaction that eats prose trades one failure for another.
+const MAX_MASKED_SUFFIX: usize = 8;
+
+/// The characters a key, or what is left of one, can be made of.
+fn is_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '-' || c == '_'
+}
+
+/// Drop what a `****` mask preserves from the key behind it.
+///
+/// `Your api key: ****0000` loses `0000`; the mask itself stays, because the
+/// mask is what says a credential was involved, and it is not key material.
+fn redact_masked_suffix(message: &str) -> String {
+    let chars: Vec<char> = message.chars().collect();
+    let mut out = String::with_capacity(message.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] != '*' || chars.get(i + 1) != Some(&'*') {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let mut stars = i;
+        while chars.get(stars) == Some(&'*') {
+            stars += 1;
+        }
+        out.extend(chars[i..stars].iter());
+
+        let mut end = stars;
+        while chars.get(end).is_some_and(|c| is_key_char(*c)) {
+            end += 1;
+        }
+        if end - stars > MAX_MASKED_SUFFIX {
+            out.extend(chars[stars..end].iter());
+        }
+        i = end;
+    }
+    out
+}
+
+/// Words this endpoint uses to name the credential it is reporting on.
+const KEY_PHRASES: [&str; 3] = ["api key", "api_key", "apikey"];
+
+/// Replace a credential written in the clear after a key-naming phrase.
+///
+/// The measured body masks the key, but masking is the endpoint's choice and
+/// not something a client may rely on; keyed on the name rather than the mask,
+/// a body that prints the value plainly is redacted as well.
+fn redact_named_values(message: &str) -> String {
+    let chars: Vec<char> = message.chars().collect();
+    let lower: Vec<char> = chars.iter().map(|c| c.to_ascii_lowercase()).collect();
+    let mut out = String::with_capacity(message.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let Some((value_start, value_end)) = named_value(&lower, &chars, i) else {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        };
+        out.extend(chars[i..value_start].iter());
+        // The replacement is the endpoint's own marker: it keeps the sentence
+        // readable and does not pretend the key is still inspectable.
+        out.push_str("****");
+        i = value_end;
+    }
+    out
+}
+
+/// If a key-naming phrase starts at `i`, return the half-open range of the
+/// credential following it — the phrase, then `:` or `=`, then the value.
+///
+/// A value that is already a mask is [`redact_masked_suffix`]'s business, and
+/// reporting the range here would strip the mask too.
+fn named_value(lower: &[char], chars: &[char], i: usize) -> Option<(usize, usize)> {
+    let phrase_len = KEY_PHRASES
+        .iter()
+        .find(|p| starts_with_ascii(lower, i, p))?
+        .chars()
+        .count();
+    let mut j = i + phrase_len;
+    while chars.get(j) == Some(&' ') {
+        j += 1;
+    }
+    if !matches!(chars.get(j), Some(':') | Some('=')) {
+        return None;
+    }
+    j += 1;
+    while chars.get(j) == Some(&' ') {
+        j += 1;
+    }
+    let value_start = j;
+    while chars.get(j).is_some_and(|c| is_key_char(*c)) {
+        j += 1;
+    }
+    (j > value_start && chars.get(value_start) != Some(&'*')).then_some((value_start, j))
+}
+
+fn starts_with_ascii(lower: &[char], i: usize, needle: &str) -> bool {
+    let mut j = i;
+    for c in needle.chars() {
+        if lower.get(j) != Some(&c) {
+            return false;
+        }
+        j += 1;
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,6 +356,59 @@ mod tests {
         let e = WireError::from_response(401, body, None);
         assert_eq!(e.kind, ErrorKind::Auth);
         assert!(!e.is_retryable());
+    }
+
+    #[test]
+    fn an_auth_failure_does_not_keep_the_key_characters_the_mask_preserved() {
+        // The captured body, not a paraphrase of it: the mask is real and so is
+        // the suffix behind it (WIRE-FACTS Quirk 6).
+        let body = include_str!("../tests/fixtures/error_401_auth.json");
+        let e = WireError::from_response(401, body, None);
+
+        // What the message is for survives: the failure, and where to look it
+        // up. Redaction that costs diagnosis is not paid for by dropping the
+        // whole message.
+        assert!(e.message.contains("Authentication Fails"), "{}", e.message);
+        assert!(e.message.contains("****"), "{}", e.message);
+        assert_eq!(
+            e.request_id.as_deref(),
+            Some("da1437c0-3fdc-4777-a104-e06d9c918f1d")
+        );
+
+        // Every form a consumer would copy or persist is free of the suffix.
+        let copies = [
+            ("message", e.message.clone()),
+            ("Display", format!("{e}")),
+            ("Debug", format!("{e:?}")),
+            ("serde", serde_json::to_string(&e).unwrap()),
+        ];
+        for (shape, text) in copies {
+            assert!(
+                !text.contains("0000"),
+                "key characters reached {shape}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_written_in_the_clear_is_replaced_by_the_mask() {
+        // Masking is the endpoint's choice, not a client guarantee; the
+        // redaction is keyed on the name so an unmasked echo is covered too.
+        let body = r#"{"error":{"type":"authentication_error","message":"Invalid API key: sk-live-abc123 for this endpoint (request_id: r1)"}}"#;
+        let e = WireError::from_response(401, body, None);
+        assert!(!e.message.contains("sk-live-abc123"), "{}", e.message);
+        assert!(e.message.contains("request_id: r1"), "{}", e.message);
+    }
+
+    #[test]
+    fn redaction_leaves_a_message_that_names_no_key_alone() {
+        // The 422 message is the diagnostically dense one — variant list and
+        // all — and must come through untouched.
+        let raw = "Failed to deserialize the JSON body into the target type: tools[0]: \
+                   unknown variant `bash_20250124`, expected `web_search_20250305` at line 1 column 94";
+        let body = format!(r#"{{"error":{{"message":"{raw}"}}}}"#);
+        let e = WireError::from_response(422, &body, None);
+        assert_eq!(e.message, raw);
     }
 
     #[test]

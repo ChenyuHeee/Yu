@@ -243,6 +243,38 @@ impl Timeline {
         self.spans.lock().expect("timeline poisoned").push(span);
     }
 
+    /// Record a span whose duration was measured elsewhere.
+    ///
+    /// Some of DESIGN's spans are *durations*, not windows. `FirstToken` is the
+    /// clearest: it is "how long until the first content arrived", measured from
+    /// the moment the request went out — so it overlaps `WireWait` rather than
+    /// following it, and there is no window to hold a guard across. Handing the
+    /// duration in is the only honest way to record it; wrapping a timer around
+    /// nothing would produce zero, which is the bug this exists to avoid.
+    ///
+    /// `started_at_ms` is back-dated so the span sits at the point in the run it
+    /// describes rather than at the point it was recorded.
+    pub fn record_measured(
+        &self,
+        kind: SpanKind,
+        agent: AgentId,
+        elapsed_ns: u64,
+        attrs: BTreeMap<String, serde_json::Value>,
+    ) -> Span {
+        let span = Span {
+            id: self.next_id(),
+            kind,
+            agent,
+            started_at_ms: crate::now_ms() - (elapsed_ns / 1_000_000) as i64,
+            elapsed_ns,
+            model_time: kind.is_model_time(),
+            label: None,
+            attrs,
+        };
+        self.record(span.clone());
+        span
+    }
+
     pub fn spans(&self) -> Vec<Span> {
         self.spans.lock().expect("timeline poisoned").clone()
     }
