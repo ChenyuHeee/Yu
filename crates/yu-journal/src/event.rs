@@ -191,6 +191,21 @@ pub enum EventBody {
     /// L3 "先记后做" (record before acting): the intent is in the record before
     /// the side effect happens, so a replay of this branch reads the recorded
     /// result instead of performing the effect again.
+    /// This journal branches from another one.
+    ///
+    /// Recorded once, as the new branch's first event. DESIGN: "fork 用引用而非
+    /// 拷贝 —— 成本从 O(记录) 降到 O(1)", so this is the *whole* storage cost of a
+    /// fork: a pointer, not a copy. Everything before `parent_at_seq` belongs to
+    /// the parent and is read through it.
+    ///
+    /// The cache consequence is part of the record rather than something a caller
+    /// discovers later: DESIGN is explicit that "fork 的代价必须显式:从分叉点起
+    /// 缓存前缀不再匹配". A fork is not a free debugging button.
+    Forked {
+        parent: SessionId,
+        parent_at_seq: u64,
+    },
+
     /// A side effect, recorded before it happens ("先记后做").
     ///
     /// Carries its **state**, because an event's existence alone cannot say
@@ -225,6 +240,7 @@ impl EventBody {
             EventBody::Injected { .. } => "injected",
             EventBody::Note { .. } => "note",
             EventBody::Effect { .. } => "effect",
+            EventBody::Forked { .. } => "forked",
         }
     }
 

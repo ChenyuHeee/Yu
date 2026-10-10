@@ -38,6 +38,14 @@ pub struct Journal {
     blobs: BlobStore,
     writer: Mutex<Writer>,
     index: RwLock<JournalIndex>,
+    /// The branch this one was forked from, and where.
+    ///
+    /// DESIGN: "fork 用引用而非拷贝". The child holds a handle to the parent and a
+    /// seq; it copies no events. That is what makes "each work item is verified
+    /// exactly once" affordable, since verification wants to branch from a
+    /// checkpoint rather than duplicate the record up to it.
+    parent: Option<std::sync::Arc<Journal>>,
+    fork_at: Option<u64>,
     /// Records the cost of journal IO.
     ///
     /// Held here rather than timed at each call site because DESIGN's headline
@@ -187,7 +195,140 @@ impl Journal {
             }),
             index: RwLock::new(index),
             timeline: None,
+            parent: None,
+            fork_at: None,
         })
+    }
+
+    /// Branch from `parent` at `at_seq`.
+    ///
+    /// The whole storage cost is the fork marker: no event is copied, and the
+    /// parent's prefix is read through the parent. A fork from a million-event
+    /// record costs the same as a fork from a ten-event one.
+    ///
+    /// What it does *not* buy is a free cache: from `at_seq` onward the rendered
+    /// prefix differs from the parent's, which is exactly why the fork point is
+    /// recorded rather than inferred.
+    pub async fn open_fork(
+        dir: impl Into<PathBuf>,
+        session: SessionId,
+        parent: std::sync::Arc<Journal>,
+        at_seq: u64,
+    ) -> Result<Self, JournalError> {
+        let parent_session = parent.session().clone();
+        let journal = Self::open(dir, session).await?;
+        // Seq numbering continues across the lineage rather than restarting.
+        //
+        // This is not cosmetic. A branch that restarts at zero collides with its
+        // parent's numbering immediately, so `parent_at_seq` would be ambiguous
+        // — it could name a point in the parent or a point in the grandparent,
+        // and nothing in the record would say which. Continuing the numbering
+        // gives every point in a lineage exactly one address, which is what
+        // "任意历史点可被精确重建并分叉" needs in order to mean anything.
+        journal.set_next_seq(at_seq).await?;
+        // The marker goes in first: a branch whose fork point is not the first
+        // thing in it cannot say where it came from, and a record that cannot
+        // say that is a transcript rather than a lineage.
+        journal
+            .append(
+                AgentId::new("fork"),
+                EventBody::Forked {
+                    parent: parent_session,
+                    parent_at_seq: at_seq,
+                },
+            )
+            .await?;
+        Ok(journal.with_parent(parent, at_seq))
+    }
+
+    fn with_parent(mut self, parent: std::sync::Arc<Journal>, at_seq: u64) -> Self {
+        self.parent = Some(parent);
+        self.fork_at = Some(at_seq);
+        self
+    }
+
+    /// Force the next seq. Used once, when a branch continues its parent's
+    /// numbering.
+    pub(crate) async fn set_next_seq(&self, seq: u64) -> Result<(), JournalError> {
+        self.writer.lock().await.next_seq = seq;
+        Ok(())
+    }
+
+    /// The effective history: every event in the lineage, up to `until`.
+    ///
+    /// Resolved through the chain rather than from the parent's own file, because
+    /// a parent's file holds only what *it* recorded after its own fork point.
+    /// The fork markers are metadata about the record rather than things that
+    /// happened in it, so they are not part of the history.
+    pub async fn history_prefix(&self, until: u64) -> Result<Vec<Event>, JournalError> {
+        // One bound per generation, tightened as the walk descends: this branch
+        // contributes everything below `until`, and each ancestor contributes
+        // only what existed when its child branched off it. Carrying a single
+        // bound all the way down would pull in a parent's *later* events — work
+        // that happened on a branch this one never took.
+        let mut events = Vec::new();
+        let mut node = self;
+        let mut bound = until;
+        loop {
+            for event in node.events().await? {
+                if event.seq < bound && !matches!(event.body, EventBody::Forked { .. }) {
+                    events.push(event);
+                }
+            }
+            match (&node.parent, node.fork_at) {
+                (Some(parent), Some(at)) => {
+                    bound = at;
+                    node = parent.as_ref();
+                }
+                _ => break,
+            }
+        }
+        // Seqs continue across the lineage, so ordering by seq is the order the
+        // work happened in — not the order the files were read.
+        events.sort_by_key(|e| e.seq);
+        Ok(events)
+    }
+
+    /// Everything this branch inherited plus everything it recorded.
+    pub async fn history(&self) -> Result<Vec<Event>, JournalError> {
+        self.history_prefix(u64::MAX).await
+    }
+
+    /// The chain of forks this branch sits on, newest first.
+    pub fn lineage(&self) -> Vec<(SessionId, u64)> {
+        let mut chain = Vec::new();
+        let mut node = Some(self);
+        while let Some(current) = node {
+            match (&current.parent, current.fork_at) {
+                (Some(parent), Some(at_seq)) => {
+                    chain.push((parent.session().clone(), at_seq));
+                    node = Some(parent);
+                }
+                _ => node = None,
+            }
+        }
+        chain
+    }
+
+    /// Where this branch's bytes stop matching its parent's.
+    ///
+    /// DESIGN: "fork 的代价必须显式:从分叉点起缓存前缀不再匹配". Returned as a
+    /// fact rather than left to be discovered when the cache misses.
+    pub fn cache_diverges_at(&self) -> Option<(SessionId, u64)> {
+        self.parent
+            .as_ref()
+            .zip(self.fork_at)
+            .map(|(parent, at)| (parent.session().clone(), at))
+    }
+
+    /// The effect state of this branch, to seed a replay.
+    ///
+    /// DESIGN: "回放遇到已提交的 effect 直接读记录,绝不重放副作用". This is the
+    /// seed that makes that possible, and it follows the fork chain — a branch
+    /// inherits its parent's completed effects, because it inherited the work
+    /// those effects did.
+    pub async fn replay_seed(&self) -> Result<crate::EffectLog, JournalError> {
+        Ok(crate::EffectLog::from_events(&self.history().await?))
     }
 
     /// Append one event. Returns it with its assigned `seq` and timestamp.

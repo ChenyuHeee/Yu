@@ -77,3 +77,15 @@ pub fn blob_files(dir: &Path) -> Vec<PathBuf> {
 pub fn log_text(journal: &Journal) -> String {
     fs::read_to_string(journal.path()).unwrap()
 }
+
+/// Open a journal forked from `parent` at `at_seq`.
+pub async fn journal_fork(
+    dir: &std::path::Path,
+    session: &str,
+    parent: std::sync::Arc<Journal>,
+    at_seq: u64,
+) -> Journal {
+    Journal::open_fork(dir, SessionId::new(session), parent, at_seq)
+        .await
+        .expect("open a fork")
+}
