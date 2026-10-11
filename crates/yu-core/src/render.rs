@@ -1268,6 +1268,54 @@ mod tests {
         );
     }
 
+    /// The instrument has to be able to see evidence accumulate.
+    ///
+    /// DESIGN says the view is bounded, and the evidence section is the one part
+    /// of it that is not: `build_view` carries every delegation's evidence and
+    /// each block's output is rendered verbatim. This is a guard on the
+    /// *instrument*, not a claim about where the bound is — it asserts that the
+    /// number moves with the volume, because a metric that could not see this
+    /// would leave the boundedness claim unfalsifiable, and a bound nobody can
+    /// measure is a bound nobody has.
+    #[test]
+    fn the_measurement_moves_when_evidence_accumulates() {
+        let c = charter();
+        let l = empty_ledger();
+        let blocks = |n: usize| -> Vec<Evidence> {
+            (0..n)
+                .map(|i| Evidence::command(format!("cmd {i}"), "x".repeat(1000), 0))
+                .collect()
+        };
+        let measure = |n: usize| {
+            let evidence = blocks(n);
+            render(RenderInput {
+                prompt: TEST_PROMPT,
+                tools: &[delegate_tool()],
+                charter: &c,
+                ledger: &l,
+                report: Some("a report"),
+                evidence: &evidence,
+                shape: &[],
+                omitted: &[],
+            })
+        };
+
+        let one = measure(1);
+        let twelve = measure(12);
+        assert!(
+            twelve.composition.raw_material_chars
+                > one.composition.raw_material_chars + 10_000,
+            "evidence is rendered verbatim, so twelve blocks must cost about \
+             twelve times one: {} vs {}",
+            twelve.composition.raw_material_chars,
+            one.composition.raw_material_chars
+        );
+        assert!(
+            twelve.raw_material_ratio().unwrap() > one.raw_material_ratio().unwrap(),
+            "and the ratio has to move with it, or the growth stays invisible"
+        );
+    }
+
     #[test]
     fn ratio_is_undefined_for_an_empty_view_rather_than_zero() {
         // Zero and "undefined" are different claims; conflating them would let a

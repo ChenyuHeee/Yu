@@ -442,6 +442,21 @@ impl DecisionLayer {
         // Evidence from every delegation so far is carried, because DESIGN makes
         // an assertion without runnable evidence unverified, and the decision
         // layer is the one that has to notice.
+        //
+        // **This is unbounded, and it is the reason the view is not.** Each
+        // `Evidence.content` is a tool's output rendered verbatim, and this
+        // carries all of them for the whole run, so round N re-renders round 1's
+        // evidence for the Nth time — the view grows with the square of the
+        // number of rounds. An earlier version of this comment said evidence was
+        // "bounded by construction"; it is not, and the measurement now says so
+        // (`ContextComposition::raw_material_chars` counts exactly this).
+        //
+        // It is left as it is here deliberately rather than trimmed, because
+        // trimming it in place would be compression — guessing which evidence
+        // mattered. DESIGN's answer is that the decision layer should not be
+        // reading raw evidence at all: M3 replaces this section with
+        // pre-registered landing slots, and `spot_check` becomes the one channel
+        // that can pull a tool's output in, charged to this layer's own account.
         let evidence: Vec<_> = outcomes
             .iter()
             .flat_map(|o| o.evidence.iter().cloned())
@@ -453,9 +468,9 @@ impl DecisionLayer {
         // Only the last delegation's manifest. Earlier rounds' omissions are
         // already addressed by the record; restating them every round would make
         // the manifest grow with the number of rounds, which is the accumulation
-        // this whole module exists to avoid. Evidence and shape are carried in
-        // full because they are what the layer judges, and both are bounded by
-        // construction.
+        // this whole module exists to avoid. The manifest is addresses rather than
+        // payloads, so unlike the evidence above it really is bounded — by the
+        // record's size, not by the run's length.
         let omitted: Vec<_> = outcomes
             .last()
             .map(|o| o.omitted.clone())
