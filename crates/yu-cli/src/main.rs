@@ -467,6 +467,34 @@ fn report_ratio(label: &str, composition: &ContextComposition) {
     }
 }
 
+/// Print L1 as the run left it.
+///
+/// L1 is what the run *produced* — the decisions and their reasons, what was
+/// ruled out, what is still open. Printing it is not decoration: on a run that
+/// decided nothing, seeing an empty ledger is the finding, and a summary line
+/// saying "0 decisions" would read as a clean run rather than a layer that could
+/// not commit to anything.
+fn report_ledger(ledger: &yu_core::render::Ledger) {
+    eprintln!(
+        "\n--- L1: {} decision(s), {} rejected, {} open question(s)",
+        ledger.decisions.len(),
+        ledger.rejected.len(),
+        ledger.open_questions.len()
+    );
+    for d in &ledger.decisions {
+        eprintln!("      decided: {} — because {}", d.what, d.why);
+    }
+    for r in &ledger.rejected {
+        eprintln!("      ruled out: {} — because {}", r.what, r.why);
+    }
+    if ledger.decisions.is_empty() && ledger.rejected.is_empty() {
+        eprintln!(
+            "      (the run wrote nothing to state: it reached no conclusion it was \
+             willing to record)"
+        );
+    }
+}
+
 /// Print how the decision layer's context moved over the run.
 ///
 /// DESIGN says the view is bounded — "大小有界、前缀字节稳定、永不退化". That is a
@@ -612,6 +640,7 @@ async fn cmd_decide(
         outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.usage.cache_read_input_tokens
     );
 
+    report_ledger(&outcome.ledger);
     // The comparison the whole design rests on, from one run.
     report_ratio("decision layer", &outcome.composition);
     report_growth(&outcome);

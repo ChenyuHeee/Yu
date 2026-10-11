@@ -93,11 +93,16 @@ pub fn decision_tools() -> Vec<ToolDefinition> {
         )),
         ToolDefinition::Custom(CustomTool::new(
             RETIRE,
-            "Remove something finished from the ledger, with the reason it is finished. \
-             Retirement is how state contracts — it is the one way your context shrinks, \
-             so use it when an item is done rather than leaving it to accumulate. The \
-             item must match an entry's text exactly; a retirement that matches nothing \
-             removes nothing and says so.",
+            "Remove an entry from the ledger, with the reason it is going. Retirement is \
+             how state contracts — it is the one way your context shrinks, so use it when \
+             an item is done rather than leaving it to accumulate. The item must match an \
+             entry's text exactly; a retirement that matches nothing removes nothing and \
+             says so.\n\
+             It removes the entry whichever list holds it, and one of those lists is the \
+             rejected one: retiring a rejection lifts the do-not-re-propose protection you \
+             put there. That is the explicit route back — it is recorded, with your reason \
+             — but it is not what this tool is for, and retiring a rejection by accident \
+             is how a settled question gets re-opened.",
             serde_json::json!({
                 "type": "object",
                 "properties": {
