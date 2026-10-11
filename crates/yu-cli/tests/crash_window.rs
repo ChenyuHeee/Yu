@@ -257,9 +257,12 @@ fn an_effect_that_happened_without_being_completed_is_detected_and_not_repeated(
     let session = "crash-b";
     let artifact = cwd.path().join("artifact.txt");
 
-    // Write the artifact, then kill the process that is waiting for this shell.
+    // Append the artifact, then kill the process that is waiting for this shell.
+    // Append rather than write: a second run of this command would be visible as a
+    // second copy of the bytes, which is what "the same effect, done twice" means
+    // for a command that touches a file.
     let command = format!(
-        "printf 'unrecorded' > {}; kill -9 $PPID",
+        "printf 'unrecorded' >> {}; kill -9 $PPID",
         artifact.display()
     );
     let call = || json!({"command": command});
@@ -339,8 +342,6 @@ fn an_effect_that_happened_without_being_completed_is_detected_and_not_repeated(
         cwd.path(),
         dir.path(),
     );
-    ran.ok();
-
     // 检出: the resumed run reports the effect, by key, and says what is unknown.
     assert!(
         ran.stderr.contains("unresolved effect") && ran.stderr.contains(&key),
@@ -353,14 +354,28 @@ fn an_effect_that_happened_without_being_completed_is_detected_and_not_repeated(
         ran.stderr
     );
 
-    // And it did not run the command again: the artifact is exactly what the
-    // first run left. A re-attempt would have appended to it.
+    // The command did not run again. The first evidence is the process itself:
+    // the command ends by killing its own parent, so a second run of it is also a
+    // second death of the harness. The exit status is evidence here rather than a
+    // precondition — a run that was killed is the failure being watched for.
+    assert!(
+        !ran.killed_by(9),
+        "the resumed run was killed by the same command it was supposed to \
+         refuse to run, so the command ran a second time"
+    );
+    assert!(
+        ran.status.success(),
+        "the resumed run failed for some other reason: {}",
+        ran.stderr
+    );
+
+    // And the artifact is exactly what the first run left. A re-attempt would
+    // have appended to it: work that may already have happened, done twice, which
+    // is the failure the ambiguity exists to prevent.
     assert_eq!(
         std::fs::read_to_string(&artifact).unwrap(),
         "unrecorded",
-        "the command was run a second time: work that may already have happened \
-         has been duplicated, which is the failure the ambiguity exists to \
-         prevent"
+        "the command was run a second time and its effect was duplicated"
     );
 
     // What the model was told, rather than silence about a call it made.
@@ -369,7 +384,17 @@ fn an_effect_that_happened_without_being_completed_is_detected_and_not_repeated(
         .iter()
         .map(|request| message_texts(request).join("\n"))
         .find(|text| text.contains("refused"))
-        .expect("the call must be answered with a refusal, not an empty success");
+        .unwrap_or_else(|| {
+            let all: Vec<String> = second
+                .requests()
+                .iter()
+                .map(|r| message_texts(r).join("\n"))
+                .collect();
+            panic!(
+                "the call must be answered with a refusal, not an empty success; sent: {all:#?}\nrecord: {}",
+                std::fs::read_to_string(&record).unwrap_or_default()
+            )
+        });
     assert!(
         refusal.contains(&key),
         "the refusal must name the effect it is refusing: {refusal}"

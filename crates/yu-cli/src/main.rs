@@ -1060,6 +1060,11 @@ async fn cmd_decide(
         dir.display(),
         surface
     );
+    // A layer that inherited a record — through a handover, which branches one —
+    // inherits its unfinished effects too. Reported for the same reason a
+    // resumed run reports them: the fact that the record does not say whether an
+    // effect happened is itself the finding, and silence reads as a clean record.
+    report_unresolved(&journal).await;
     let started = std::time::Instant::now();
     let outcome = layer.run().await?;
     let elapsed = started.elapsed();
