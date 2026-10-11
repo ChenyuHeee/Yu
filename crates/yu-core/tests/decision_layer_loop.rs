@@ -898,3 +898,81 @@ async fn a_tool_use_naming_another_tool_is_answered_rather_than_run_as_a_delegat
         message_texts(&requests[1])
     );
 }
+
+// ---------------------------------------------------------------------------
+// What the round ceiling does not do
+// ---------------------------------------------------------------------------
+
+/// **`max_rounds` bounds nothing, and this writes that fact down.**
+///
+/// A round converses until the model stops asking — the inner loop in
+/// `DecisionLayer::run` has no `break` — so the outer `for` never advances past
+/// its first iteration, and a completed run always reports `1 round(s)`.
+/// Measured here: with `max_rounds = 1` the layer still makes four requests,
+/// because nothing in the loop counts them.
+///
+/// This is a *characterization* test, not a guard on correct behaviour. It pins
+/// the state this milestone inherits so that making rounds real has to be a
+/// deliberate act: it fails the moment a round can end, and whoever makes that
+/// happen must also decide what `max_rounds` means, because today
+/// `yu decide --max-rounds` is a knob that does nothing.
+///
+/// It is in this file because of what the tail of `run` looks like without it:
+/// `Err(LoopError::StepCeiling)` reads like a live guard and is reachable only
+/// for `max_rounds == 0`. An arm that looks alive and is not is the exact class
+/// of thing this milestone exists to find, and a comment saying so is not a test.
+///
+/// Rounds only differ once L1 is written between them, and nothing writes the
+/// ledger during a run yet — which is why this is not fixed here.
+#[tokio::test]
+async fn the_round_ceiling_does_not_bound_a_run_that_keeps_asking() {
+    let endpoint = FakeEndpoint::start(vec![
+        Reply::Json(tool_use_reply(
+            "msg-r1",
+            "first",
+            "call-r1",
+            "delegate",
+            json!({"task": "one"}),
+        )),
+        // Consumed by the executor the first attempt derives, not by the layer:
+        // the two converse over the same socket.
+        Reply::Json(text_reply("msg-e1", "REPORT: one done")),
+        Reply::Json(tool_use_reply(
+            "msg-r2",
+            "again",
+            "call-r2",
+            "delegate",
+            json!({"task": "two"}),
+        )),
+        Reply::Json(tool_use_reply(
+            "msg-r3",
+            "again",
+            "call-r3",
+            "delegate",
+            json!({"task": "three"}),
+        )),
+        Reply::Json(text_reply("msg-r4", "decided with what I have")),
+    ]);
+    let run = decide("round-ceiling", &endpoint, 1).await;
+
+    assert_eq!(
+        run.outcome.rounds, 1,
+        "a completed run always reports the first round"
+    );
+    assert_eq!(
+        run.outcome.delegations, 1,
+        "the per-round delegation ceiling does hold — only the first ran"
+    );
+    assert_eq!(
+        endpoint.to_an_executor().len(),
+        1,
+        "and the other two attempts never reached an executor"
+    );
+    assert_eq!(
+        endpoint.to_the_decision_layer().len(),
+        4,
+        "`max_rounds = 1` permitted four requests, so it bounds nothing. If this \
+         assertion now fails, a round can end — `max_rounds` has become real, and \
+         this test plus the unreachable comment in `run` both need revisiting."
+    );
+}

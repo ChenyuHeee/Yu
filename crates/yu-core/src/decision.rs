@@ -435,6 +435,24 @@ impl DecisionLayer {
             }
         }
 
+        // Reachable **only** when `max_rounds` is zero. The inner loop above has
+        // no `break` — a round converses until the model stops asking — so for
+        // any `max_rounds >= 1` a completed run always returned from inside it,
+        // and the outer `for` never advanced past its first iteration. Measured:
+        // a run with `--max-rounds 1` makes as many requests as it likes, and
+        // every run that ends reports `1 round(s)`.
+        //
+        // That is not a metric defect — the reported round count is true — but
+        // `max_rounds` is a user-facing knob that bounds nothing, and this arm
+        // reading like a live guard is worse than it being absent.
+        //
+        // It belongs to the milestone that makes re-rendering mean something:
+        // rounds only differ once L1 is written between them, and today the
+        // ledger is never written during a run. The guard that pins this is
+        // `the_round_ceiling_does_not_bound_a_run_that_keeps_asking` in
+        // `tests/decision_layer_loop.rs`, which fails the moment a round can
+        // actually end — forcing whoever makes it real to say so deliberately
+        // rather than to discover it.
         Err(LoopError::StepCeiling(self.config.max_rounds))
     }
 
