@@ -19,6 +19,7 @@ pub mod delegate;
 pub mod gate;
 pub mod landing;
 pub mod render;
+pub mod spot;
 pub mod topology;
 pub mod traits;
 
