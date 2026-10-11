@@ -1563,6 +1563,19 @@ pub async fn change_generation<M: ReaderModel>(
     handover.origin = Some(record.origin());
     merge_loose_ends(&mut handover.loose_ends, loose);
 
+    // **And the constraints the session is still under.** The readers extract
+    // constraints from the *record*, and a constraint that was only ever
+    // injected into L0 — passed on the command line, never written into a note —
+    // is one no reader can read. The dying session is holding it, and this is
+    // the last moment it can be handed on: the alternative is a constraint that
+    // silently stops being in force at a generation boundary, which is exactly
+    // what "换代后仍生效的约束一条不少" rules out.
+    for constraint in &charter.constraints {
+        if !handover.constraints.iter().any(|held| held == constraint) {
+            handover.constraints.push(constraint.clone());
+        }
+    }
+
     // Step 4 — back to the record, not to the reports.
     let gaps = Verifier::find_gaps_in(&record, &handover);
 
@@ -2699,6 +2712,72 @@ mod change_tests {
         .await
         .expect_err("a session cannot be its own ancestor");
         assert!(matches!(err, HandoverError::SameSession { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A constraint that only ever lived in L0 still crosses the boundary.**
+    ///
+    /// The readers read the record; a constraint that was passed on the command
+    /// line and injected into L0 every round was never *written* anywhere they
+    /// can see. The dying session is the one entity holding it, and this call is
+    /// the last moment it can be handed on — the acceptance's condition 4 is
+    /// "换代后仍生效的约束一条不少", and this is the half of it that the readers
+    /// structurally cannot do.
+    ///
+    /// Revert: drop the union of `charter.constraints` into the handover, and
+    /// the new session's L0 no longer carries it.
+    #[tokio::test]
+    async fn a_constraint_that_only_ever_lived_in_l0_still_reaches_the_next_session() {
+        const ONLY_IN_L0: &str = "the release branch is never touched by this work";
+        let (dir, journal, _) = planted_record("l0-constraint").await;
+        // The constraint is in the charter the run is under, and in no event of
+        // the record — which is exactly the case the readers cannot read.
+        let mut charter = charter();
+        charter.constraints = vec![ONLY_IN_L0.to_owned()];
+        let model = AngleScript::new("none").answering(
+            ReaderAngle::DecisionsAndReasons,
+            "- [journal:seq=1] the daemon owns sessions; the CLI only attaches",
+        );
+
+        let change = change_generation(
+            &model,
+            &journal,
+            Trigger::NaturalCompletion,
+            &charter,
+            &Ledger::default(),
+            &ReaderAngle::ALL,
+        )
+        .await
+        .expect("the flow runs over a real record");
+        assert!(
+            change.handover.constraints.iter().any(|held| held == ONLY_IN_L0),
+            "the session's own L0 constraint has to be carried: {:#?}",
+            change.handover.constraints
+        );
+
+        let next = change.handover.new_session(&Charter::from_the_humans_own_words(
+            "continue the daemon work",
+            1,
+            "cli",
+        ));
+        assert!(
+            next.charter.constraints.iter().any(|held| held == ONLY_IN_L0),
+            "and it has to be in force in the new session's L0: {:#?}",
+            next.charter.constraints
+        );
+        // Carrying it twice is the other failure: the handover is read on every
+        // new session, and a constraint listed twice reads as two constraints.
+        assert_eq!(
+            change
+                .handover
+                .constraints
+                .iter()
+                .filter(|held| *held == ONLY_IN_L0)
+                .count(),
+            1,
+            "one constraint, one entry: {:#?}",
+            change.handover.constraints
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
