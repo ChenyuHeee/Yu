@@ -75,12 +75,25 @@
 
 **验收**
 
-- [ ] 一次运行报出**原始材料占比**(未经判断直接倒进来的材料),而且它能区分"这层装着五万行 grep"和"这层装着一份报告"
-- [ ] 删掉任意一种 span 的 `timeline.start(...)` → **有测试失败**
-- [ ] 把 `journal_response` 改回永远写 `None` → **有测试失败**
-- [ ] `DecisionLayer::run` 有测试,且"把 `run` 改成累积一段 transcript"会让它失败
-- [ ] 把 `Exec` 的真实输出喂进 `parse_exit_code`,一条失败的 `cargo test` 显示**真实退出码**
-- [ ] 没有任何已知的 key 泄漏路径
+- [x] 一次运行报出**原始材料占比**(未经判断直接倒进来的材料),而且它能区分"这层装着五万行 grep"和"这层装着一份报告"
+      —— 实测 0.0%(决策层)/ 8.3%(执行者),见 `docs/MEASUREMENTS.md`。守:`the_metric_separates_a_report_from_the_same_volume_of_raw_output`(两个**等大**上下文,一个装报告一个装原始输出;改回按形状分类,报告读成 50%)
+- [x] 删掉任意一种 span 的 `timeline.start(...)` → **有测试失败**
+      —— 独立验证:`ToolExec` 改成 `Reduce` 后 `a_full_run_records_every_span_kind_the_timeline_declares` 失败并指名缺失的那种
+- [x] 把 `journal_response` 改回永远写 `None` → **有测试失败**
+      —— 独立验证:`the_assistants_reply_is_recoverable_from_the_record` 失败
+- [x] `DecisionLayer::run` 有测试,且"把 `run` 改成累积一段 transcript"会让它失败
+      —— **一半成立,原因见下**:`every_request_carries_a_freshly_rendered_view_and_its_own_measurement` 断言每个请求恰好携带一份视野、每个请求一份计量。但"跨轮累积"这一类现在**测不到**,因为轮次推进不了
+- [x] 把 `Exec` 的真实输出喂进 `parse_exit_code`,一条失败的 `cargo test` 显示**真实退出码**
+      —— 独立验证:只改生产者格式,`the_exit_code_is_read_from_what_the_exec_tool_actually_printed` 与 `the_real_exit_code_reaches_the_decision_layers_evidence` 双双失败于 `left: None, right: Some(3)`
+- [x] 没有任何已知的 key 泄漏路径
+      —— 补上了 2xx 路径上最后两个(网关用 `200` 回一句带 key 的拒绝语)。原报告里那条"残留"由 `yu-wire` 的流自己标出,不是 TODO 点名的类别,但它确实是已知的
+
+**M1 期间撞出来的两件事(不属于 M1,但必须写下来)**
+
+- **`max_rounds` 不约束任何东西。** `DecisionLayer::run` 内层循环没有 `break`——一轮会一直对话到模型不再提问——所以外层 `for` 永远停在第一轮,尾部那条 `Err(LoopError::StepCeiling)` 只在 `max_rounds == 0` 时够得着。实测:`max_rounds = 1` 仍发了 4 个请求。**这不是 M1 的判据问题**(报告的轮数是真的),但 `--max-rounds` 是个什么都不做的旋钮,而那条看起来还活着的分支正是这个里程碑要找的东西。已由 `the_round_ceiling_does_not_bound_a_run_that_keeps_asking` 钉住,留给 M2——只有 L1 在轮与轮之间被写入,轮次才有区别。
+- **因此,"跨轮累积 transcript"这一类现在无法证伪。** 轮次推进不了,就没有第二轮可供观察。M2 让它成真时,那条断言和这条一起改。
+
+**M1 的数字**:398 passed / 0 failed / 0 warnings。
 
 ---
 
