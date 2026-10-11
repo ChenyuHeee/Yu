@@ -34,9 +34,9 @@ pub mod log;
 pub mod reader;
 
 pub use blob::{BlobStore, digest_of};
-pub use effect::{EffectGuard, EffectLog};
+pub use effect::{EffectGuard, EffectLog, ReplayOfUnresolved, UnresolvedEffect};
 pub use event::{EffectState, Event, EventBody, SessionId, ThinkingRecord};
-pub use log::Journal;
+pub use log::{ForkEstimate, Journal};
 pub use reader::JournalIndex;
 
 /// Everything this crate can fail with.

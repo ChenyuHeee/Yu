@@ -26,12 +26,14 @@ use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
 
-use yu_journal::{BlobStore, EventBody, Journal, ThinkingRecord};
+use yu_journal::{BlobStore, EffectState, EventBody, Journal, ThinkingRecord};
 use yu_observe::{
     AgentId, ContextComposition, ShapeSignal, ShapeTracker, SpanKind, StepObservation, Timeline,
     TokenUsage,
 };
-use yu_tools::{Payload, Pressure, Reduction, ResultKind, ToolContext, ToolRegistry, ToolResult};
+use yu_tools::{
+    EffectVerdict, Payload, Pressure, Reduction, ResultKind, ToolContext, ToolRegistry, ToolResult,
+};
 use yu_wire::client::{StreamSink, WireClient};
 use yu_wire::sse::StreamedMessage;
 use yu_wire::types::{
@@ -39,6 +41,7 @@ use yu_wire::types::{
     Thinking, ToolDefinition, ToolUseBlock,
 };
 
+use crate::effects::{Plan, Replay, effect_key};
 use crate::gate::{AdmissionGate, spawn_abortable};
 use crate::render::CompositionMeter;
 
@@ -341,13 +344,19 @@ impl Agent {
         config: AgentConfig,
         cwd: PathBuf,
     ) -> Self {
+        // The registry's own reducer, not a fresh default-budget one. A reducer
+        // built here would be a second, uninjectable copy of a decision the run
+        // already made: `yu-policy` installs the reduction table on the registry,
+        // and this is the line that would have quietly ignored it.
+        let mut ctx = tools.context();
+        ctx.cwd = cwd;
         Self {
             client,
             journal,
             tools,
             timeline,
             gate: AdmissionGate::new(),
-            ctx: ToolContext::with_default_budget(cwd),
+            ctx,
             config,
             messages: Vec::new(),
             shape: ShapeTracker::new(),
@@ -378,6 +387,25 @@ impl Agent {
             .await?;
         self.messages.push(Message::user(task));
 
+        // What the record this run is continuing already knows about its side
+        // effects. Read once, before the first tool could run: a journal reopened
+        // after a crash — or forked at a historical point — is the whole reason
+        // the seed exists, and reading it later would mean a tool had already
+        // been handed the chance to repeat an effect the record says is done.
+        //
+        // The second value is the finding nobody asked for: effects the record
+        // left in the crash window, which this run will not silently re-perform
+        // (see `crate::effects`). It is reported rather than swallowed because a
+        // caller that hears nothing concludes the record was clean.
+        let replay = Replay::from_journal(&self.journal).await?;
+        for unfinished in replay.unfinished() {
+            tracing::warn!(
+                key = %unfinished.key,
+                at_seq = unfinished.at_seq,
+                "an effect from the record never completed; the record does not say whether it happened"
+            );
+        }
+
         let mut usage = TokenUsage::default();
         let mut signals = Vec::new();
         // The context of the most recent request actually sent. Replaced every
@@ -386,6 +414,9 @@ impl Agent {
         let mut sent_context = ContextComposition::default();
         let mut reductions = Vec::new();
         let mut tool_calls = 0u32;
+        // How big the context was at the last request the endpoint answered. The
+        // first request has nothing behind it to measure, and `None` says so.
+        let mut context_tokens: Option<u64> = None;
 
         // The last step's answer and stop reason, kept because the ceiling is a
         // real ending and the account of where the run got to is made of them.
@@ -425,7 +456,7 @@ impl Agent {
                         model: req.model.clone(),
                         messages: message_count,
                         digest,
-                        est_input_tokens: None,
+                        est_input_tokens: context_tokens,
                     },
                 )
                 .await?;
@@ -434,6 +465,7 @@ impl Agent {
             let mut sink = CollectSink::default();
             let outcome = self.client.stream(&req, &mut sink).await?;
             usage.add(&outcome.message.usage.to_observed());
+            context_tokens = Some(outcome.message.usage.to_observed().context_tokens());
 
             self.journal_response(&outcome.message).await?;
 
@@ -504,7 +536,7 @@ impl Agent {
                 StopDisposition::RunTools => {
                     tool_calls += uses.len() as u32;
                     let pressure = pressure_from(&outcome.message.usage);
-                    let (blocks, applied) = self.dispatch(&uses, pressure).await?;
+                    let (blocks, applied) = self.dispatch(&uses, pressure, &replay).await?;
                     reductions.extend(applied);
                     // DESIGN: every `tool_result` in ONE user message.
                     self.messages.push(Message::user(blocks));
@@ -712,6 +744,7 @@ impl Agent {
         &self,
         uses: &[ToolUseBlock],
         pressure: Pressure,
+        replay: &Replay,
     ) -> Result<(Vec<ContentBlock>, Vec<Reduction>), LoopError> {
         let mut slots: Vec<Option<(ContentBlock, Reduction)>> = Vec::new();
         slots.resize_with(uses.len(), || None);
@@ -745,6 +778,9 @@ impl Agent {
             }
         }
 
+        // Owned, because a concurrent tool runs on another task and a borrow of
+        // the seed would not outlive the spawn.
+        let replay = Arc::new(replay.clone());
         let mut handles = Vec::new();
         for index in concurrent {
             let tu = uses[index].clone();
@@ -754,11 +790,12 @@ impl Agent {
             let journal = self.journal.clone();
             let timeline = self.timeline.clone();
             let agent = self.config.id.clone();
+            let replay = replay.clone();
             handles.push((
                 index,
                 spawn_abortable(async move {
                     let _admission = gate.admit(true).await;
-                    run_one(registry, ctx, journal, agent, tu, pressure, timeline).await
+                    run_one(registry, ctx, journal, agent, tu, pressure, timeline, replay).await
                 }),
             ));
         }
@@ -783,6 +820,7 @@ impl Agent {
                 tu,
                 pressure,
                 self.timeline.clone(),
+                replay.clone(),
             )
             .await?;
             slots[index] = Some(outcome);
@@ -802,6 +840,13 @@ impl Agent {
 }
 
 /// Execute one tool, reduce its result, and record both.
+///
+/// The effect half runs first and last, and it is the whole of DESIGN's
+/// "**先记后做**": the intent is in the record *before* the tool is allowed to act,
+/// and the completion goes in after. Between those two writes is the window this
+/// discipline exists for, and everything `replay` decides is about a record that
+/// ends inside it.
+#[allow(clippy::too_many_arguments)]
 async fn run_one(
     registry: Arc<ToolRegistry>,
     ctx: ToolContext,
@@ -810,9 +855,153 @@ async fn run_one(
     tu: ToolUseBlock,
     pressure: Pressure,
     timeline: Arc<Timeline>,
+    replay: Arc<Replay>,
 ) -> Result<(ContentBlock, Reduction), yu_wire::WireError> {
     let name = tu.name.clone();
     let input = tu.input.clone();
+
+    // What this call is about to change, if anything, and the key the record
+    // will hold it under.
+    let intent = registry
+        .get(&name)
+        .and_then(|tool| tool.effect(&input))
+        .map(|intent| (effect_key(&intent.key, &tu.id), intent));
+
+    if let Some((key, intent)) = &intent {
+        match replay.plan(key) {
+            // DESIGN: "回放遇到已提交的 effect 直接读记录,绝不重放副作用". Nothing is
+            // executed, and nothing is appended either: the record already holds
+            // this call's result, and writing a second one under the same
+            // `tool_use_id` would be the duplication L2 constraint 1 refuses.
+            Plan::Committed { result_seq } => {
+                return Ok(replayed_result(journal.as_ref(), result_seq, &tu.id, key).await);
+            }
+            Plan::Unfinished {
+                idempotent,
+                at_seq,
+            } => {
+                // The record was interrupted inside the window. What the world
+                // says decides — see `effects::decide` for why neither eager
+                // reading is the default.
+                let verdict = registry
+                    .get(&name)
+                    .map(|tool| tool.effect_in_place(&input, &ctx))
+                    .unwrap_or(EffectVerdict::Unknown);
+                match crate::effects::decide(idempotent, verdict) {
+                    crate::effects::Decision::AlreadyInPlace => {
+                        // The act happened; only its record is missing. Recording
+                        // *that* is not a guess — it is the finding, with its
+                        // evidence, and it is what settles the key for every
+                        // later replay instead of leaving each one to re-ask.
+                        journal
+                            .append(
+                                agent.clone(),
+                                EventBody::Note {
+                                    text: format!(
+                                        "effect `{key}` was recorded as intended at seq {at_seq} and \
+                                         never completed; the world already holds its result, so the \
+                                         act happened and only the record of it was lost. Nothing was \
+                                         performed; the effect is recorded as done."
+                                    ),
+                                },
+                            )
+                            .await
+                            .map_err(|e| yu_wire::WireError::transport(format!("journaling: {e}")))?;
+                        journal
+                            .append(
+                                agent.clone(),
+                                EventBody::Effect {
+                                    key: key.clone(),
+                                    description: intent.description.clone(),
+                                    state: EffectState::Done { result_seq: None },
+                                    tool_use_id: Some(tu.id.clone()),
+                                    idempotent: intent.idempotent,
+                                },
+                            )
+                            .await
+                            .map_err(|e| yu_wire::WireError::transport(format!("journaling: {e}")))?;
+                        let text = format!(
+                            "nothing was performed: `{name}` was already completed when this replay \
+                             reached it (key `{key}`, interrupted at seq {at_seq} before its \
+                             completion was written). The result it produced is in the world, and it \
+                             is not reproduced here."
+                        );
+                        return Ok((
+                            ContentBlock::ToolResult(yu_wire::types::ToolResultBlock::text(
+                                &tu.id, text,
+                            )),
+                            Reduction::Replayed { seq: at_seq },
+                        ));
+                    }
+                    crate::effects::Decision::Reattempt => {
+                        // Say why in the record: an effect being performed a
+                        // second time is exactly the event a reader must not have
+                        // to infer, and this is the one case where the second
+                        // attempt is certified to be the same as the first.
+                        journal
+                            .append(
+                                agent.clone(),
+                                EventBody::Note {
+                                    text: format!(
+                                        "effect `{key}` was recorded as intended at seq {at_seq} and \
+                                         never completed; its key is idempotent, so it is performed \
+                                         again rather than skipped."
+                                    ),
+                                },
+                            )
+                            .await
+                            .map_err(|e| yu_wire::WireError::transport(format!("journaling: {e}")))?;
+                    }
+                    crate::effects::Decision::Surface => {
+                        journal
+                            .append(
+                                agent.clone(),
+                                EventBody::Note {
+                                    text: format!(
+                                        "effect `{key}` was recorded as intended at seq {at_seq} and \
+                                         never completed. The record does not say whether it happened \
+                                         and the key does not certify that performing it twice is safe, \
+                                         so `{name}` was neither re-run nor skipped."
+                                    ),
+                                },
+                            )
+                            .await
+                            .map_err(|e| yu_wire::WireError::transport(format!("journaling: {e}")))?;
+                        let text = format!(
+                            "refused, and nothing was performed: an earlier attempt at this effect \
+                             (`{}`, key `{key}`, recorded at seq {at_seq}) never completed. The \
+                             record does not say whether it happened, and re-running it may do the \
+                             work twice. Resolve it against the world — the address above is where \
+                             to look — before this call can run.",
+                            intent.description
+                        );
+                        return Ok((
+                            ContentBlock::ToolResult(yu_wire::types::ToolResultBlock::text(
+                                &tu.id, text,
+                            )),
+                            Reduction::Replayed { seq: at_seq },
+                        ));
+                    }
+                }
+            }
+            Plan::Fresh => {}
+        }
+
+        // 先记: the intent is in the record before the tool is allowed to act.
+        journal
+            .append(
+                agent.clone(),
+                EventBody::Effect {
+                    key: key.clone(),
+                    description: intent.description.clone(),
+                    state: EffectState::Intended,
+                    tool_use_id: Some(tu.id.clone()),
+                    idempotent: intent.idempotent,
+                },
+            )
+            .await
+            .map_err(|e| yu_wire::WireError::transport(format!("journaling: {e}")))?;
+    }
 
     // `ctx` is needed both inside the blocking task and afterwards, for
     // reduction, so the task gets its own clone.
@@ -887,9 +1076,9 @@ async fn run_one(
     // agent: `outcome_from_run` recovers a delegation's evidence from here, and
     // an event filed under a name every executor shares would be handed to
     // whichever one asked first.
-    journal
+    let result_event = journal
         .append(
-            agent,
+            agent.clone(),
             EventBody::ToolResult {
                 tool_use_id: tu.id.clone(),
                 name: tu.name.clone(),
@@ -905,7 +1094,75 @@ async fn run_one(
         .await
         .map_err(|e| yu_wire::WireError::transport(format!("journaling tool result: {e}")))?;
 
+    // 后做 — the other end of the window. The completion is written *after* the
+    // result it produced, and it names that result's seq, because the seq is what
+    // a replay reads instead of performing the effect again. A crash between the
+    // act above and this line leaves an `Intended` and no completion, which is
+    // the state `Replay` was built to read.
+    if let Some((key, intent)) = &intent {
+        journal
+            .append(
+                agent,
+                EventBody::Effect {
+                    key: key.clone(),
+                    description: intent.description.clone(),
+                    state: EffectState::Done {
+                        result_seq: Some(result_event.seq),
+                    },
+                    tool_use_id: Some(tu.id.clone()),
+                    idempotent: intent.idempotent,
+                },
+            )
+            .await
+            .map_err(|e| yu_wire::WireError::transport(format!("journaling effect: {e}")))?;
+    }
+
     Ok((reduced.to_block(&tu.id), reduction))
+}
+
+/// Answer a call whose effect the record already says is complete.
+///
+/// DESIGN: "回放遇到已提交的 effect 直接读记录,绝不重放副作用" — the tool is not
+/// run, and the result the model sees is the one the first run produced. When the
+/// record names no result — a completion recorded without one — the honest answer
+/// is that there is nothing to read, rather than an empty success.
+async fn replayed_result(
+    journal: &Journal,
+    result_seq: Option<u64>,
+    tool_use_id: &str,
+    key: &str,
+) -> (ContentBlock, Reduction) {
+    let Some(seq) = result_seq else {
+        let text = format!(
+            "nothing was performed: `{key}` is recorded as already done, and the record names no \
+             result for it. The effect was performed once; its output is not addressable here."
+        );
+        return (
+            ContentBlock::ToolResult(yu_wire::types::ToolResultBlock::text(tool_use_id, text)),
+            Reduction::Replayed { seq: 0 },
+        );
+    };
+    let text = match journal.read_range(seq, seq + 1).await {
+        Ok(events) => match events.into_iter().next().map(|event| event.body) {
+            Some(EventBody::ToolResult { inline, blob, .. }) => {
+                match inline.or_else(|| blob.and_then(|digest| journal.blobs().get_str(&digest).ok()))
+                {
+                    Some(text) => text,
+                    None => format!(
+                        "nothing was performed: `{key}` was already done at seq {seq}, and the \
+                         payload that call produced was dropped by its reduction. The record says \
+                         where it went; re-read it rather than re-running the tool."
+                    ),
+                }
+            }
+            _ => format!("seq {seq} is not a tool result, so `{key}` has nothing to read"),
+        },
+        Err(err) => format!("nothing was performed for `{key}`, and its recorded result at seq {seq} could not be read: {err}"),
+    };
+    (
+        ContentBlock::ToolResult(yu_wire::types::ToolResultBlock::text(tool_use_id, text)),
+        Reduction::Replayed { seq },
+    )
 }
 
 impl Agent {
@@ -1066,6 +1323,7 @@ fn reduction_name(r: &Reduction, spill_refused: bool) -> &'static str {
         Reduction::SpillWithPointer { .. } => "spill_with_pointer",
         Reduction::DelegateReader { .. } => "delegate_reader",
         Reduction::SandboxReduce => "sandbox_reduce",
+        Reduction::Replayed { .. } => "replayed",
     }
 }
 
@@ -1704,6 +1962,7 @@ mod tests {
             big_call(),
             Pressure::high(),
             Timeline::new(),
+            Arc::new(Replay::default()),
         )
         .await
         .unwrap();
@@ -1767,6 +2026,7 @@ mod tests {
             big_call(),
             Pressure::high(),
             Timeline::new(),
+            Arc::new(Replay::default()),
         )
         .await
         .unwrap();

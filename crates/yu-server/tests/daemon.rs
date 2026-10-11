@@ -52,37 +52,38 @@ fn session_dirs(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-#[test]
-fn launching_a_session_writes_it_down_and_recovery_reads_it_back() {
+#[tokio::test]
+async fn launching_a_session_writes_it_down_and_recovery_reads_it_back() {
     let dir = tempdir();
     let cfg = config(dir.path().to_path_buf());
     let host = DirectoryHost::new(dir.path());
 
-    let launched = host.launch(&cfg, "make the tests pass").unwrap();
+    let launched = host.launch(&cfg, "make the tests pass").await.unwrap();
     assert!(host.dir_for(&launched.id).is_dir(), "a session owns a directory");
     assert!(host.dir_for(&launched.id).join("info.json").is_file());
 
-    let recovered = host.thread_recovery(&cfg, &launched.id).unwrap();
+    let recovered = host.thread_recovery(&cfg, &launched.id).await.unwrap();
     assert_eq!(recovered.id, launched.id);
     assert_eq!(recovered.status, SessionStatus::Ready);
-    assert_eq!(host.sessions().unwrap().len(), 1);
+    assert_eq!(host.sessions().await.unwrap().len(), 1);
 }
 
 /// Recovery must report what the session was doing, not what would be convenient.
 ///
 /// A session recorded as `Busy` was interrupted mid-turn. Resetting it to ready
 /// would hide exactly the interruption recovery exists to surface.
-#[test]
-fn a_busy_session_is_not_quietly_reset_to_ready() {
+#[tokio::test]
+async fn a_busy_session_is_not_quietly_reset_to_ready() {
     let dir = tempdir();
     let cfg = config(dir.path().to_path_buf());
     let host = DirectoryHost::new(dir.path());
-    let launched = host.launch(&cfg, "charter").unwrap();
+    let launched = host.launch(&cfg, "charter").await.unwrap();
 
     host.set_status(&cfg, &launched.id, SessionStatus::Busy)
+        .await
         .unwrap();
 
-    let recovered = host.thread_recovery(&cfg, &launched.id).unwrap();
+    let recovered = host.thread_recovery(&cfg, &launched.id).await.unwrap();
     assert_eq!(
         recovered.status,
         SessionStatus::Busy,
@@ -90,14 +91,14 @@ fn a_busy_session_is_not_quietly_reset_to_ready() {
     );
 }
 
-#[test]
-fn an_unreadable_record_is_a_crash_rather_than_a_session_that_never_existed() {
+#[tokio::test]
+async fn an_unreadable_record_is_a_crash_rather_than_a_session_that_never_existed() {
     let dir = tempdir();
     let host = DirectoryHost::new(dir.path());
     std::fs::create_dir_all(dir.path().join("torn")).unwrap();
     std::fs::write(dir.path().join("torn/info.json"), "{ this is not json").unwrap();
 
-    let sessions = host.sessions().unwrap();
+    let sessions = host.sessions().await.unwrap();
     assert_eq!(sessions.len(), 1, "a damaged session must not be dropped");
     assert!(
         matches!(sessions[0].status, SessionStatus::Crashed { .. }),
@@ -114,19 +115,19 @@ fn an_unreadable_record_is_a_crash_rather_than_a_session_that_never_existed() {
 /// daemon keeps its session directories in. Scanning every entry as a session
 /// reported the blob store as one that had crashed — a phantom crash for every
 /// CLI run, in the one list a caller reads to find out what actually died.
-#[test]
-fn the_journals_own_files_are_not_reported_as_crashed_sessions() {
+#[tokio::test]
+async fn the_journals_own_files_are_not_reported_as_crashed_sessions() {
     let dir = tempdir();
     let cfg = config(dir.path().to_path_buf());
     let host = DirectoryHost::new(dir.path());
-    let launched = host.launch(&cfg, "charter").unwrap();
+    let launched = host.launch(&cfg, "charter").await.unwrap();
 
     // What a CLI run leaves behind in the same directory.
     std::fs::write(dir.path().join("run-20260101T000000.jsonl"), "{}\n").unwrap();
     std::fs::create_dir_all(dir.path().join("blobs/ab")).unwrap();
     std::fs::write(dir.path().join("blobs/ab/cdef"), "a payload").unwrap();
 
-    let sessions = host.sessions().unwrap();
+    let sessions = host.sessions().await.unwrap();
     assert_eq!(
         sessions.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
         vec![launched.id.as_str()],
@@ -141,26 +142,26 @@ fn the_journals_own_files_are_not_reported_as_crashed_sessions() {
     // Not a session is not recoverable as one either: `blobs` is a name in the
     // state directory, not a session that needs reattaching.
     assert!(matches!(
-        host.thread_recovery(&cfg, "blobs"),
+        host.thread_recovery(&cfg, "blobs").await,
         Err(ServerError::UnknownSession { .. })
     ));
 }
 
-#[test]
-fn an_unknown_session_is_named_in_the_error() {
+#[tokio::test]
+async fn an_unknown_session_is_named_in_the_error() {
     let dir = tempdir();
     let cfg = config(dir.path().to_path_buf());
     let host = DirectoryHost::new(dir.path());
-    let err = host.thread_recovery(&cfg, "nope").unwrap_err();
+    let err = host.thread_recovery(&cfg, "nope").await.unwrap_err();
     assert!(err.to_string().contains("nope"), "{err}");
 }
 
-#[test]
-fn stopping_a_session_is_recorded_not_just_remembered() {
+#[tokio::test]
+async fn stopping_a_session_is_recorded_not_just_remembered() {
     let dir = tempdir();
     let cfg = config(dir.path().to_path_buf());
     let host = DirectoryHost::new(dir.path());
-    let launched = host.launch(&cfg, "charter").unwrap();
+    let launched = host.launch(&cfg, "charter").await.unwrap();
 
     // Through the protocol, as a client would.
     let responses = handle_for_test(
@@ -169,28 +170,190 @@ fn stopping_a_session_is_recorded_not_just_remembered() {
         Request::Stop {
             session: launched.id.clone(),
         },
-    );
+    )
+    .await;
     assert!(matches!(responses.as_slice(), [Response::Done { .. }]));
 
     // A fresh read of the directory — i.e. what a restarted daemon would see.
-    let recovered = host.thread_recovery(&cfg, &launched.id).unwrap();
+    let recovered = host.thread_recovery(&cfg, &launched.id).await.unwrap();
     assert_eq!(recovered.status, SessionStatus::Stopped);
 }
 
-#[test]
-fn a_session_survives_the_daemon_that_started_it() {
+#[tokio::test]
+async fn a_session_survives_the_daemon_that_started_it() {
     // The point of writing sessions down: a daemon that dies and comes back must
     // find the same sessions, not new ones.
     let dir = tempdir();
     let cfg = config(dir.path().to_path_buf());
     let id = {
         let host = DirectoryHost::new(dir.path());
-        host.launch(&cfg, "charter").unwrap().id
+        host.launch(&cfg, "charter").await.unwrap().id
     };
     let restarted = DirectoryHost::new(dir.path());
-    let found = restarted.thread_recovery(&cfg, &id).unwrap();
+    let found = restarted.thread_recovery(&cfg, &id).await.unwrap();
     assert_eq!(found.id, id);
     assert!(found.created_ms > 0, "the record kept when it was made");
+}
+
+// ---------------------------------------------------------------------------
+// The daemon that owns its sessions' records
+// ---------------------------------------------------------------------------
+
+/// **M6: "进程被 kill -9 后能从最后一条完好记录续跑"** — the library half.
+///
+/// The process-level proof (a real `yu daemon`, a real `SIGKILL`, a real
+/// restart) is `yu-cli`'s `a_killed_daemon_resumes_from_the_last_record_it_wrote`.
+/// What this pins down is the rule that proof rests on: a session's record is the
+/// authority on where it got to, a description written beside it is not, and what
+/// a restarted daemon continues from is the last record that was written *whole*.
+///
+/// The torn fragment is written by hand rather than raced, and that is the one
+/// thing this test constructs: a crash landing exactly between two writes cannot
+/// be produced on demand. The fragment is byte-for-byte what such a crash leaves —
+/// a partial line after the last newline — and everything done to it afterwards
+/// is the production path.
+#[tokio::test]
+async fn a_restarted_daemon_continues_from_the_last_whole_record() {
+    let dir = tempdir();
+    let cfg = config(dir.path().to_path_buf());
+
+    let (session, before_kill) = {
+        let daemon = yu_server::daemon::Daemon::open(dir.path()).unwrap();
+        let live = daemon.start("make the tests pass").await.unwrap();
+        let id = live.id();
+        // Three records: the charter, and two messages from the human.
+        let a = live.record("read the failure").await.unwrap();
+        let b = live.record("now fix it").await.unwrap();
+        (id, vec![0, a, b])
+    };
+    assert_eq!(before_kill, vec![0, 1, 2]);
+
+    // And then a crash during an append: a fragment with no newline after the
+    // last whole record. Byte for byte what a kill in the middle of a write
+    // leaves behind.
+    let journal_path = dir.path().join(&session).join(format!("{session}.jsonl"));
+    {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal_path)
+            .unwrap();
+        file.write_all(b"{\"seq\":3,\"ts_ms\":1,\"session\":\"s\",\"agent\":{\"id\":\"h\"},\"bo")
+            .unwrap();
+    }
+
+    // A new daemon over the same state directory: the session is still there,
+    // and it reports where the record got to — not where the fragment got to.
+    let restarted = yu_server::daemon::Daemon::open(dir.path()).unwrap();
+    let recovered = restarted.thread_recovery(&cfg, &session).await.unwrap();
+    assert_eq!(recovered.id, session);
+    assert_eq!(
+        recovered.last_seq,
+        Some(2),
+        "recovery must report the last record that was written whole; a fragment \
+         is not a record, and what it claims is not a fact about the run"
+    );
+
+    // Continuing: the fragment is dropped rather than welded onto, and numbering
+    // resumes after the last whole record.
+    let seq = restarted.deliver(&cfg, &session, "carry on").await.unwrap();
+    assert_eq!(
+        seq, 3,
+        "the next record continues from the last whole one — a fragment must not \
+         consume an address"
+    );
+    assert_eq!(
+        restarted.thread_recovery(&cfg, &session).await.unwrap().last_seq,
+        Some(3)
+    );
+    let text = std::fs::read_to_string(&journal_path).unwrap();
+    assert_eq!(
+        text.lines().count(),
+        4,
+        "the fragment was repaired away rather than left to weld onto the next \
+         record: {text}"
+    );
+    assert!(!text.contains("\"bo\n"), "the fragment is still in the file: {text}");
+
+    // And every record that was whole before the crash is still there, in order.
+    let live = restarted.attach(&session).await.unwrap();
+    let seqs: Vec<u64> = live
+        .history()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|event| event.seq)
+        .collect();
+    assert_eq!(seqs, vec![0, 1, 2, 3], "the record lost or reordered events");
+}
+
+/// A `Send` reaches the record before it is answered, and the answer says what
+/// did not happen.
+#[tokio::test]
+async fn a_send_reaches_the_record_and_the_answer_says_no_turn_ran() {
+    let dir = tempdir();
+    let cfg = config(dir.path().to_path_buf());
+    let daemon = yu_server::daemon::Daemon::open(dir.path()).unwrap();
+    let started = handle_for_test(
+        &daemon,
+        &cfg,
+        Request::Start {
+            charter: "ship it".to_owned(),
+        },
+    )
+    .await;
+    let Response::Started { session } = started.as_slice()[0].clone() else {
+        panic!("expected Started, got {started:?}");
+    };
+
+    let responses = handle_for_test(
+        &daemon,
+        &cfg,
+        Request::Send {
+            session: session.clone(),
+            text: "the parser is wrong".to_owned(),
+        },
+    )
+    .await;
+
+    // The message is in the record...
+    let live = daemon.attach(&session).await.unwrap();
+    let messages: Vec<String> = live
+        .history()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.body {
+            yu_journal::EventBody::UserMessage { text } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        messages,
+        vec!["the parser is wrong"],
+        "DESIGN: 人类原话原样存活 — the human's words are in the journal, verbatim"
+    );
+
+    // ...and the answer says exactly what happened rather than implying a turn.
+    let chunk = responses
+        .iter()
+        .find_map(|r| match r {
+            Response::Chunk { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the client is told what was done");
+    assert!(
+        chunk.contains("recorded at seq 1"),
+        "the charter is seq 0, so the first message from the human is seq 1: {chunk}"
+    );
+    assert!(
+        chunk.contains("needs a model client"),
+        "a recorded message must not read as a completed turn: {chunk}"
+    );
+    assert!(responses.iter().any(|r| matches!(
+        r,
+        Response::Done { stop_reason, .. } if stop_reason == "recorded"
+    )));
 }
 
 #[tokio::test]

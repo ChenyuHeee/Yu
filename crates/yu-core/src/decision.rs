@@ -319,6 +319,9 @@ impl DecisionLayer {
     /// Run the layer to a decision.
     pub async fn run(&mut self) -> Result<DecisionOutcome, LoopError> {
         let mut usage = TokenUsage::default();
+        // The size of the context the endpoint last reported for this layer — see
+        // `EventBody::ModelRequest::est_input_tokens`.
+        let mut context_tokens: Option<u64> = None;
         let mut contexts: Vec<ContextComposition> = Vec::new();
         let mut all_outcomes: Vec<DelegateOutcome> = Vec::new();
         // What the most recent delegation derived, and what it rendered to.
@@ -422,7 +425,7 @@ impl DecisionLayer {
                             model: req.model.clone(),
                             messages: req.messages.len(),
                             digest,
-                            est_input_tokens: None,
+                            est_input_tokens: context_tokens,
                         },
                     )
                     .await?;
@@ -430,6 +433,7 @@ impl DecisionLayer {
                 let mut sink = SilentSink::default();
                 let outcome = self.client.stream(&req, &mut sink).await?;
                 usage.add(&outcome.message.usage.to_observed());
+                context_tokens = Some(outcome.message.usage.to_observed().context_tokens());
                 if !sink.text.trim().is_empty() {
                     last_text = sink.text.clone();
                 }

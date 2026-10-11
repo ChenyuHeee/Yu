@@ -14,4 +14,5 @@
 //! concern (`thread_recovery`), not an afterthought. Headless goes through
 //! `exec` with JSONL output.
 
+pub mod daemon;
 pub mod session;

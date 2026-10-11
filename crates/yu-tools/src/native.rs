@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use yu_journal::digest_of;
 use yu_wire::types::{CustomTool, ToolDefinition};
 
 use crate::reduce::{Budget, Pressure, Reducer, Reduction};
@@ -83,11 +84,79 @@ impl ToolContext {
     }
 }
 
+/// A side effect a tool is about to perform, declared before it performs it.
+///
+/// DESIGN: "effect 纪律:**先记后做**。回放遇到已提交的 effect 直接读记录,绝不重放副作用;
+/// 有副作用的工具带 idempotency key". The declaration exists so the loop can put the
+/// intent in the record *before* the act: a record that ends on an intent is a
+/// record that was interrupted inside the one window this discipline exists for,
+/// and a record with no intent before the act cannot say the act was coming.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectIntent {
+    /// The effect's identity as the tool understands it: what is being changed,
+    /// and to what. The loop appends the call's id to make it unique per call —
+    /// the same tool with the same input twice in one run is two effects, not
+    /// one, so a key naming only the inputs would let the second be skipped as
+    /// though it were the first.
+    pub key: String,
+    /// What the effect is, in words, for whoever reads the record afterwards.
+    pub description: String,
+    /// Whether performing this effect twice is the same as performing it once.
+    ///
+    /// The tool's claim, and it is recorded because a replay is answered by the
+    /// record: an interrupted effect is otherwise undecidable, and a key that
+    /// certifies nothing may be neither skipped nor re-performed without asking
+    /// someone.
+    pub idempotent: bool,
+}
+
+/// Whether an effect that was recorded as intended is already in place.
+///
+/// The world is evidence about the crash window, and for its second half it is
+/// the only evidence there is: the record says the act was about to happen and
+/// says nothing about whether it did, so a tool that can look at what it would
+/// have changed answers the question the record cannot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectVerdict {
+    /// The effect's outcome is present: the bytes are written, the artifact
+    /// matches. The act happened; only the record of it is missing.
+    InPlace,
+    /// The effect's outcome is absent, as far as the tool can tell. The act did
+    /// not happen, or was undone.
+    NotInPlace,
+    /// The tool cannot tell — a command's effects are not inspectable, and
+    /// answering either way would be a claim nothing supports.
+    Unknown,
+}
+
 /// A tool the harness executes itself.
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn definition(&self) -> ToolDefinition;
     fn execute(&self, input: &Value, ctx: &ToolContext) -> ToolResult;
+
+    /// The side effect this call will perform, or `None` for a tool that changes
+    /// nothing.
+    ///
+    /// The default is `None` because most tools are readers, and because
+    /// declaring an effect is a claim only the tool's author can make — a wrong
+    /// `Some` would put a needless stop in a replay's path. The other direction
+    /// is guarded rather than defaulted: every tool in [`ToolRegistry::native`]
+    /// that can change something declares one, and
+    /// `every_mutating_tool_declares_its_effect` fails if one stops.
+    fn effect(&self, _input: &Value) -> Option<EffectIntent> {
+        None
+    }
+
+    /// Whether an effect recorded as intended is already in place in the world.
+    ///
+    /// Consulted when a replay meets an intent the record never finished — the
+    /// half of the crash window the record cannot answer. `Unknown` is the
+    /// default because a tool that has not said how to look cannot be assumed to
+    /// have looked.
+    fn effect_in_place(&self, _input: &Value, _ctx: &ToolContext) -> EffectVerdict {
+        EffectVerdict::Unknown
+    }
 }
 
 /// `read_file` — one file, in full.
@@ -180,6 +249,34 @@ impl Tool for WriteFile {
                 "additionalProperties": false
             }),
         ))
+    }
+
+    fn effect(&self, input: &Value) -> Option<EffectIntent> {
+        let path = input.get("path").and_then(Value::as_str)?;
+        let content = input.get("content").and_then(Value::as_str)?;
+        Some(write_intent(path, content))
+    }
+
+    /// The one native tool whose effect is *inspectable*, and therefore the one
+    /// that can answer the crash window's open question.
+    ///
+    /// The key names the bytes and the place, so "did this happen?" is a question
+    /// about the world with a checkable answer: read the path and hash it. A
+    /// record that ends on this intent, next to a file that already holds those
+    /// exact bytes, is a record of an act that happened and was not written down.
+    fn effect_in_place(&self, input: &Value, ctx: &ToolContext) -> EffectVerdict {
+        let Some(path) = input.get("path").and_then(Value::as_str) else {
+            return EffectVerdict::Unknown;
+        };
+        let Some(content) = input.get("content").and_then(Value::as_str) else {
+            return EffectVerdict::Unknown;
+        };
+        match std::fs::read(ctx.resolve(path)) {
+            Ok(bytes) if bytes == content.as_bytes() => EffectVerdict::InPlace,
+            Ok(_) => EffectVerdict::NotInPlace,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => EffectVerdict::NotInPlace,
+            Err(_) => EffectVerdict::Unknown,
+        }
     }
 
     fn execute(&self, input: &Value, ctx: &ToolContext) -> ToolResult {
@@ -320,6 +417,23 @@ impl Tool for Exec {
         ))
     }
 
+    /// A command is an effect because nothing here can know that it is not.
+    ///
+    /// `cargo test` and `rm -rf build` arrive through the same door, and the tool
+    /// has no way to tell them apart — so the honest declaration is that a shell
+    /// command may change anything.
+    fn effect(&self, input: &Value) -> Option<EffectIntent> {
+        let command = input.get("command").and_then(Value::as_str)?;
+        Some(EffectIntent {
+            key: format!("exec:sha256:{}", digest_of(command.as_bytes())),
+            description: format!("run `sh -c {command}`"),
+            // A command is not its own key: running the same one twice is two
+            // effects, which is why this is `false` and not a claim that the
+            // second run is free.
+            idempotent: false,
+        })
+    }
+
     fn execute(&self, input: &Value, ctx: &ToolContext) -> ToolResult {
         let command = match required_str(self.name(), input, "command") {
             Ok(command) => command,
@@ -409,6 +523,25 @@ pub fn parse_exit_code(command: &str, output: &str) -> Option<i32> {
     marker.strip_prefix(EXIT_MARKER)?.trim().parse().ok()
 }
 
+/// The intent behind a `write_file` call, in the one place both the tool and its
+/// tests read it from.
+///
+/// The key names the place and the bytes, so that the effect it identifies is the
+/// *whole* effect: writing different content to the same path is a different
+/// effect, and so is writing the same content elsewhere. That is what makes the
+/// claim below — that performing it twice is the same as once — a fact about the
+/// bytes rather than about the call.
+fn write_intent(path: &str, content: &str) -> EffectIntent {
+    EffectIntent {
+        key: format!(
+            "write_file:{path}#sha256:{}",
+            digest_of(content.as_bytes())
+        ),
+        description: format!("write {} bytes to `{path}`", content.len()),
+        idempotent: true,
+    }
+}
+
 fn text_result(
     tool: &str,
     input: &Value,
@@ -457,6 +590,14 @@ pub struct ToolRegistry {
     tools: Vec<Box<dyn Tool>>,
     index: HashMap<String, usize>,
     cwd: PathBuf,
+    /// The reducer every context built from this registry runs under.
+    ///
+    /// Held here rather than passed at each call site because the registry is
+    /// where a run's tool surface is assembled, and the reduction table is part
+    /// of that surface: which of DESIGN's five paths a result takes is policy,
+    /// and a policy that reached only some of the tools would be a second,
+    /// contradicting account of what the run does.
+    reducer: Option<Arc<Reducer>>,
 }
 
 impl ToolRegistry {
@@ -465,7 +606,19 @@ impl ToolRegistry {
             tools: Vec::new(),
             index: HashMap::new(),
             cwd: PathBuf::from("."),
+            reducer: None,
         }
+    }
+
+    /// Build every context from `reducer` instead of the default budget.
+    ///
+    /// This is where a policy's `[[reduction]]` rows reach the code that reduces
+    /// — `yu-policy` implements `yu_tools::reduce::ReductionTable`, the front end
+    /// hands the table in here, and nothing below this line knows what a TOML
+    /// file is. DESIGN's constraint 0: "改一条策略规则,不重新编译 Rust".
+    pub fn with_reducer(mut self, reducer: Arc<Reducer>) -> Self {
+        self.reducer = Some(reducer);
+        self
     }
 
     /// Register a tool. A name that is already present is replaced in place, so
@@ -537,8 +690,23 @@ impl ToolRegistry {
     }
 
     /// A ready context for this registry's tools.
+    ///
+    /// The context carries the registry's reducer, so a table installed with
+    /// [`ToolRegistry::with_reducer`] is the one every call actually reduces
+    /// under. Building the context with the default budget here — which is what
+    /// this did — is how a policy could be loaded, parsed and consulted by nobody.
     pub fn context(&self) -> ToolContext {
-        ToolContext::with_default_budget(self.cwd.clone())
+        match &self.reducer {
+            Some(reducer) => ToolContext::new(self.cwd.clone(), reducer.clone()),
+            None => ToolContext::with_default_budget(self.cwd.clone()),
+        }
+    }
+
+    /// The reducer this registry's contexts run under.
+    pub fn reducer(&self) -> Arc<Reducer> {
+        self.reducer
+            .clone()
+            .unwrap_or_else(|| Arc::new(Reducer::new(Budget::default())))
     }
 }
 
@@ -780,6 +948,149 @@ mod tests {
             text.contains("requires a non-empty string `command`"),
             "{text}"
         );
+    }
+
+    /// Every tool that can change something says so, and every tool that cannot
+    /// says nothing.
+    ///
+    /// The default is `None`, which is the right default for a crate of readers
+    /// and the wrong answer for `write_file` and `exec`. A tool that performs a
+    /// side effect without declaring it is the one hole the crash discipline
+    /// cannot see: its writes never enter the record, so a replay re-does them
+    /// with nothing anywhere to say that it did.
+    #[test]
+    fn every_mutating_tool_declares_its_effect() {
+        let registry = ToolRegistry::native("/tmp");
+        let mutating = ["write_file", "exec"];
+        for name in registry.names() {
+            let tool = registry.get(&name).expect("registered");
+            let declared = tool.effect(&json!({"path": "p", "content": "c", "command": "true"}));
+            if mutating.contains(&name.as_str()) {
+                assert!(
+                    declared.is_some(),
+                    "`{name}` can change the world and declares no effect, so nothing \
+                     about it ever reaches the record"
+                );
+            } else {
+                assert!(
+                    declared.is_none(),
+                    "`{name}` declares an effect it does not have: {declared:?}"
+                );
+            }
+        }
+        // The read-only surface changes nothing and therefore declares nothing.
+        let read_only = ToolRegistry::read_only("/tmp");
+        for name in read_only.names() {
+            assert!(
+                read_only
+                    .get(&name)
+                    .expect("registered")
+                    .effect(&json!({"path": "p"}))
+                    .is_none(),
+                "`{name}` is offered as read-only and declares an effect"
+            );
+        }
+    }
+
+    /// The write's key names the bytes and the place, and its verdict is checked
+    /// against the world.
+    ///
+    /// This is the pair a record needs in order to answer the crash window's
+    /// second half: the key is what "did it happen?" can be asked *about*, and
+    /// the verdict is the asking.
+    #[test]
+    fn a_write_declares_what_it_will_change_and_reports_whether_it_already_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ctx(dir.path());
+        let tool = WriteFile;
+        let input = json!({"path": "out.txt", "content": "hello"});
+        let intent = tool.effect(&input).expect("writing is an effect");
+        assert!(
+            intent.key.starts_with("write_file:out.txt#sha256:"),
+            "the key must name the place and the bytes: {}",
+            intent.key
+        );
+        assert!(intent.idempotent, "writing the same bytes twice is one write");
+
+        assert_eq!(
+            tool.effect_in_place(&input, &context),
+            EffectVerdict::NotInPlace,
+            "nothing is written yet"
+        );
+        WriteFile.execute(&input, &context);
+        assert_eq!(
+            tool.effect_in_place(&input, &context),
+            EffectVerdict::InPlace,
+            "the bytes are on disk, so the act happened"
+        );
+        // Same path, different bytes: a different effect, and not in place.
+        assert_eq!(
+            tool.effect_in_place(&json!({"path": "out.txt", "content": "other"}), &context),
+            EffectVerdict::NotInPlace
+        );
+        assert_ne!(
+            write_intent("out.txt", "hello").key,
+            write_intent("out.txt", "other").key,
+            "writing different bytes is a different effect"
+        );
+    }
+
+    /// A command cannot certify anything about itself.
+    ///
+    /// This is the safe direction stated as a value: `unknown` means a replay of
+    /// an unfinished command stops and asks, rather than choosing between losing
+    /// the work and doing it twice.
+    #[test]
+    fn a_command_declares_an_effect_it_cannot_certify() {
+        let dir = tempfile::tempdir().unwrap();
+        let intent = Exec
+            .effect(&json!({"command": "rm -rf build"}))
+            .expect("a command may change anything, so it is an effect");
+        assert!(!intent.idempotent, "a command is not its own key");
+        assert!(intent.description.contains("rm -rf build"), "{intent:?}");
+        assert_eq!(
+            Exec.effect_in_place(&json!({"command": "rm -rf build"}), &ctx(dir.path())),
+            EffectVerdict::Unknown,
+            "a command's effects are not inspectable, and saying otherwise would be \
+             a claim nothing supports"
+        );
+    }
+
+    /// The reduction table reaches the tools through the registry, or a policy
+    /// can be loaded and consulted by nobody.
+    #[test]
+    fn a_registry_reducer_reaches_every_context_it_builds() {
+        use crate::reduce::{Axes, ReductionPath, ReductionTable};
+        struct AlwaysDrop;
+        impl ReductionTable for AlwaysDrop {
+            fn path_for(&self, _: &Axes<'_>) -> Option<ReductionPath> {
+                Some(ReductionPath::DropWithManifest)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let payload = "x".repeat(64);
+        std::fs::write(dir.path().join("f.txt"), &payload).unwrap();
+        let input = json!({"path": "f.txt"});
+
+        let plain = ToolRegistry::read_only(dir.path());
+        let raw = ReadFile.execute(&input, &plain.context());
+        let mut spill = |_: &[u8]| String::new();
+        let (path, _) =
+            plain
+                .context()
+                .reduce(raw.clone(), Pressure::low(), &mut spill);
+        assert_eq!(path, Reduction::PassThrough, "small payloads pass through");
+
+        let tabled = ToolRegistry::read_only(dir.path()).with_reducer(Arc::new(
+            Reducer::new(Budget::default()).with_table(Arc::new(AlwaysDrop)),
+        ));
+        let mut spill = |_: &[u8]| String::new();
+        let (path, shown) = tabled.context().reduce(raw, Pressure::low(), &mut spill);
+        assert!(
+            matches!(path, Reduction::DropWithManifest { .. }),
+            "the registry's table did not reach the reducer: {path:?}"
+        );
+        assert!(!shown.is_complete());
     }
 
     #[test]

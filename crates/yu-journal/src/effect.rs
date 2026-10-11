@@ -9,17 +9,24 @@
 //! key already committed" a question the caller has to ask *before* acting, and it
 //! leaves the key uncommitted unless the caller says the effect completed.
 
-use std::collections::BTreeSet;
-
-/// Keys whose side effects have completed.
+/// Keys whose side effects have completed, and where their results landed.
 ///
-/// `BTreeSet` rather than a hash set so [`EffectLog::committed`] is ordered:
-/// the journal's contents are replayed in order, and a set that enumerates
+/// A `BTreeMap` rather than a hash map so [`EffectLog::committed`] is ordered:
+/// the journal's contents are replayed in order, and a map that enumerates
 /// differently on every run would make that replay non-deterministic for no
 /// gain.
 #[derive(Debug, Clone, Default)]
 pub struct EffectLog {
-    committed: BTreeSet<String>,
+    /// Key -> the seq of the result it produced, when the record named one.
+    ///
+    /// A map rather than a set because "this effect was performed" and "here is
+    /// what it produced" are two different answers, and the second is what a
+    /// replay needs in order to read the record instead of performing the
+    /// effect: DESIGN's "回放遇到已提交的 effect 直接读记录" is only possible if the
+    /// record says where. `None` is a completion whose result was never recorded
+    /// (or was recorded somewhere this log did not see), which is not the same as
+    /// an incomplete effect.
+    committed: std::collections::BTreeMap<String, Option<u64>>,
 }
 
 impl EffectLog {
@@ -27,15 +34,37 @@ impl EffectLog {
         Self::default()
     }
 
+    /// Where the recorded result of a completed effect is, if the record said.
+    ///
+    /// `Some(None)` means the effect is committed and its result is not
+    /// addressable — a replay must still not perform it again, but it has nothing
+    /// to read either, and saying so is the caller's job.
+    pub fn result_seq(&self, key: &str) -> Option<Option<u64>> {
+        self.committed.get(key).copied()
+    }
+
     /// Whether the effect behind `key` has already happened in this run.
     pub fn is_committed(&self, key: &str) -> bool {
-        self.committed.contains(key)
+        self.committed.contains_key(key)
     }
 
     /// Mark the effect behind `key` as done. Idempotent: committing a key twice
     /// is the same as committing it once.
+    ///
+    /// A later completion wins, because the second one is the one that can name
+    /// its result. A completion with no result does not overwrite one that has
+    /// one — the address is what a replay needs, and dropping it would make a
+    /// committed effect unreadable.
     pub fn commit(&mut self, key: impl Into<String>) {
-        self.committed.insert(key.into());
+        self.committed.insert(key.into(), None);
+    }
+
+    /// Commit `key`, recording where its result landed.
+    pub fn commit_with_result(&mut self, key: impl Into<String>, result_seq: Option<u64>) {
+        let key = key.into();
+        let recorded = self.committed.get(&key).copied().flatten();
+        self.committed
+            .insert(key, result_seq.or(recorded));
     }
 
     /// Every committed key, in order.
@@ -56,15 +85,117 @@ impl EffectLog {
             if let crate::EventBody::Effect { key, state, .. } = &event.body
                 && state.may_skip()
             {
-                log.commit(key.clone());
+                match state {
+                    crate::EffectState::Done { result_seq } => {
+                        log.commit_with_result(key.clone(), *result_seq);
+                    }
+                    _ => log.commit(key.clone()),
+                }
             }
         }
         log
     }
 
     pub fn committed(&self) -> Vec<String> {
-        self.committed.iter().cloned().collect()
+        self.committed.keys().cloned().collect()
     }
+
+    /// The effects the record says were attempted and never finished.
+    ///
+    /// This is the other half of [`EffectLog::from_events`], and it is the half
+    /// that answers "做了没记完 → 能检出". A record that ends on `Intended` is a
+    /// record that was interrupted inside the one window the discipline exists
+    /// for, and the finding is *negative evidence with an address*: the key, what
+    /// the effect was, and which call it belonged to. Silence is not an option —
+    /// an effect that is neither committed nor reported is one a caller will
+    /// assume never happened.
+    ///
+    /// Last state wins per key, not first: a key that was completed and later
+    /// re-attempted without finishing is unresolved again, and a scan that
+    /// stopped at the first `Done` would report it as settled.
+    pub fn unresolved(events: &[crate::Event]) -> Vec<UnresolvedEffect> {
+        let mut last: std::collections::BTreeMap<String, UnresolvedEffect> =
+            std::collections::BTreeMap::new();
+        for event in events {
+            if let crate::EventBody::Effect {
+                key,
+                description,
+                state,
+                tool_use_id,
+                idempotent,
+            } = &event.body
+            {
+                match state {
+                    crate::EffectState::Intended => {
+                        last.insert(
+                            key.clone(),
+                            UnresolvedEffect {
+                                key: key.clone(),
+                                description: description.clone(),
+                                tool_use_id: tool_use_id.clone(),
+                                idempotent: *idempotent,
+                                at_seq: event.seq,
+                            },
+                        );
+                    }
+                    // Settled one way or the other: the key is no longer in the
+                    // window, whichever side it landed on.
+                    crate::EffectState::Done { .. } | crate::EffectState::Abandoned => {
+                        last.remove(key);
+                    }
+                }
+            }
+        }
+        last.into_values().collect()
+    }
+}
+
+/// An effect that was recorded as intended and never recorded as finished.
+///
+/// Carried as a value rather than as a log line because every reader of it has to
+/// decide something — re-attempt it, refuse it, or ask a human — and a formatted
+/// sentence would have to be re-parsed to do that.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnresolvedEffect {
+    pub key: String,
+    /// What the effect was, in the words of the tool that declared it.
+    pub description: String,
+    /// The call it belonged to, when it belonged to one.
+    pub tool_use_id: Option<String>,
+    /// The tool's claim that re-performing it is safe — see
+    /// [`crate::EventBody::Effect`].
+    pub idempotent: bool,
+    /// The seq of the `Intended` record, so the finding has an address.
+    pub at_seq: u64,
+}
+
+impl UnresolvedEffect {
+    /// What a replay must do about it, given that the record does not say whether
+    /// the effect happened.
+    ///
+    /// Both eager answers are wrong somewhere, and the key's own claim is what
+    /// decides between them: a key that certifies idempotency can be performed
+    /// again, and one that does not may be neither skipped (work that maybe never
+    /// happened is lost) nor re-performed (work that maybe happened is
+    /// duplicated), so it stops and asks.
+    pub fn replay(&self) -> ReplayOfUnresolved {
+        if self.idempotent {
+            ReplayOfUnresolved::Reattempt
+        } else {
+            ReplayOfUnresolved::Surface
+        }
+    }
+}
+
+/// What an unresolved effect leaves a replay to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayOfUnresolved {
+    /// The key certifies that performing it twice is the same as once.
+    Reattempt,
+    /// The key certifies nothing, so neither skipping nor re-performing is safe.
+    /// The effect is reported with its address and a caller — a human, or the
+    /// decision layer — decides.
+    Surface,
 }
 
 /// Permission to perform one side effect.

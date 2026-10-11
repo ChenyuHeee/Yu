@@ -148,10 +148,44 @@ impl Journal {
     ///
     /// Reopening an existing file rebuilds the index from it and resumes seq
     /// numbering — the record is the only source of truth about where it ends.
+    ///
+    /// A branch reopened from disk finds its parent again. The record's first
+    /// event says which record it was forked from and where, so the lineage is
+    /// not something a process has to remember: a branch read back by a *later*
+    /// process reads its history through its parent exactly as the process that
+    /// made the fork did. Without this, a fork would only be a fork while the
+    /// handle that made it lived, and "任意历史点可被精确重建并分叉" would hold for
+    /// one process's lifetime only.
     pub async fn open(dir: impl Into<PathBuf>, session: SessionId) -> Result<Self, JournalError> {
-        let dir = dir.into();
+        let mut seen = std::collections::BTreeSet::new();
+        Self::open_inner(dir.into(), session, &mut seen).await
+    }
+
+    /// The recursive half, boxed by hand.
+    ///
+    /// A chain of forks is a chain of awaits, and the compiler cannot size an
+    /// unboxed one. `Pin<Box<..>>` rather than `futures-util`'s `BoxFuture`
+    /// because this crate does not depend on that crate, and two lines are not
+    /// worth acquiring it for. The recursion is bounded by `seen`: a lineage that
+    /// returned to a session it already walked is refused rather than followed.
+    fn open_inner<'a>(
+        dir: PathBuf,
+        session: SessionId,
+        seen: &'a mut std::collections::BTreeSet<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self, JournalError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
         if session.as_str().is_empty() {
             return Err(JournalError::EmptySessionId);
+        }
+        if !seen.insert(session.as_str().to_owned()) {
+            // A record cannot be its own ancestor. Reported rather than followed,
+            // because following it would not terminate.
+            return Err(JournalError::Corrupt {
+                offset: 0,
+                reason: format!("the fork lineage returns to `{session}`"),
+            });
         }
         tokio::fs::create_dir_all(&dir).await?;
 
@@ -180,7 +214,7 @@ impl Journal {
         let offset = index.committed_len();
         let next_seq = index.next_seq();
 
-        Ok(Self {
+        let journal = Self {
             dir,
             path,
             session,
@@ -197,6 +231,52 @@ impl Journal {
             timeline: None,
             parent: None,
             fork_at: None,
+        };
+
+        let Some((parent_id, at_seq)) = journal.fork_marker().await? else {
+            return Ok(journal);
+        };
+        let parent_path = journal.dir.join(event_log_file_name(&parent_id));
+        if !tokio::fs::try_exists(&parent_path).await? {
+            // The branch's own file is intact and readable; what is missing is the
+            // record it points at. Opening it would *create* an empty file under
+            // the parent's name — a phantom ancestor whose silence would read as
+            // "that record did no work" — so the attachment is skipped, and said
+            // out loud rather than left to be discovered as a short history.
+            tracing::warn!(
+                parent = %parent_id,
+                "this record says it was forked from a session with no file here; \
+                 its prefix cannot be read through the parent"
+            );
+            return Ok(journal);
+        }
+        let parent = Self::open_boxed(journal.dir.clone(), parent_id, seen).await?;
+        Ok(journal.with_parent(parent, at_seq))
+        })
+    }
+
+    async fn open_boxed(
+        dir: PathBuf,
+        session: SessionId,
+        seen: &mut std::collections::BTreeSet<String>,
+    ) -> Result<std::sync::Arc<Self>, JournalError> {
+        Ok(std::sync::Arc::new(Self::open_inner(dir, session, seen).await?))
+    }
+
+    /// The fork marker, when this record begins with one.
+    ///
+    /// Read from the file rather than remembered, because the question is asked at
+    /// open time and the first line is where the answer is.
+    async fn fork_marker(&self) -> Result<Option<(SessionId, u64)>, JournalError> {
+        let Some(first) = self.events().await?.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(match first.body {
+            EventBody::Forked {
+                parent,
+                parent_at_seq,
+            } if parent != self.session => Some((parent, parent_at_seq)),
+            _ => None,
         })
     }
 
@@ -329,6 +409,71 @@ impl Journal {
     /// those effects did.
     pub async fn replay_seed(&self) -> Result<crate::EffectLog, JournalError> {
         Ok(crate::EffectLog::from_events(&self.history().await?))
+    }
+
+    /// The effects the record says were attempted and never finished.
+    ///
+    /// The companion of [`Journal::replay_seed`], over the same history: the seed
+    /// says what must not be performed again, this says what cannot be decided
+    /// from the record at all. A caller that reads only the seed sees an
+    /// interrupted effect as one that never happened, which is the reading
+    /// [`crate::UnresolvedEffect`] exists to prevent.
+    pub async fn unresolved_effects(&self) -> Result<Vec<crate::UnresolvedEffect>, JournalError> {
+        Ok(crate::EffectLog::unresolved(&self.history().await?))
+    }
+
+    /// What forking at `at_seq` will cost, measured before the fork happens.
+    ///
+    /// DESIGN is explicit that this must be visible rather than discovered:
+    /// "**fork 的代价必须显式**:从分叉点起缓存前缀不再匹配。**fork 是带成本提示的
+    /// 操作,不是免费调试按钮**". Two numbers, because a fork has two costs and
+    /// they point in opposite directions:
+    ///
+    /// * **storage** — one marker line. "fork 用引用而非拷贝 —— 成本从 O(记录) 降到
+    ///   O(1)": nothing is copied, so this is the same for a ten-event parent and a
+    ///   million-event one.
+    /// * **the prefix** — everything before the fork point, which a replay of the
+    ///   branch has to re-establish from scratch, because from `at_seq` onward the
+    ///   rendered bytes no longer match anything cached. `est_input_tokens` is
+    ///   taken from the last `ModelRequest` at or before the point, which is a
+    ///   measurement the record already holds rather than an estimate invented
+    ///   here.
+    pub async fn estimate_fork(&self, at_seq: u64) -> Result<ForkEstimate, JournalError> {
+        let events = self.history_prefix(at_seq).await?;
+        let mut bytes: u64 = 0;
+        let mut est_input_tokens = None;
+        for event in &events {
+            bytes += serde_json::to_vec(event)?.len() as u64;
+            if let EventBody::ModelRequest {
+                est_input_tokens: Some(tokens),
+                ..
+            } = &event.body
+            {
+                est_input_tokens = Some(*tokens);
+            }
+        }
+        // The marker as it will actually be written, so the storage half of the
+        // estimate is a measurement and not a guess. `ts_ms` is filled by the
+        // journal at append time; a 13-digit millisecond timestamp is what it
+        // will be, which is what this models.
+        let marker = Event {
+            seq: at_seq,
+            ts_ms: 1_700_000_000_000,
+            session: SessionId::new("<the new branch>"),
+            agent: AgentId::new("fork"),
+            body: EventBody::Forked {
+                parent: self.session().clone(),
+                parent_at_seq: at_seq,
+            },
+        };
+        Ok(ForkEstimate {
+            parent: self.session().clone(),
+            at_seq,
+            events: events.len(),
+            bytes,
+            est_input_tokens,
+            marker_bytes: serde_json::to_vec(&marker)?.len() as u64 + 1,
+        })
     }
 
     /// Append one event. Returns it with its assigned `seq` and timestamp.
@@ -527,6 +672,50 @@ impl Journal {
 
     fn index_write(&self) -> RwLockWriteGuard<'_, JournalIndex> {
         self.index.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// What forking at a point costs, before the fork is made.
+///
+/// See [`Journal::estimate_fork`]. Held as a value so a front end prints it
+/// without re-deriving it, and so a test can assert the two halves separately:
+/// the storage cost that does not grow with the parent, and the prefix that does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkEstimate {
+    pub parent: SessionId,
+    pub at_seq: u64,
+    /// Events the branch inherits and reads through its parent.
+    pub events: usize,
+    /// Bytes those events occupy in the record.
+    pub bytes: u64,
+    /// The size of the context the last recorded request at or before the fork
+    /// point was carrying, when the record holds one.
+    pub est_input_tokens: Option<u64>,
+    /// Bytes of the one line the fork itself writes.
+    pub marker_bytes: u64,
+}
+
+impl std::fmt::Display for ForkEstimate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "forking {} at seq {}: {} event(s) / {} bytes inherited by reference; \
+             the cache prefix diverges there, so {}; the fork itself costs {} byte(s)",
+            self.parent,
+            self.at_seq,
+            self.events,
+            self.bytes,
+            match self.est_input_tokens {
+                Some(tokens) => format!(
+                    "a replay of this branch re-sends the prefix the last recorded request \
+                     measured at {tokens} input tokens"
+                ),
+                None => "no request was recorded at or before the point, so the re-send \
+                         cost of the prefix is not known from the record"
+                    .to_owned(),
+            },
+            self.marker_bytes,
+        )
     }
 }
 

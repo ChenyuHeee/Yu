@@ -93,6 +93,7 @@ async fn events_and_the_journal_have_the_documented_shape() {
             description: "charge the card".to_owned(),
             state: EffectState::Done { result_seq: None },
             tool_use_id: None,
+            idempotent: false,
         },
     ];
     for body in &bodies {
