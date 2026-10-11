@@ -17,6 +17,7 @@ pub mod decide;
 pub mod decision;
 pub mod delegate;
 pub mod gate;
+pub mod outcomes;
 pub mod render;
 pub mod topology;
 pub mod traits;

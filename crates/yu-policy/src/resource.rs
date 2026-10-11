@@ -24,6 +24,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use yu_core::outcomes::OutcomeSets;
+
+use crate::outcomes::OutcomeSetsError;
 
 /// Ceilings a run may spend. `None` means "no ceiling configured" rather than
 /// zero — an absent budget must be visibly absent, because a budget that reads as
@@ -116,6 +119,15 @@ pub struct Policy {
     /// rather than by a numeric field nobody maintains.
     pub reduction: Vec<ReductionRule>,
     pub hooks: Vec<Hook>,
+    /// Pre-registered outcome sets, by id. DESIGN: "报告的形状在调用之前就定了"
+    /// — the decision layer *selects* a set for a delegation (it cannot invent
+    /// one, being no expert in the domain), and the executor classifies what
+    /// happened into one of the set's slots.
+    ///
+    /// The vocabulary the slots are built from lives in
+    /// [`yu_core::outcomes`]; the five rules a declared set must satisfy are
+    /// enforced by [`crate::outcomes`] before a [`Policy`] is handed out.
+    pub outcome_sets: OutcomeSets,
     /// Tier 2 script name -> source.
     pub scripts: BTreeMap<String, String>,
     pub budgets: Budgets,
@@ -126,7 +138,16 @@ impl Policy {
     ///
     /// This function existing at run time *is* the acceptance criterion: the
     /// binary that reads a policy is not rebuilt when the policy changes.
+    ///
+    /// The text is read twice: once as a document, so `[[outcome_sets]]` can be
+    /// checked against its rules *with the set and slot named in every error*
+    /// (see [`crate::outcomes`]), and once as the typed contract. A second
+    /// parse of a policy-sized string is the price of that context, and it is
+    /// paid at load time, not per run.
     pub fn from_toml_str(s: &str) -> Result<Self, PolicyError> {
+        let document =
+            toml::from_str::<toml::Value>(s).map_err(|e| PolicyError::Parse(e.to_string()))?;
+        crate::outcomes::validate_outcome_sets(&document)?;
         toml::from_str(s).map_err(|e| PolicyError::Parse(e.to_string()))
     }
 
@@ -189,6 +210,10 @@ pub enum PolicyError {
     Parse(String),
     #[error("policy is missing `{key}`")]
     Missing { key: String },
+    /// An `[[outcome_sets]]` declaration broke one of the loader's rules. The
+    /// inner error carries the set and the slot the complaint is about.
+    #[error("{0}")]
+    OutcomeSets(#[from] OutcomeSetsError),
     #[error("policy has no script named `{name}`")]
     UnknownScript { name: String },
     #[error("unsupported: {0}")]
