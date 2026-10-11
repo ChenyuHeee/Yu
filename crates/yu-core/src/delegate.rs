@@ -1035,5 +1035,156 @@ mod tests {
             "the cause must not be confused with the budget: {rendered}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }    // ---- pre-registered landings, end to end -------------------------------
+
+    /// A turn that asks to classify, with the slot the executor chose.
+    fn land_reply(slot: &str, why: &str) -> String {
+        serde_json::json!({
+            "id": "msg-land",
+            "model": "fake-model",
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "classifying", "signature": "sig"},
+                {"type": "tool_use", "id": "call_00_land", "name": crate::landing::LAND,
+                 "input": {"slot": slot, "why": why}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })
+        .to_string()
     }
+
+    fn planned(slots: &[&str]) -> crate::landing::PlannedOutcomes {
+        crate::landing::PlannedOutcomes {
+            id: "build".to_owned(),
+            description: Some("A build was attempted.".to_owned()),
+            slots: slots.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    async fn run_with_landing(replies: Vec<String>, outcomes: Option<crate::landing::PlannedOutcomes>, name: &str) -> DelegateOutcome {
+        use crate::agent::test_support::FakeEndpoint;
+        use yu_journal::SessionId;
+
+        let fake = FakeEndpoint::scripted(replies);
+        let dir = scratch_dir(name);
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let tools = Arc::new(yu_tools::ToolRegistry::native(&dir));
+        let mut args = DelegateArgs::new("build the thing");
+        args.outcomes = outcomes;
+        let outcome = run_delegation(&args, fake.client(), journal, tools, Timeline::new(), dir.clone())
+            .await
+            .expect("the scripted executor finishes");
+        let _ = std::fs::remove_dir_all(&dir);
+        outcome
+    }
+
+    /// **M3's round trip: the executor classifies, and the classification comes back.**
+    ///
+    /// The landing is recovered from the record rather than from the loop's
+    /// return value, so this also proves the `land` call reaches L2 — a landing
+    /// that existed only in memory would be invisible to everything downstream,
+    /// including the harness check that reads it.
+    #[tokio::test]
+    async fn a_pre_registered_set_comes_back_as_the_slot_the_executor_chose() {
+        use crate::agent::test_support::final_reply;
+
+        let outcome = run_with_landing(
+            vec![land_reply("compile_error", "error[E0308]"), final_reply("done")],
+            Some(planned(&["pass", "compile_error"])),
+            "delegate-landing",
+        )
+        .await;
+
+        let landing = outcome.landing.as_ref().expect("a set was pre-registered");
+        assert_eq!(landing.slot, "compile_error");
+        assert_eq!(landing.why, "error[E0308]");
+        assert!(!landing.is_other());
+        assert_eq!(outcome.steps, 2, "land, then finish");
+    }
+
+    /// **Design: "`other` 必须存在,落进去要响."**
+    #[tokio::test]
+    async fn a_slot_the_set_does_not_contain_lands_in_other_with_the_word_used() {
+        use crate::agent::test_support::final_reply;
+
+        let outcome = run_with_landing(
+            vec![land_reply("disk_full", "no space left"), final_reply("done")],
+            Some(planned(&["pass", "compile_error"])),
+            "delegate-other",
+        )
+        .await;
+
+        let landing = outcome.landing.as_ref().expect("a set was pre-registered");
+        assert!(landing.is_other(), "an unpredicted slot lands in `other`");
+        assert_eq!(
+            landing.unlisted.as_deref(),
+            Some("disk_full"),
+            "and the word it used survives, so a surprise can be told from a \
+             set that is named wrong"
+        );
+    }
+
+    /// An executor that was asked and did not answer is not the same as one that
+    /// was never asked.
+    #[tokio::test]
+    async fn an_executor_that_was_asked_and_did_not_answer_lands_in_other_with_that_reason() {
+        use crate::agent::test_support::final_reply;
+
+        let outcome = run_with_landing(
+            vec![final_reply("I finished, I think")],
+            Some(planned(&["pass", "compile_error"])),
+            "delegate-silent",
+        )
+        .await;
+
+        let landing = outcome.landing.as_ref().expect("a set was pre-registered");
+        assert!(landing.is_other());
+        assert!(
+            landing.why.contains("did not classify"),
+            "the reason has to be the absence itself, not an empty string: {}",
+            landing.why
+        );
+        // And the other direction: a delegation that was never given a set must
+        // not report a landing at all, or "we did not ask" would render as
+        // "it did not fit".
+        let unasked = run_with_landing(
+            vec![final_reply("done")],
+            None,
+            "delegate-unasked",
+        )
+        .await;
+        assert_eq!(unasked.landing, None);
+    }
+
+    /// **"落进 `other` 时放宽报告."**
+    #[tokio::test]
+    async fn landing_in_other_keeps_more_of_the_report() {
+        use crate::agent::test_support::final_reply;
+
+        let long = "word ".repeat(REPORT_BUDGET_CHARS);
+        let predicted = run_with_landing(
+            vec![land_reply("pass", "it worked"), final_reply(&long)],
+            Some(planned(&["pass"])),
+            "delegate-narrow",
+        )
+        .await;
+        let unpredicted = run_with_landing(
+            vec![land_reply("something_else", "it did not fit"), final_reply(&long)],
+            Some(planned(&["pass"])),
+            "delegate-wide",
+        )
+        .await;
+
+        assert!(!predicted.landing.as_ref().unwrap().is_other());
+        assert!(unpredicted.landing.as_ref().unwrap().is_other());
+        assert!(
+            unpredicted.render().chars().count() > predicted.render().chars().count() * 2,
+            "an unpredicted result is carried entirely by its prose, so the budget \
+             has to widen: {} vs {}",
+            unpredicted.render().chars().count(),
+            predicted.render().chars().count()
+        );
+    }
+
 }
