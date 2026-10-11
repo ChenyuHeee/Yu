@@ -1,0 +1,6 @@
+# Pinned exactly. `mkdocs gh-deploy` compares versions and aborts when the
+# running mkdocs is older than the one that made the previous deployment, so a
+# local build and a CI build that disagree can refuse to publish. Keep these
+# identical in both places; let Dependabot propose the bumps.
+mkdocs-material==9.7.7
+mkdocs==1.6.1

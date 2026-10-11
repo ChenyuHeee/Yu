@@ -1,0 +1,5 @@
+# This is an orphan branch: it does not inherit the root .gitignore from main.
+/site/
+/.venv/
+__pycache__/
+.DS_Store

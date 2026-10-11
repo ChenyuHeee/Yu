@@ -1,0 +1,65 @@
+site_name: Yu — CLI and Developer Manual
+site_url: https://chenyuheee.github.io/Yu/
+site_description: Command surface, configuration, and integration reference for the Yu agent harness.
+repo_url: https://github.com/ChenyuHeee/Yu
+# The manual lives on its own branch, not on the default one, so the edit link
+# has to name that branch explicitly or every "edit this page" link 404s.
+edit_uri: edit/docs-site/docs/
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: install.md
+      - Configuration: configuration.md
+  - Commands:
+      - commands/index.md
+      - yu probe: commands/probe.md
+      - yu exec: commands/exec.md
+      - yu run: commands/run.md
+      - yu decide: commands/decide.md
+      - yu metrics: commands/metrics.md
+      - yu fork: commands/fork.md
+      - yu daemon: commands/daemon.md
+  - Reference:
+      - Tools: reference/tools.md
+      - Policy file: reference/policy.md
+      - Record format: reference/record.md
+  - Integration:
+      - Embedding the crates: integration/embedding.md
+      - Endpoint compatibility: integration/endpoint.md
