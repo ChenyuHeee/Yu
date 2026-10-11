@@ -50,6 +50,14 @@ use crate::render::{Evidence, NotLoadedEntry};
 /// that rule was not applied.
 pub const REPORT_BUDGET_CHARS: usize = 2500;
 
+/// The budget when the executor landed in `other`.
+///
+/// Wider because a predicted result is mostly carried by its slot and an
+/// unpredicted one is carried entirely by its prose: there is no slot to read,
+/// so the words are the whole account. Cutting them to the width of a predicted
+/// outcome would discard exactly the part that made the result worth reporting.
+pub const WIDE_REPORT_BUDGET_CHARS: usize = 8000;
+
 /// What the decision layer asks for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateArgs {
@@ -60,6 +68,11 @@ pub struct DelegateArgs {
     /// and expensive failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<String>,
+    /// The set of landing slots this call was launched with, when one was
+    /// pre-registered. `None` means the delegation was not asked to classify
+    /// itself, and nothing downstream may pretend it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcomes: Option<crate::landing::PlannedOutcomes>,
     /// Files the work is expected to touch.
     ///
     /// DESIGN lists "实际触碰文件 vs 预期" as a shape signal, and this is where
@@ -72,6 +85,7 @@ pub struct DelegateArgs {
 impl DelegateArgs {
     pub fn new(task: impl Into<String>) -> Self {
         Self {
+            outcomes: None,
             task: task.into(),
             question: None,
             expected_files: None,
@@ -86,6 +100,13 @@ pub struct DelegateOutcome {
     pub report: String,
     /// Commands that ran, with their exit codes where the run captured one.
     pub evidence: Vec<Evidence>,
+    /// Where the executor classified this result, when it was asked to.
+    ///
+    /// `None` means no set was pre-registered, which is different from a landing
+    /// of `other` and must not be rendered as one: "we did not ask" and "it did
+    /// not fit what we asked" are different findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing: Option<crate::landing::Landing>,
     /// Deterministic counts.
     pub shape: Vec<ShapeSignal>,
     /// What the run recorded and this view does not contain.
@@ -147,7 +168,21 @@ impl DelegateOutcome {
             "({} step(s), {} tool call(s))\n\n",
             self.steps, self.tool_calls
         ));
-        out.push_str(&truncate_report(&self.report, self.report_address.as_deref()));
+        // A landing of `other` widens the budget. DESIGN: "落进 `other` 时**放宽**
+        // 报告:那正是要细节的时候." When the result fits a slot the caller named,
+        // the slot is most of the report and the prose is a footnote; when it does
+        // not, the prose is the only account of what happened, and cutting it to
+        // the width of a predicted outcome throws away the thing that made it
+        // worth reporting.
+        let budget = match &self.landing {
+            Some(landing) if landing.is_other() => WIDE_REPORT_BUDGET_CHARS,
+            _ => REPORT_BUDGET_CHARS,
+        };
+        out.push_str(&truncate_report(
+            &self.report,
+            self.report_address.as_deref(),
+            budget,
+        ));
         out.push('\n');
 
         if self.evidence.is_empty() {
@@ -205,8 +240,13 @@ pub async fn outcome_from_run(
     run: &LoopOutcome,
     journal: &Journal,
     declared_files: Option<&[String]>,
+    planned: Option<&crate::landing::PlannedOutcomes>,
 ) -> Result<DelegateOutcome, yu_journal::JournalError> {
     let events = journal.events().await?;
+    // The executor's own classification of its result, recovered from the record
+    // rather than from the loop's memory — the same way `exec` evidence is, and
+    // for the same reason: the record is the thing that survives the process.
+    let mut landing_input: Option<serde_json::Value> = None;
 
     // Pair each `exec` call with its result to recover runnable evidence. Only
     // commands count: a file read is not evidence that something works.
@@ -224,6 +264,11 @@ pub async fn outcome_from_run(
                 name,
                 input,
             } => {
+                if name == crate::landing::LAND {
+                    // Last one wins: a second `land` is a correction, and the
+                    // record keeps both so the correction is visible.
+                    landing_input = Some(input.clone());
+                }
                 if name == "exec" {
                     let command = input
                         .get("command")
@@ -350,8 +395,23 @@ pub async fn outcome_from_run(
     // here was complete by construction and the "stopped" branch below was
     // unreachable prose (see `LoopOutcome::stopped_early`).
     let stopped_early = run.stopped_early;
+    let landing = match (planned, landing_input) {
+        (Some(planned), Some(input)) => Some(crate::landing::read_landing(&input, &planned.slots)),
+        // Asked, and did not answer. That is itself a finding, and it is
+        // reported as an unpredicted result rather than as an absent one: the
+        // report may still be prose, but nothing in it was classified, so
+        // nothing in it has been checked.
+        (Some(_), None) => Some(crate::landing::Landing {
+            slot: crate::landing::OTHER.to_owned(),
+            why: "the executor did not classify its result".to_owned(),
+            unlisted: None,
+        }),
+        (None, _) => None,
+    };
+
     Ok(DelegateOutcome {
         report: run.text.clone(),
+        landing,
         evidence,
         shape,
         omitted,
@@ -370,11 +430,11 @@ pub async fn outcome_from_run(
 /// The truncation is stated rather than silent, and it carries an address when
 /// one exists. DESIGN: "清单不谎称" — a manifest that says "truncated" without
 /// saying where is only half honest, and the half it omits is the useful one.
-fn truncate_report(report: &str, address: Option<&str>) -> String {
-    if report.chars().count() <= REPORT_BUDGET_CHARS {
+fn truncate_report(report: &str, address: Option<&str>, budget: usize) -> String {
+    if report.chars().count() <= budget {
         return report.to_owned();
     }
-    let mut end = REPORT_BUDGET_CHARS;
+    let mut end = budget;
     while end > 0 && !report.is_char_boundary(end) {
         end -= 1;
     }
@@ -490,8 +550,42 @@ pub async fn run_delegation(
          State the outcome and the evidence for it; leave out the narrative of how you got there."
     );
 
-    let config = AgentConfig::new(yu_observe::AgentId::new("executor"), client.default_model())
-        .max_steps(16);
+    // Last, so it is the final thing read before the executor starts: the
+    // classification is the report, and an instruction to fill in a form at the
+    // end of a long task gets followed less often than one that arrives at the
+    // end of the instructions.
+    let task = match &args.outcomes {
+        Some(planned) => format!(
+            "{task}\n\n---\nBefore you finish, call `land` exactly once and say where this \
+             result landed. You were launched with these slots: {}. Choose the one your evidence \
+             supports rather than the one that sounds best, and choose `other` if none of them \
+             fits — an unpredicted result is more useful to the decision layer than a wrong \
+             prediction, and forcing it into the nearest slot destroys it.",
+            planned
+                .slots
+                .iter()
+                .map(|s| format!("`{s}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        None => task,
+    };
+
+    // The pre-registered slots reach the executor two ways, and both are needed.
+    // The *tool* carries them into the request's tool list, which is the front of
+    // the cacheable prefix — DESIGN: "预测集在**请求**里(前缀缓存自动命中)". The
+    // *task* names them in prose because a schema `enum` says what is allowed and
+    // not what each slot means, and an executor choosing between `compile_error`
+    // and `test_failure` needs the difference stated rather than inferred.
+    let mut config =
+        AgentConfig::new(yu_observe::AgentId::new("executor"), client.default_model())
+            .max_steps(16);
+    if let Some(planned) = &args.outcomes {
+        config = config.extra_tool(crate::landing::land_tool(
+            &planned.slots,
+            planned.description.as_deref(),
+        ));
+    }
     // DESIGN lists `spawn` among the spans, and topology is meant to be chosen at
     // run time on the strength of derivation being cheap. Neither claim is
     // checkable while the span is never emitted: there was no way to see that a
@@ -507,9 +601,14 @@ pub async fn run_delegation(
         .finish();
     tracing::debug!(elapsed_ms = spawned.elapsed_ms(), "spawn");
     let run = run?;
-    outcome_from_run(&run, &journal, args.expected_files.as_deref())
-        .await
-        .map_err(crate::agent::LoopError::Journal)
+    outcome_from_run(
+        &run,
+        &journal,
+        args.expected_files.as_deref(),
+        args.outcomes.as_ref(),
+    )
+    .await
+    .map_err(crate::agent::LoopError::Journal)
 }
 
 /// Fixtures for tests that exercise what gets derived rather than what comes
@@ -520,6 +619,7 @@ pub(crate) mod tests_support {
 
     pub fn outcome_for(task: &str) -> DelegateOutcome {
         DelegateOutcome {
+            landing: None,
             report: format!("did: {task}"),
             evidence: Vec::new(),
             shape: Vec::new(),
@@ -608,6 +708,7 @@ mod tests {
     #[test]
     fn a_report_with_no_evidence_says_so_explicitly() {
         let outcome = DelegateOutcome {
+            landing: None,
             report: "I refactored the parser and it is much cleaner now.".into(),
             evidence: vec![],
             shape: vec![],
@@ -631,6 +732,7 @@ mod tests {
     #[test]
     fn an_incomplete_run_is_not_reported_as_complete() {
         let outcome = DelegateOutcome {
+            landing: None,
             report: "gave up".into(),
             evidence: vec![],
             shape: vec![],
@@ -651,6 +753,7 @@ mod tests {
     #[test]
     fn evidence_shows_the_command_and_its_exit_code() {
         let outcome = DelegateOutcome {
+            landing: None,
             report: "tests pass".into(),
             evidence: vec![Evidence::command("cargo test", "running 12 tests\nok", 0)],
             shape: vec![],
@@ -670,6 +773,7 @@ mod tests {
 
     fn outcome_with_report(report: String, address: Option<&str>) -> DelegateOutcome {
         DelegateOutcome {
+            landing: None,
             report,
             evidence: vec![],
             shape: vec![],
@@ -766,6 +870,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let outcome = DelegateOutcome {
+            landing: None,
             report: "done".into(),
             evidence: vec![Evidence::command("cargo test", long, 0)],
             shape: vec![],

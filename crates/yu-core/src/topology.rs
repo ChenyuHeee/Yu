@@ -262,6 +262,7 @@ pub async fn derive<R: DelegateRunner>(
                 // 恰好被一个非作者验证一次". The verifier is therefore a fresh
                 // reader, not the author asked to check itself.
                 let args = DelegateArgs {
+                    outcomes: None,
                     task: format!(
                         "Verify this work item against the record. You did not write it. \
                          Report only what the record actually shows: {item}"

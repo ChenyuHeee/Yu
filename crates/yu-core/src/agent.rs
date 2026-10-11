@@ -71,6 +71,14 @@ pub struct AgentConfig {
     /// turn count — so this is a backstop against a wedged loop, not the
     /// mechanism that ends a run.
     pub max_steps: u32,
+    /// Tools that answer without running anything.
+    ///
+    /// `land` is the one that needs this: it is a channel for the executor to
+    /// *classify* its own result, so there is no effect to perform and nothing
+    /// to sandbox. Its answer is the harness restating what it recorded. It is
+    /// here rather than in the registry because its slot list is the delegation's
+    /// and changes per call, while a registry is built once and shared.
+    pub extra_tools: Vec<ToolDefinition>,
 }
 
 impl AgentConfig {
@@ -85,7 +93,14 @@ impl AgentConfig {
             // caller should have to remember to attach, so it is the default.
             system: vec![SystemBlock::text(EXECUTOR_PROMPT)],
             max_steps: 40,
+            extra_tools: Vec::new(),
         }
+    }
+
+    /// Add a tool that is answered rather than executed.
+    pub fn extra_tool(mut self, tool: ToolDefinition) -> Self {
+        self.extra_tools.push(tool);
+        self
     }
 
     pub fn system(mut self, blocks: Vec<SystemBlock>) -> Self {
@@ -530,7 +545,10 @@ impl Agent {
         if !self.config.system.is_empty() {
             req = req.system(self.config.system.clone());
         }
-        let definitions = self.tools.definitions();
+        let mut definitions = self.tools.definitions();
+        // After the registry's, so the registered surface keeps its order and
+        // the prefix stays byte-stable as extra tools come and go.
+        definitions.extend(self.config.extra_tools.iter().cloned());
         if !definitions.is_empty() {
             req = req.tools(definitions);
         }
@@ -609,9 +627,22 @@ impl Agent {
         let mut slots: Vec<Option<(ContentBlock, Reduction)>> = Vec::new();
         slots.resize_with(uses.len(), || None);
 
+        // The tools that are answered rather than executed, first. They need no
+        // admission and no task, but they do need recording: the landing is what
+        // the harness will check the evidence against, so a landing that never
+        // reached the journal would make the check silently vacuous.
+        for (index, tu) in uses.iter().enumerate() {
+            if self.config.extra_tools.iter().any(|t| t.name() == tu.name) {
+                slots[index] = Some(self.answer_in_place(tu, pressure).await?);
+            }
+        }
+
         let mut concurrent = Vec::new();
         let mut exclusive = Vec::new();
         for (index, tu) in uses.iter().enumerate() {
+            if slots[index].is_some() {
+                continue;
+            }
             if supports_parallel(&tu.name) {
                 concurrent.push(index);
             } else {
@@ -772,6 +803,55 @@ async fn run_one(
         .map_err(|e| yu_wire::WireError::transport(format!("journaling tool result: {e}")))?;
 
     Ok((reduced.to_block(&tu.id), reduction))
+}
+
+impl Agent {
+    /// Record a call to a tool that performs no effect, and answer it.
+    ///
+    /// The result is journaled with the same shape a real one gets, because
+    /// everything downstream reads the record rather than the loop's memory —
+    /// `outcome_from_run` recovers a delegation's landing from the journal
+    /// exactly as it recovers `exec` evidence, and a landing that existed only
+    /// in this function's return value would be invisible to it.
+    async fn answer_in_place(
+        &self,
+        tu: &ToolUseBlock,
+        _pressure: Pressure,
+    ) -> Result<(ContentBlock, Reduction), LoopError> {
+        let text = crate::landing::acknowledgement(
+            tu.input.get("slot").and_then(serde_json::Value::as_str).unwrap_or(crate::landing::OTHER),
+        );
+        self.journal
+            .append(
+                self.config.id.clone(),
+                EventBody::ToolCall {
+                    tool_use_id: tu.id.clone(),
+                    name: tu.name.clone(),
+                    input: tu.input.clone(),
+                },
+            )
+            .await?;
+        self.journal
+            .append(
+                self.config.id.clone(),
+                EventBody::ToolResult {
+                    tool_use_id: tu.id.clone(),
+                    name: tu.name.clone(),
+                    kind: yu_tools::ResultKind::Structured.as_str().to_owned(),
+                    bytes: text.len() as u64,
+                    reproducible: true,
+                    addressable: false,
+                    inline: Some(text.clone()),
+                    blob: None,
+                    reduction: Some("pass_through".to_owned()),
+                },
+            )
+            .await?;
+        Ok((
+            ContentBlock::ToolResult(yu_wire::types::ToolResultBlock::text(&tu.id, text)),
+            Reduction::PassThrough,
+        ))
+    }
 }
 
 /// Whether a tool may run alongside others.
