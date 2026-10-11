@@ -16,7 +16,7 @@ use serde_json::Value;
 
 use yu_observe::{SpanKind, Timeline};
 
-use crate::error::{ErrorKind, WireError};
+use crate::error::{ErrorKind, WireError, redact_key_material};
 use crate::quirks::Quirks;
 use crate::sse::{SseEvent, SseParser, StreamAccumulator, StreamedMessage};
 use crate::types::{ContentBlock, MessagesRequest, MessagesResponse};
@@ -330,9 +330,18 @@ impl WireClient {
             return Err(WireError::from_response(status, &body, retry_after));
         }
         serde_json::from_str(&body).map_err(|e| {
+            // A 2xx that does not parse is still an ingest point, and a gateway
+            // in front of the endpoint can answer `200` with a body that quotes
+            // the credential it rejected. Redaction happens on the *message*, not
+            // on `body` before parsing: `redact_masked_suffix` cannot tell
+            // `****0000` from markdown bold followed by a word, so running it
+            // over the payload would rewrite legitimate content.
             WireError::new(
                 ErrorKind::MalformedResponse,
-                format!("response did not parse: {e}; body began: {}", preview(&body)),
+                redact_key_material(&format!(
+                    "response did not parse: {e}; body began: {}",
+                    preview(&body)
+                )),
             )
         })
     }
@@ -513,11 +522,13 @@ impl WireClient {
                     return Err(StreamFailure {
                         error: WireError::new(
                             ErrorKind::MalformedResponse,
-                            format!(
+                            // Same ingest point as above, same reason: `200` is
+                            // not a promise that the body is the endpoint's.
+                            redact_key_material(&format!(
                                 "HTTP 200 but the body was neither SSE nor a message: {e}; \
                                  body began: {}",
                                 body.chars().take(300).collect::<String>()
-                            ),
+                            )),
                         ),
                         emitted_content: false,
                     });
@@ -1012,5 +1023,100 @@ mod tests {
             Some(307),
             "the caller must learn the endpoint answered with a redirect: {err}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Redaction on the 2xx path
+    //
+    // `from_response` redacts error bodies, so a 4xx/5xx quoting the credential
+    // is handled. A `200` is not a promise that the body came from the endpoint:
+    // a gateway or auth proxy in front of it can answer `OK` with the rejection
+    // notice, key and all. Those bodies fail to parse, and the parse-failure
+    // message carried a preview of them verbatim — the last ingest point that
+    // did not redact.
+    // -----------------------------------------------------------------------
+
+    /// Answers one request with `body`, always `200 OK`.
+    fn respond_200(body: &'static str, content_type: &'static str) -> SocketAddr {
+        let listener = loopback_listener();
+        let addr = listener.local_addr().expect("listener address");
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else {
+                return;
+            };
+            read_request(&mut sock);
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: {content_type}\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = sock.write_all(reply.as_bytes());
+        });
+        addr
+    }
+
+    fn client_for(addr: SocketAddr) -> WireClient {
+        WireClient::builder()
+            .base_url(format!("http://{addr}"))
+            .auth(Auth::ApiKey("canary-key".into()))
+            .retry(RetryPolicy {
+                max_attempts: 1,
+                ..Default::default()
+            })
+            .default_model("test-model")
+            .build()
+            .expect("building the client")
+    }
+
+    fn a_request() -> MessagesRequest {
+        MessagesRequest::new("test-model", 16, vec![Message::user("hello")])
+    }
+
+    /// What a gateway's `200` looks like when it is the one doing the rejecting.
+    const GATEWAY_REJECTION: &str =
+        r#"<html><body>Request denied. Your api key: ****0000 is invalid.</body></html>"#;
+
+    #[tokio::test]
+    async fn a_2xx_body_that_does_not_parse_does_not_carry_the_key_it_quotes() {
+        let addr = respond_200(GATEWAY_REJECTION, "text/html");
+        let err = client_for(addr)
+            .send(&a_request())
+            .await
+            .expect_err("a non-JSON 200 is a malformed response");
+
+        let rendered = format!("{err}");
+        let debugged = format!("{err:?}");
+        for (what, text) in [("Display", &rendered), ("Debug", &debugged)] {
+            assert!(
+                !text.contains("0000"),
+                "the key characters the mask preserved reached {what}: {text}"
+            );
+            // The mask itself stays: it is what says a credential was involved.
+            assert!(
+                text.contains("****"),
+                "{what} must still report that a credential was quoted: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_2xx_stream_body_that_is_neither_sse_nor_a_message_is_redacted_too() {
+        // The streaming path builds its own message from the same body, so it
+        // needed the same treatment — two ingest points, one policy.
+        let addr = respond_200(GATEWAY_REJECTION, "text/html");
+        let mut sink = NullSink;
+        let err = client_for(addr)
+            .stream(&a_request(), &mut sink)
+            .await
+            .expect_err("a 200 that is neither SSE nor a message is malformed");
+
+        let text = format!("{err}");
+        assert!(
+            !text.contains("0000"),
+            "the key characters the mask preserved reached the stream error: {text}"
+        );
+        assert!(text.contains("****"), "and the mask must survive: {text}");
     }
 }
