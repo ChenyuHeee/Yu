@@ -439,11 +439,22 @@ impl Journal {
             let Some(start) = index.offset_at_or_after(from) else {
                 return Ok(Vec::new());
             };
-            // Exclusive upper bound: where `until` begins, or the end of what has
-            // been committed. Falling back to the file end rather than to
-            // "unbounded" keeps the read bounded even for a range that runs past
-            // the last event.
-            let end = index.offset_of(until).unwrap_or_else(|| index.committed_len());
+            // Exclusive upper bound: where the *first* event at or after `until`
+            // begins, or the end of what has been committed when there is none.
+            //
+            // `offset_at_or_after`, not `offset_of`: a branch's index holds only
+            // the seqs that branch recorded itself, so `until` is missing from it
+            // for every range ending at or before the fork point — the normal
+            // case on a fork. `offset_of` answered `None` there, and the fallback
+            // to the committed end read the branch's *whole* file: a range whose
+            // upper bound is below the branch's first event came back full of
+            // events at and past that bound, which is the one thing an addressed
+            // range must not do. Offsets follow seq order, so the next recorded
+            // address is also the bounded answer for a range that runs past the
+            // last event.
+            let end = index
+                .offset_at_or_after(until)
+                .unwrap_or_else(|| index.committed_len());
             (start, end)
         };
         if end <= start {

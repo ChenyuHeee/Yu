@@ -6,6 +6,8 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use common::*;
 use yu_journal::EventBody;
 
@@ -102,4 +104,57 @@ async fn a_range_read_never_reads_past_its_upper_bound() {
     // silence about it is about where it stopped, not about it being unparseable.
     let raw = std::fs::read_to_string(&path).unwrap();
     assert!(raw.contains("\"seq\":999"), "the planted record is on disk");
+}
+
+/// The bound is a bound on a branch too, where `until` names a seq this branch
+/// never wrote.
+///
+/// A branch's index holds only the seqs *it* recorded — everything at or below
+/// the fork point is read through the parent — so `until` is absent from it for
+/// any range ending before the branch's first own event. Looking the bound up
+/// with `offset_of` answered `None` there and fell back to the committed end of
+/// the branch's file, so the read came back with the branch's whole file: events
+/// at and past the exclusive bound, which is the read an addressed range exists
+/// not to be.
+#[tokio::test]
+async fn a_branchs_range_stops_at_a_bound_the_branch_does_not_hold() {
+    let dir = tempdir();
+    let parent = Arc::new(journal_in(dir.path(), "parent").await);
+    for i in 0..6 {
+        parent
+            .append(agent(), EventBody::Note { text: format!("p{i}") })
+            .await
+            .unwrap();
+    }
+
+    // The branch's own addresses start at its fork point: the marker at 4, then
+    // the three notes it records for itself.
+    let child = journal_fork(dir.path(), "child", parent.clone(), 4).await;
+    for i in 0..3 {
+        child
+            .append(agent(), EventBody::Note { text: format!("c{i}") })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        child
+            .events()
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<_>>(),
+        vec![4, 5, 6, 7],
+        "the branch holds none of the seqs below its fork point"
+    );
+
+    let ranged = child.read_range(0, 3).await.unwrap();
+    assert!(
+        ranged.iter().all(|e| e.seq < 3),
+        "a range must not return events at or past its exclusive bound: {ranged:?}"
+    );
+    assert!(
+        ranged.is_empty(),
+        "nothing in this branch sits below seq 3: {ranged:?}"
+    );
 }

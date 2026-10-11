@@ -278,50 +278,66 @@ impl EventBody {
     }
 }
 
-// `yu_observe::TokenUsage` is an accounting type and carries no `PartialEq`, so
-// equality is written out here instead of derived: two events are equal exactly
-// when every recorded fact is equal. Deriving on the rest would be wrong anyway
-// — a new field must force a decision here, not silently change what "same
-// event" means.
+// Equality is written out here instead of derived: two events are equal exactly
+// when every recorded fact is equal, and that claim deserves one place to be
+// made — a new field must force a decision here, not silently change what "same
+// event" means. (`usage` is compared by `TokenUsage`'s own `PartialEq`; it is an
+// accounting type whose fields are all recorded facts, so a field added there is
+// counted rather than missed.)
+//
+// The match is on `self` alone, and that is load-bearing rather than stylistic.
+// It used to be on `(self, other)` and to end in `_ => false`, and `Forked` —
+// added later — was given no arm, so it fell into that catch-all and
+// `Forked == Forked` was *false*. A wildcard cannot tell "these are two different
+// variants" from "nobody wrote an arm for this one": the first is the answer
+// "unequal", the second is a comparison that silently lost a case, and the arm
+// was there for the first. Matching one side exhaustively hands the second case
+// to the compiler — a new variant is a non-exhaustive match, and a new field is a
+// missing binding in the arm *and* in the `other` pattern inside it. Cross-variant
+// pairs are not an arm at all: they are the `other` pattern failing to match,
+// which is the only place "not equal" can be said without also swallowing the
+// same-variant case.
 impl PartialEq for EventBody {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                EventBody::SessionStarted {
-                    charter: c1,
-                    model: m1,
-                    quirks: b1,
-                },
+        match self {
+            EventBody::SessionStarted {
+                charter: c1,
+                model: m1,
+                quirks: b1,
+            } => matches!(
+                other,
                 EventBody::SessionStarted {
                     charter: c2,
                     model: m2,
                     quirks: b2,
-                },
-            ) => c1 == c2 && m1 == m2 && b1 == b2,
-            (EventBody::UserMessage { text: a }, EventBody::UserMessage { text: b }) => a == b,
-            (
-                EventBody::ModelRequest {
-                    model: m1,
-                    messages: n1,
-                    digest: d1,
-                    est_input_tokens: t1,
-                },
+                } if c1 == c2 && m1 == m2 && b1 == b2
+            ),
+            EventBody::UserMessage { text: a } => {
+                matches!(other, EventBody::UserMessage { text: b } if a == b)
+            }
+            EventBody::ModelRequest {
+                model: m1,
+                messages: n1,
+                digest: d1,
+                est_input_tokens: t1,
+            } => matches!(
+                other,
                 EventBody::ModelRequest {
                     model: m2,
                     messages: n2,
                     digest: d2,
                     est_input_tokens: t2,
-                },
-            ) => m1 == m2 && n1 == n2 && d1 == d2 && t1 == t2,
-            (
-                EventBody::ModelResponse {
-                    id: i1,
-                    stop_reason: s1,
-                    usage: u1,
-                    blocks: b1,
-                    thinking: t1,
-                    text_blob: x1,
-                },
+                } if m1 == m2 && n1 == n2 && d1 == d2 && t1 == t2
+            ),
+            EventBody::ModelResponse {
+                id: i1,
+                stop_reason: s1,
+                usage: u1,
+                blocks: b1,
+                thinking: t1,
+                text_blob: x1,
+            } => matches!(
+                other,
                 EventBody::ModelResponse {
                     id: i2,
                     stop_reason: s2,
@@ -329,39 +345,37 @@ impl PartialEq for EventBody {
                     blocks: b2,
                     thinking: t2,
                     text_blob: x2,
-                },
-            ) => {
-                i1 == i2
+                } if i1 == i2
                     && s1 == s2
-                    && same_usage(u1, u2)
+                    && u1 == u2
                     && b1 == b2
                     && t1 == t2
                     && x1 == x2
-            }
-            (
-                EventBody::ToolCall {
-                    tool_use_id: i1,
-                    name: n1,
-                    input: v1,
-                },
+            ),
+            EventBody::ToolCall {
+                tool_use_id: i1,
+                name: n1,
+                input: v1,
+            } => matches!(
+                other,
                 EventBody::ToolCall {
                     tool_use_id: i2,
                     name: n2,
                     input: v2,
-                },
-            ) => i1 == i2 && n1 == n2 && v1 == v2,
-            (
-                EventBody::ToolResult {
-                    tool_use_id: i1,
-                    name: n1,
-                    kind: k1,
-                    bytes: y1,
-                    reproducible: r1,
-                    addressable: a1,
-                    inline: l1,
-                    blob: b1,
-                    reduction: d1,
-                },
+                } if i1 == i2 && n1 == n2 && v1 == v2
+            ),
+            EventBody::ToolResult {
+                tool_use_id: i1,
+                name: n1,
+                kind: k1,
+                bytes: y1,
+                reproducible: r1,
+                addressable: a1,
+                inline: l1,
+                blob: b1,
+                reduction: d1,
+            } => matches!(
+                other,
                 EventBody::ToolResult {
                     tool_use_id: i2,
                     name: n2,
@@ -372,9 +386,7 @@ impl PartialEq for EventBody {
                     inline: l2,
                     blob: b2,
                     reduction: d2,
-                },
-            ) => {
-                i1 == i2
+                } if i1 == i2
                     && n1 == n2
                     && k1 == k2
                     && y1 == y2
@@ -383,42 +395,46 @@ impl PartialEq for EventBody {
                     && l1 == l2
                     && b1 == b2
                     && d1 == d2
-            }
-            (
-                EventBody::Injected {
-                    label: l1,
-                    blob: b1,
-                },
+            ),
+            EventBody::Injected {
+                label: l1,
+                blob: b1,
+            } => matches!(
+                other,
                 EventBody::Injected {
                     label: l2,
                     blob: b2,
-                },
-            ) => l1 == l2 && b1 == b2,
-            (EventBody::Note { text: a }, EventBody::Note { text: b }) => a == b,
-            (
-                EventBody::Effect {
-                    key: k1,
-                    description: d1,
-                    state: s1,
-                    tool_use_id: t1,
-                },
+                } if l1 == l2 && b1 == b2
+            ),
+            EventBody::Note { text: a } => {
+                matches!(other, EventBody::Note { text: b } if a == b)
+            }
+            EventBody::Forked {
+                parent: p1,
+                parent_at_seq: q1,
+            } => matches!(
+                other,
+                EventBody::Forked {
+                    parent: p2,
+                    parent_at_seq: q2,
+                } if p1 == p2 && q1 == q2
+            ),
+            EventBody::Effect {
+                key: k1,
+                description: d1,
+                state: s1,
+                tool_use_id: t1,
+            } => matches!(
+                other,
                 EventBody::Effect {
                     key: k2,
                     description: d2,
                     state: s2,
                     tool_use_id: t2,
-                },
-            ) => k1 == k2 && d1 == d2 && s1 == s2 && t1 == t2,
-            _ => false,
+                } if k1 == k2 && d1 == d2 && s1 == s2 && t1 == t2
+            ),
         }
     }
-}
-
-fn same_usage(a: &TokenUsage, b: &TokenUsage) -> bool {
-    a.input_tokens == b.input_tokens
-        && a.output_tokens == b.output_tokens
-        && a.cache_read_input_tokens == b.cache_read_input_tokens
-        && a.cache_creation_input_tokens == b.cache_creation_input_tokens
 }
 
 /// The two fields the index needs from a line.
@@ -447,11 +463,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn kind_matches_the_serialized_tag() {
-        // The tag is what shows up in the file; `kind()` is what observation
-        // counts. If they ever drift, the metrics lie.
-        let bodies = vec![
+    /// One body of every variant.
+    ///
+    /// The failure mode this list exists for — an arm missing from the
+    /// hand-written `PartialEq` — is invisible from any single case, so a test
+    /// that has to hold "for every variant" takes the list from here instead of
+    /// carrying its own, where the missing one would be missing too.
+    fn one_of_each() -> Vec<EventBody> {
+        vec![
             EventBody::SessionStarted {
                 charter: "c".into(),
                 model: "m".into(),
@@ -493,17 +512,80 @@ mod tests {
                 blob: "b".into(),
             },
             EventBody::Note { text: "n".into() },
+            EventBody::Forked {
+                parent: SessionId::new("parent"),
+                parent_at_seq: 3,
+            },
             EventBody::Effect {
                 key: "k".into(),
                 description: "d".into(),
                 state: EffectState::Intended,
                 tool_use_id: None,
             },
-        ];
-        for body in bodies {
+        ]
+    }
+
+    #[test]
+    fn kind_matches_the_serialized_tag() {
+        // The tag is what shows up in the file; `kind()` is what observation
+        // counts. If they ever drift, the metrics lie.
+        for body in one_of_each() {
             let value = serde_json::to_value(&body).unwrap();
-            assert_eq!(value["event"], json!(body.kind()));
+            assert_eq!(value["event"], json!(body.kind()), "{body:?}");
         }
+    }
+
+    /// No variant compares unequal to itself.
+    ///
+    /// This is the property a missing arm breaks, and the one the wildcard arm
+    /// hid: `Forked` had no arm, so it fell through to `_ => false` and a branch
+    /// did not equal itself. Checked over every variant rather than the one that
+    /// happened to be missing, so the next variant added is covered by the same
+    /// guard instead of needing its own.
+    #[test]
+    fn no_variant_compares_unequal_to_itself() {
+        for body in one_of_each() {
+            assert_eq!(body, body.clone(), "{body:?} is not equal to itself");
+        }
+    }
+
+    /// `Forked` compares the fields it records, and nothing else.
+    ///
+    /// Both recorded fields matter: the parent names the record being extended
+    /// and the seq is the point it was extended from, so a fork read back from
+    /// disk must compare equal to the one that was written, and two different
+    /// forks must not.
+    #[test]
+    fn a_fork_is_equal_to_itself_and_to_no_other_fork() {
+        let fork = EventBody::Forked {
+            parent: SessionId::new("parent"),
+            parent_at_seq: 3,
+        };
+        assert_eq!(fork, fork.clone());
+        assert_eq!(
+            fork,
+            EventBody::Forked {
+                parent: SessionId::new("parent"),
+                parent_at_seq: 3,
+            }
+        );
+        assert_ne!(
+            fork,
+            EventBody::Forked {
+                parent: SessionId::new("other"),
+                parent_at_seq: 3,
+            }
+        );
+        assert_ne!(
+            fork,
+            EventBody::Forked {
+                parent: SessionId::new("parent"),
+                parent_at_seq: 4,
+            }
+        );
+        // A different variant is still unequal — the answer the wildcard arm was
+        // supposed to give, kept while the same-variant cases stopped reaching it.
+        assert_ne!(fork, EventBody::Note { text: "n".into() });
     }
 
     #[test]
