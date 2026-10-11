@@ -265,12 +265,41 @@ total 8          exit=0
 |---|---|---|---|
 | 1 | 决策层上下文是决策形状的 | 原始材料占比 ≈ 0 | ✅ `raw material 0.0% of 23308 chars (raw 0 + reduced 6490 + calls 0 + definitions 4278)` |
 | 2 | 没有任何东西被静默丢弃 | 清单的完整性可验证 | ✅ 层自己用清单完成了一次判断:"Shape flags 2 files touched outside the declared 3 (policy.toml, run.log) — resolved as read-only: both listings show identical sizes and mtimes across the whole run, and the manifest contains only read_file results for them, no writes." |
-| 3 | 中途 `kill -9` | 恢复后继续,且**没有重复副作用** | ❌ **跑不了** —— 见下 |
-| 4 | 中途换代一次 | 换代后仍生效的约束一条不少 | ⚠️ **没被触发** —— `handover.json` 没写出 |
-| 5 | 事后可重建 | 能从记录里重建任意一个历史点 | ⚠️ **记录支持,但这次没有行使** —— 74 条事件、blob store、`delegated` 血缘都在 |
+| 3 | 中途 `kill -9` | 恢复后继续,且**没有重复副作用** | ✅ **第二次运行通过了** —— 见下 |
+| 4 | 中途换代一次 | 换代后仍生效的约束一条不少 | ⚠️ **仍未行使**(第二次运行没带 `--handover-out`) |
+| 5 | 事后可重建 | 能从记录里重建任意一个历史点 | ⚠️ **仍未行使** —— 但记录现在有 102 条事件、`round_started`/`delegated` 都在,`yu fork` 能定价并分叉 |
 | 6 | harness 开销 | ≤ 模型时间的 X% | ✅ 含执行者真跑的命令 3.27%,不含则 0.061%(X 定为 10%) |
 
-**条件 3 为什么跑不了 —— 这是一处真实的缺口,不是环境问题。** `yu decide` **没有 `--session`**。daemon 能续会话但**不跑 turn**(`Send` 只把消息记进记录并明说没有 turn 运行过),而 decide 跑 turn 却不能续。于是一次被 `kill -9` 打断的 `yu decide` **无法继续**。`--handover` 也救不了它:交接是在会话**结束时**写的,而被杀掉的会话什么都没写。**这条验收在设计这次运行的过程中才暴露出来** —— 想写编排脚本时才发现没有可用的续跑入口。
+### 第二次运行:条件 3 通过了,而且检查第一次真的开火了
+
+补上 `yu decide --session` 之后重跑。任务改成三步(append 一行到 `progress.log`、写 `greet.sh`、跑它),**等那条 append 的 effect 真的 `done` 之后**再 `kill -9`:
+
+```
+DONE: run `sh -c printf 'step-one done\n' >> progress.log; echo "rc=$?"; ls -l progress.log`
+SIGKILL sent (exit 137)
+--- progress.log: 14 bytes  (一行)
+```
+
+续跑:
+
+```
+--- continuing a session whose record already existed: seq continues at 36; L0 = 1 constraint(s)
+--- rounds already spent: 1; this continuation runs rounds 2..=4
+```
+
+**`progress.log` 续跑前 14 字节、续跑后 14 字节 —— 记录在案的副作用没有被重做。** 条件 3 的核心主张成立。执行者也认出了既存状态:*"All three requirements were already satisfied by the pre-existing state; I made no writes, and verified by real execution: `./greet.sh` printed exactly `hello from greet`"*。
+
+**而 harness 的自洽检查在真实运行里第一次开火:**
+
+```
+!! the executor landed on `delivered_and_verified`, but a command ran and failed: `echo "---progress.log---" …` exited 1
+```
+
+执行者落在 `delivered_and_verified`(断言"跑过的命令都成功"),而它有一条命令退出码 1。**这是 M3 那个机制第一次在真实运行里抓到东西** —— 不是"可见",是"可抓"。之前我只能用构造的误报证明它会响;现在它自己响了。
+
+其余读数:决策层 `raw material 0.0% of 24531 chars`;harness 开销 **2.29%**(不含执行者真跑的命令则 0.029%);记录 102 条事件,`session_seeded`、`round_started` 都在。
+
+### 第一次运行时,条件 3 为什么跑不了 —— 那是一处真实的缺口,不是环境问题。 `yu decide` **没有 `--session`**。daemon 能续会话但**不跑 turn**(`Send` 只把消息记进记录并明说没有 turn 运行过),而 decide 跑 turn 却不能续。于是一次被 `kill -9` 打断的 `yu decide` **无法继续**。`--handover` 也救不了它:交接是在会话**结束时**写的,而被杀掉的会话什么都没写。**这条验收在设计这次运行的过程中才暴露出来** —— 想写编排脚本时才发现没有可用的续跑入口。
 
 **条件 4 为什么没被触发。** 这次运行在第 5 轮撞到轮数上限(`stopped_early`),所以走的不是"决定达成"那条触发,而是阈值那条;视野增长没越过去,于是没有交接。它打印的原因是 *"the session stopped without deciding"* —— **措辞有歧义**:L1 里明明有 1 条决策,它想说的应该是"没有达成最终答复"。这条要改的是文案,不是逻辑,但歧义的后果是读的人会以为层什么都没决定。
 
