@@ -16,11 +16,15 @@
 //! rather than assumed (`SpanKind::Spawn`).
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use yu_journal::EventBody;
+use yu_observe::AgentId;
+
 use crate::agent::LoopError;
-use crate::delegate::{self, DelegateArgs, DelegateOutcome};
+use crate::delegate::{self, DelegateArgs, DelegateOutcome, Standing};
 
 /// The shapes DESIGN names, plus the degenerate one.
 ///
@@ -216,11 +220,17 @@ impl Derivation {
 /// Runs one delegation. Injected so the derivation logic is testable without a
 /// client and without spending anything.
 pub trait DelegateRunner {
-    fn run(
-        &self,
-        args: DelegateArgs,
-    ) -> impl std::future::Future<Output = Result<DelegateOutcome, LoopError>> + Send;
+    /// Boxed rather than `async fn`, and that is load-bearing rather than
+    /// stylistic: a derived agent runs the same loop that derived it, so the
+    /// future here is *recursive* — `run` eventually awaits a call to itself.
+    /// An `impl Future` whose type has to be inferred through that cycle has no
+    /// fixed point (the compiler reports it as an opaque-type cycle), so the
+    /// recursion is given a type by erasing it here.
+    fn run(&self, args: DelegateArgs) -> BoxFuture<'_, Result<DelegateOutcome, LoopError>>;
 }
+
+/// A future that may be awaited from anywhere, including from inside itself.
+pub type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
 /// Carry out a derivation, returning what each child reported.
 ///
@@ -261,15 +271,10 @@ pub async fn derive<R: DelegateRunner>(
                 // DESIGN: "验证者从原始记录出发,不从上一级报告出发" and "每个工作项
                 // 恰好被一个非作者验证一次". The verifier is therefore a fresh
                 // reader, not the author asked to check itself.
-                let args = DelegateArgs {
-                    outcomes: None,
-                    task: format!(
-                        "Verify this work item against the record. You did not write it. \
-                         Report only what the record actually shows: {item}"
-                    ),
-                    question: None,
-                    expected_files: None,
-                };
+                let args = DelegateArgs::new(format!(
+                    "Verify this work item against the record. You did not write it. \
+                     Report only what the record actually shows: {item}"
+                ));
                 outcomes.push(runner.run(args).await?);
             }
         }
@@ -278,25 +283,121 @@ pub async fn derive<R: DelegateRunner>(
 }
 
 /// The real runner: derives through the executor.
+///
+/// It is also the **injection point**. Everything a derived run is *given*
+/// rather than asked for — the conditions the parent is under, its depth, its
+/// address in the lineage, the set the whole call was launched with — is filled
+/// in here, by the harness, on the way past. That is why a delegating agent
+/// never has to remember to pass any of it: DESIGN's "约束靠注入,不靠记忆" applied
+/// to the one place where forgetting would be invisible, because a run with no
+/// constraints looks exactly like a run that has none.
 pub struct ExecutorRunner {
     pub client: std::sync::Arc<yu_wire::client::WireClient>,
     pub journal: std::sync::Arc<yu_journal::Journal>,
     pub tools: std::sync::Arc<yu_tools::ToolRegistry>,
     pub timeline: std::sync::Arc<yu_observe::Timeline>,
     pub cwd: std::path::PathBuf,
+    /// Who is deriving. The author of every edge this records, and of the
+    /// refusal when there is nothing to derive.
+    deriving: AgentId,
+    /// What the derived agents are given.
+    standing: Standing,
+    /// The address derived agents extend: this agent's own path.
+    prefix: String,
+    /// The depth the derived agents run at.
+    depth: u32,
+    /// The pre-registered set this call was launched with, if any.
+    outcomes: Option<crate::landing::PlannedOutcomes>,
+    /// How many agents this parent has derived, so far in its run.
+    next_index: AtomicU32,
+}
+
+impl ExecutorRunner {
+    pub fn new(
+        client: std::sync::Arc<yu_wire::client::WireClient>,
+        journal: std::sync::Arc<yu_journal::Journal>,
+        tools: std::sync::Arc<yu_tools::ToolRegistry>,
+        timeline: std::sync::Arc<yu_observe::Timeline>,
+        cwd: std::path::PathBuf,
+        deriving: AgentId,
+        standing: Standing,
+    ) -> Self {
+        Self {
+            client,
+            journal,
+            tools,
+            timeline,
+            cwd,
+            deriving,
+            standing,
+            prefix: String::new(),
+            depth: 1,
+            outcomes: None,
+            next_index: AtomicU32::new(0),
+        }
+    }
+
+    /// The depth the derived agents run at.
+    pub fn at(mut self, depth: u32) -> Self {
+        self.depth = depth;
+        self
+    }
+
+    /// The parent's own address, which its children extend.
+    pub fn under(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = prefix.into();
+        self
+    }
+
+    /// The set the whole call was launched with.
+    pub fn landing_in(mut self, outcomes: Option<crate::landing::PlannedOutcomes>) -> Self {
+        self.outcomes = outcomes;
+        self
+    }
+
+    /// Where this parent's numbering of derived agents starts.
+    ///
+    /// A parent that derives more than once keeps counting: two delegations that
+    /// both numbered from one would give two different runs one name.
+    pub fn starting_at(mut self, index: u32) -> Self {
+        self.next_index = AtomicU32::new(index);
+        self
+    }
 }
 
 impl DelegateRunner for ExecutorRunner {
-    async fn run(&self, args: DelegateArgs) -> Result<DelegateOutcome, LoopError> {
-        delegate::run_delegation(
-            &args,
-            self.client.clone(),
-            self.journal.clone(),
-            self.tools.clone(),
-            self.timeline.clone(),
-            self.cwd.clone(),
-        )
-        .await
+    fn run(&self, mut args: DelegateArgs) -> BoxFuture<'_, Result<DelegateOutcome, LoopError>> {
+        Box::pin(async move {
+            let index = self.next_index.fetch_add(1, Ordering::SeqCst) + 1;
+            args.path = delegate::child_path(&self.prefix, index);
+            args.depth = self.depth;
+            args.standing = self.standing.clone();
+            args.outcomes = self.outcomes.clone();
+
+            // The edge, recorded before the child starts. A record that held only
+            // the child's own events would say that work happened and not who asked
+            // for it, and the tree could not be drawn from it.
+            self.journal
+                .append(
+                    self.deriving.clone(),
+                    EventBody::Delegated {
+                        child: args.agent(),
+                        depth: args.depth,
+                        task: args.task.clone(),
+                    },
+                )
+                .await?;
+
+            delegate::run_delegation(
+                &args,
+                self.client.clone(),
+                self.journal.clone(),
+                self.tools.clone(),
+                self.timeline.clone(),
+                self.cwd.clone(),
+            )
+            .await
+        })
     }
 }
 
@@ -463,9 +564,11 @@ mod tests {
     struct Counting(std::sync::Mutex<Vec<String>>);
 
     impl DelegateRunner for Counting {
-        async fn run(&self, args: DelegateArgs) -> Result<DelegateOutcome, LoopError> {
-            self.0.lock().unwrap().push(args.task.clone());
-            Ok(crate::delegate::tests_support::outcome_for(&args.task))
+        fn run(&self, args: DelegateArgs) -> BoxFuture<'_, Result<DelegateOutcome, LoopError>> {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(args.task.clone());
+                Ok(crate::delegate::tests_support::outcome_for(&args.task))
+            })
         }
     }
 

@@ -158,10 +158,20 @@
 
 **验收**
 
-- [ ] **把 constraints 从 charter 里删掉,执行者的行为会变** —— 证明它真的被注入,而不是碰巧没违反
-- [ ] 改一条拓扑声明,运行行为跟着变(**不是只有渲染变**)
-- [ ] 追踪一次运行,能画出一棵**深度 ≥ 3** 的树
-- [ ] 一个子 agent 能在自己的运行里再派 agent,且血缘记录完整
+- [x] **把 constraints 从 charter 里删掉,执行者的行为会变** —— 证明它真的被注入,而不是碰巧没违反
+      —— 守:`the_charters_constraints_are_injected_into_the_executors_system_block`。**这条是机制证明,不是行为保证**:它证明约束进了执行者的 system block,且**不在** per-delegation 的 task 文本里;把 charter 里的 constraints 删掉,请求里就不再有它 —— 否则"它没违反"和"它从没被告知"看起来一模一样。真实模型会不会**遵守**约束不是确定性测试能回答的,这里不声称。回退注入 → 失败于"the executor was not given the constraint the charter states"
+- [x] 改一条拓扑声明,运行行为跟着变(**不是只有渲染变**)
+      —— 守:`the_declared_width_decides_how_many_executors_run`:`fan_out width = 2` 与 `width = 4` 是同一次委托的 2 个与 4 个执行者,计数取自 scripted endpoint 上**真实发出的请求**,四个孩子的报告也全部回到决策层。回退"读声明"这一步(`run_derivation` 用默认 spec)→ `left: 1, right: 2`
+- [x] 追踪一次运行,能画出一棵**深度 ≥ 3** 的树
+      —— 守:`one_run_leaves_a_tree_three_delegations_deep`:从 L2 的 `delegated` 事件画树,深度 3、每个节点恰好一个父亲;`yu decide` 现在也把树打印出来,读的是记录而不是内存。回退"执行者可以派生" → "the record draws a tree 1 level(s) deep"
+- [x] 一个子 agent 能在自己的运行里再派 agent,且血缘记录完整
+      —— 同一条守里 `executor#1` 既是孩子又是父亲。上限是 `MAX_DELEGATION_DEPTH = 3`(决策层 → 执行者 → 执行者 → 执行者);守:`the_depth_ceiling_refuses_a_fourth_level_rather_than_running_it` —— 到了上限的执行者**不被提供** `delegate`,硬要调用会拿到一句说明自己撞了什么墙的拒绝。回退上限 → "a fourth level ran despite the ceiling"
+
+**M4 期间撞出来的一件事(不在验收里,但必须写下来)**
+
+- **`delegate` 的 schema 被写了两遍,到达请求的偏偏是错的那一份。** 计算出来的那份带着策略声明的 set ids,手写的那份没有 —— 而发出去的是手写的:于是 `required` 里有 `outcomes`,schema 里却没有它,决策层看不到有哪些集合可选,**唯一能满足 schema 的做法恰好是它唯一被禁止做的事**(发明一个集合)。守:`the_schema_carries_the_set_ids_and_declares_every_field_it_requires`
+
+**M4 的数字**:490 passed / 0 failed / 0 warnings。**没有跑真实模型**(本机没有可用凭据),验收证据全部来自 scripted endpoint;上面每条"回退即失败"都是真的跑过的回退。
 
 ---
 

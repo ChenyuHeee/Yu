@@ -27,13 +27,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use yu_journal::{EventBody, Journal};
-use yu_observe::{ContextComposition, ShapeSignal, SpanKind, Timeline, TokenUsage};
+use yu_observe::{AgentId, ContextComposition, ShapeSignal, SpanKind, Timeline, TokenUsage};
 use yu_tools::native::parse_exit_code;
 use yu_wire::client::WireClient;
-use yu_wire::types::{CustomTool, ToolDefinition};
+use yu_wire::types::{CustomTool, SystemBlock, ToolDefinition};
 
-use crate::agent::{Agent, AgentConfig, LoopOutcome};
+use crate::agent::{Agent, AgentConfig, Deriving, LoopOutcome, Spawn};
 use crate::render::{Evidence, NotLoadedEntry};
+use crate::topology::{self, DelegateRunner, Derivation, ExecutorRunner, TopologySpec};
 
 /// How much of a delegation's report the decision layer will accept.
 ///
@@ -58,7 +59,41 @@ pub const REPORT_BUDGET_CHARS: usize = 2500;
 /// outcome would discard exactly the part that made the result worth reporting.
 pub const WIDE_REPORT_BUDGET_CHARS: usize = 8000;
 
-/// What the decision layer asks for.
+/// The name of the tool a delegating agent calls.
+///
+/// One constant because three things have to agree on it: the surface the agent
+/// is offered, the dispatch that answers it, and the record.
+pub const DELEGATE: &str = "delegate";
+
+/// How deep derivations may go.
+///
+/// The decision layer's own delegations are depth 1, so this allows
+/// decision → executor → executor → executor and refuses a fifth level. It is
+/// the smallest bound that makes a depth-3 tree reachable, and it is a bound at
+/// all because nothing else stops a tree from growing: every level is a fresh
+/// model loop, the step budget is per-run rather than per-tree, and A deriving B
+/// deriving C … has no ceiling on what a run can spend. DESIGN's enabling
+/// condition is that derivation be *cheap*, not that it be free — and where it
+/// is not free, a number has to be chosen rather than discovered.
+pub const MAX_DELEGATION_DEPTH: u32 = 3;
+
+/// What an agent is *given* about the run it is part of.
+///
+/// DESIGN's derived principle 3: "约束靠注入,不靠记忆 —— 每一层每一轮被**给予**约束".
+/// A constraint is a standing condition of the run, not a property of one
+/// delegation, which is why it lives here and travels with the run rather than
+/// being restated by whoever remembers it. The topology is here for the same
+/// reason: it is a declaration about the work, and every level that derives work
+/// has to be under it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Standing {
+    /// Verbatim from L0's charter.
+    pub constraints: Vec<String>,
+    /// The declared shape of the work, when one was declared.
+    pub topology: Option<TopologySpec>,
+}
+
+/// What a delegating agent asks for.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateArgs {
     /// What to accomplish. The executor starts fresh and knows only this.
@@ -68,16 +103,14 @@ pub struct DelegateArgs {
     /// and expensive failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<String>,
-    /// The set of landing slots this call was launched with.
+    /// The work items a deriving topology fans out over or partitions.
     ///
-    /// **Not read from the model.** The model names a set *id*; the layer
-    /// resolves it against the policy and fills this in. `skip` is what keeps
-    /// the two apart: without it, a model that could write `slots` could write
-    /// its own set, and the harness would then be checking a landing against a
-    /// claim the executor's caller invented — which is the failure the policy
-    /// exists to prevent.
-    #[serde(skip)]
-    pub outcomes: Option<crate::landing::PlannedOutcomes>,
+    /// Written by the delegating model, not by the harness: it names *places to
+    /// cover*, and the topology declaration decides what is done with them —
+    /// which is the whole of "拓扑是可声明的策略". Each item becomes one derived
+    /// agent's entire task, so an item has to stand on its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<String>,
     /// Files the work is expected to touch.
     ///
     /// DESIGN lists "实际触碰文件 vs 预期" as a shape signal, and this is where
@@ -85,22 +118,87 @@ pub struct DelegateArgs {
     /// is what makes scope drift detectable rather than merely regrettable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_files: Option<Vec<String>>,
+    // ---- everything below is the harness's, and `skip` is what keeps it so.
+    //
+    // A field the model could write is a field the model controls, and each of
+    // these is a fact only the harness holds: the set this call was launched
+    // with, the conditions the run is under, how deep it sits, and where it
+    // belongs in the lineage. A model that could write them could write its own
+    // contract, its own constraints, and its own ancestry.
+    /// The set of landing slots this call was launched with.
+    ///
+    /// **Not read from the model.** The model names a set *id*; the layer
+    /// resolves it against the policy and fills this in. Without `skip`, a model
+    /// that could write `slots` could write its own set, and the harness would
+    /// then be checking a landing against a claim the executor's caller invented
+    /// — which is the failure the policy exists to prevent.
+    #[serde(skip)]
+    pub outcomes: Option<crate::landing::PlannedOutcomes>,
+    /// Injected, never remembered: L0's constraints and the declared topology.
+    #[serde(skip)]
+    pub standing: Standing,
+    /// Which delegation level the run this creates sits at. See
+    /// [`MAX_DELEGATION_DEPTH`].
+    #[serde(skip)]
+    pub depth: u32,
+    /// The derived agent's address in the lineage tree — `"1"`, `"1.2"`.
+    ///
+    /// Assigned by whoever derives it, and the only thing that makes two nodes
+    /// distinguishable in the record: without it every executor is called
+    /// `executor`, and a parent recovering its own evidence from the journal
+    /// would read its children's as its own.
+    #[serde(skip)]
+    pub path: String,
 }
 
 impl DelegateArgs {
     pub fn new(task: impl Into<String>) -> Self {
         Self {
-            outcomes: None,
             task: task.into(),
             question: None,
+            items: Vec::new(),
             expected_files: None,
+            outcomes: None,
+            standing: Standing::default(),
+            depth: 0,
+            path: String::new(),
         }
+    }
+
+    /// The identity this delegation runs under.
+    ///
+    /// A `run_delegation` called without a path — a test driving one run, or a
+    /// caller with no lineage — is named `executor`, which is what every
+    /// executor was called before derivation existed.
+    pub fn agent(&self) -> AgentId {
+        if self.path.is_empty() {
+            AgentId::new("executor")
+        } else {
+            AgentId::new(format!("executor#{}", self.path))
+        }
+    }
+}
+
+/// Where a derived agent sits, given its parent's path and its ordinal among
+/// that parent's derived agents.
+pub(crate) fn child_path(parent: &str, index: u32) -> String {
+    if parent.is_empty() {
+        index.to_string()
+    } else {
+        format!("{parent}.{index}")
     }
 }
 
 /// What comes back: a view, not a transcript.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DelegateOutcome {
+    /// The task this agent was given, as it was given.
+    ///
+    /// Carried so a parent reducing several derived agents can attach each
+    /// report to the piece of work it answers — a report with no subject is not
+    /// reducible, and the parent did not write these tasks.
+    #[serde(default)]
+    pub task: String,
     /// The executor's final reply.
     pub report: String,
     /// Commands that ran, with their exit codes where the run captured one.
@@ -280,7 +378,17 @@ pub async fn outcome_from_run(
     declared_files: Option<&[String]>,
     planned: Option<&crate::landing::PlannedOutcomes>,
 ) -> Result<DelegateOutcome, yu_journal::JournalError> {
-    let events = journal.events().await?;
+    // **Scoped to this run.** The record holds a whole tree of runs, and
+    // everything below is recovered from it by *this* agent's name. Reading the
+    // journal unscoped was correct while only one executor could exist; with
+    // derivation it would hand a parent its children's evidence, its children's
+    // landings, and its children's omissions as its own — and the harness's
+    // landing check would then confirm a claim the parent never made.
+    let all = journal.events().await?;
+    let events: Vec<yu_journal::Event> = all
+        .into_iter()
+        .filter(|event| event.agent == run.agent)
+        .collect();
     // The executor's own classification of its result, recovered from the record
     // rather than from the loop's memory — the same way `exec` evidence is, and
     // for the same reason: the record is the thing that survives the process.
@@ -523,6 +631,9 @@ pub async fn outcome_from_run(
     }
 
     Ok(DelegateOutcome {
+        // Filled by the caller, which is the only place that knows what was
+        // asked: this function is handed a finished run, not a delegation.
+        task: String::new(),
         report: run.text.clone(),
         landing,
         contradiction,
@@ -649,6 +760,14 @@ pub fn delegate_tool(sets: &crate::outcomes::OutcomeSets) -> ToolDefinition {
             "type": "string",
             "description": "What you need to know, if that differs from the task."
         },
+        "items": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "The places to cover, when the declared topology of the work fans \
+                            out or partitions. Each item becomes one executor's whole task, \
+                            so write each one so it stands alone. How many of them run is \
+                            the topology's decision, not yours."
+        },
         "expected_files": {
             "type": "array",
             "items": { "type": "string" },
@@ -666,8 +785,13 @@ pub fn delegate_tool(sets: &crate::outcomes::OutcomeSets) -> ToolDefinition {
             .remove("outcomes");
     }
 
+    // The computed schema, not a second copy of it. The copy that used to be
+    // written out here had drifted: it declared no `outcomes` property while
+    // `required` named one, so the layer was told to pass a set without being
+    // told which ids exist — leaving inventing one as the only thing it could
+    // do, which is exactly what the policy's sets exist to prevent.
     ToolDefinition::Custom(CustomTool::new(
-        "delegate",
+        DELEGATE,
         "Send a fresh executor to do work, or to answer a question about work already \
          done. The executor starts with no memory of previous delegations, so state \
          everything it needs in `task`. It reports back a summary, its evidence, and a \
@@ -675,25 +799,100 @@ pub fn delegate_tool(sets: &crate::outcomes::OutcomeSets) -> ToolDefinition {
          a question rather than expecting to inspect the work.",
         json!({
             "type": "object",
-            "properties": {
-                "task": {
-                    "type": "string",
-                    "description": "What to accomplish. The executor knows only this."
-                },
-                "question": {
-                    "type": "string",
-                    "description": "What you need to know, if that differs from the task."
-                },
-                "expected_files": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Files you expect this work to touch. Declaring them is what makes scope drift detectable."
-                }
-            },
+            "properties": properties,
             "required": required,
             "additionalProperties": false
         }),
     ))
+}
+
+/// Make a delegation, under the declared shape of the work.
+///
+/// This is the production entry point: what a delegating agent calls. The shape
+/// is read from the conditions the run is under — `Charter::topology` reached
+/// this through [`Standing`] — and it decides *how many* agents the delegation
+/// becomes and *what each is asked*, not merely what a view says about them.
+/// DESIGN: "拓扑是可声明的策略,不是硬编码结构", and a declaration nothing acts
+/// on is a comment.
+///
+/// A shape that derives nothing (`single`, `peer`, or any shape with no items to
+/// work over) runs the task as one executor, which is what a delegation was
+/// before this existed.
+pub async fn run_derivation(
+    args: &DelegateArgs,
+    runner: &ExecutorRunner,
+) -> Result<Vec<DelegateOutcome>, crate::agent::LoopError> {
+    let declared = args.standing.topology.clone().unwrap_or_default();
+    match declared.plan(&args.task, &args.items) {
+        // Nothing to derive. The task runs where it was asked, as one child.
+        Derivation::Direct => Ok(vec![runner.run(args.clone()).await?]),
+        shape => topology::derive(runner, &shape).await,
+    }
+}
+
+/// What a delegating agent sees for a delegation that derived more than one
+/// agent.
+///
+/// One child renders exactly as it always did — a delegation is a delegation,
+/// and the header would be noise on the common case. More than one is a shape
+/// the reader has to be told about: N reports arriving unlabelled would read as
+/// one report that contradicts itself.
+pub fn render_derivation(outcomes: &[DelegateOutcome]) -> String {
+    match outcomes {
+        [] => String::new(),
+        [only] => only.render(),
+        many => {
+            // Each report is labelled with what that agent was asked, because a
+            // parent reducing several reports cannot use one it cannot attach to
+            // a piece of the work.
+            let mut out = format!(
+                "DELEGATION DERIVED {} AGENTS — one report each, in the order they were \
+                 derived.\n",
+                many.len()
+            );
+            for (index, outcome) in many.iter().enumerate() {
+                out.push_str(&format!(
+                    "\n--- derived agent {} of {}: {} ---\n{}",
+                    index + 1,
+                    many.len(),
+                    outcome.task,
+                    outcome.render()
+                ));
+            }
+            out
+        }
+    }
+}
+
+/// The edges a record contains: who derived whom.
+///
+/// Reads them out of the typed event rather than inferring them, so "血缘记录完整"
+/// is checkable — a tree drawn from this has every node the run actually ran and
+/// no node it did not.
+pub fn spawn_edges(events: &[yu_journal::Event]) -> Vec<SpawnEdge> {
+    events
+        .iter()
+        .filter_map(|event| match &event.body {
+            EventBody::Delegated { child, depth, task } => Some(SpawnEdge {
+                parent: event.agent.clone(),
+                child: child.clone(),
+                depth: *depth,
+                task: task.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// One delegation, as recorded: the deriving agent, the derived agent, and what
+/// the derived agent was asked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpawnEdge {
+    /// The agent that did the deriving — the event's own author.
+    pub parent: AgentId,
+    pub child: AgentId,
+    pub depth: u32,
+    pub task: String,
 }
 
 /// Run one delegation.
@@ -715,10 +914,17 @@ pub async fn run_delegation(
     // The executor is told the budget and the reason for it. A length limit
     // handed over as an arbitrary rule gets ignored; one that says where the
     // text is going explains itself.
+    //
+    // "Whoever asked for this" rather than "the decision layer", because at
+    // depth two and below the reader is a parent executor that has to reduce the
+    // report — and a reason that names the wrong reader is a reason that stops
+    // being true exactly where the tree gets deep.
     let task = format!(
-        "{task}\n\n---\nYour final reply goes straight into the decision layer's context, which \
-         is the scarcest resource in this system. Keep it under {REPORT_BUDGET_CHARS} characters. \
-         State the outcome and the evidence for it; leave out the narrative of how you got there."
+        "{task}\n\n---\nYour final reply goes straight into the context of whoever asked for \
+         this work — an agent that has to reduce it, and behind it the decision layer, whose \
+         context is the scarcest resource in this system. Keep it under \
+         {REPORT_BUDGET_CHARS} characters. State the outcome and the evidence for it; leave out \
+         the narrative of how you got there."
     );
 
     // Last, so it is the final thing read before the executor starts: the
@@ -748,15 +954,43 @@ pub async fn run_delegation(
     // *task* names them in prose because a schema `enum` says what is allowed and
     // not what each slot means, and an executor choosing between `compile_error`
     // and `test_failure` needs the difference stated rather than inferred.
-    let mut config =
-        AgentConfig::new(yu_observe::AgentId::new("executor"), client.default_model())
-            .max_steps(16);
+    let mut config = AgentConfig::new(args.agent(), client.default_model()).max_steps(16);
+    // **The constraints are injected here, and they go in the system block.**
+    //
+    // DESIGN's derived principle 3: "约束靠注入,不靠记忆" — the execution layer is
+    // *given* its constraints and does not remember them. Leaving them to the
+    // decision layer to restate per delegation is the failure this prevents: a
+    // standing condition carried in the per-delegation task text is dropped on
+    // the delegation where nobody restated it, and nothing in the record shows
+    // the loss.
+    //
+    // A system block rather than the task because the two are different kinds of
+    // thing: a task is per-delegation and a constraint is a standing condition.
+    // It is also the only version that is byte-stable across delegations, which
+    // is what makes it cacheable at the front of the prefix.
+    if let Some(block) = constraints_block(&args.standing.constraints) {
+        config = config.standing(block);
+    }
     if let Some(planned) = &args.outcomes {
         config = config.extra_tool(crate::landing::land_tool(
             &planned.names(),
             planned.description.as_deref(),
         ));
     }
+    // Whether this run may derive, decided here rather than at the moment a call
+    // arrives: an agent that cannot derive is not offered `delegate`, and a call
+    // to the name anyway is answered with the reason. The ceiling is on the
+    // child's depth, so a run at the ceiling simply has nowhere to go.
+    config = config.deriving(if args.depth < MAX_DELEGATION_DEPTH {
+        Deriving::Allowed(Spawn {
+            standing: args.standing.clone(),
+            outcomes: args.outcomes.clone(),
+            path: args.path.clone(),
+            depth: args.depth,
+        })
+    } else {
+        Deriving::AtDepthCeiling
+    });
     // DESIGN lists `spawn` among the spans, and topology is meant to be chosen at
     // run time on the strength of derivation being cheap. Neither claim is
     // checkable while the span is never emitted: there was no way to see that a
@@ -772,14 +1006,73 @@ pub async fn run_delegation(
         .finish();
     tracing::debug!(elapsed_ms = spawned.elapsed_ms(), "spawn");
     let run = run?;
-    outcome_from_run(
+    let mut outcome = outcome_from_run(
         &run,
         &journal,
         args.expected_files.as_deref(),
         args.outcomes.as_ref(),
     )
     .await
-    .map_err(crate::agent::LoopError::Journal)
+    .map_err(crate::agent::LoopError::Journal)?;
+    outcome.task = args.task.clone();
+    Ok(outcome)
+}
+
+/// The executor's system block for the conditions it is working under.
+///
+/// `None` when nothing was declared, because an empty heading is noise the model
+/// would have to read past on every single run — and "no constraints were
+/// declared" and "there are no constraints" are different facts that a blank
+/// block would merge.
+fn constraints_block(constraints: &[String]) -> Option<SystemBlock> {
+    if constraints.is_empty() {
+        return None;
+    }
+    let mut out = String::from(
+        "# Constraints\n\nStanding conditions of this run, given to you rather than left for you to \
+         remember. They hold for everything you do here and they are not yours to trade against \
+         the task:\n",
+    );
+    for constraint in constraints {
+        out.push_str(&format!("- {constraint}\n"));
+    }
+    Some(SystemBlock::text(out))
+}
+
+/// The `delegate` tool as an agent that may derive sees it.
+///
+/// A smaller surface than the decision layer's, and deliberately: no outcome
+/// sets (only the decision layer chooses those, and it cannot be a choice the
+/// executor makes for itself), no `question` and no `expected_files` — an
+/// executor delegating is splitting work, not specifying a contract.
+pub fn executor_delegate_tool() -> ToolDefinition {
+    ToolDefinition::Custom(CustomTool::new(
+        DELEGATE,
+        "Derive a fresh executor for part of this work. It starts with no memory of anything \
+         you have done, so the task you give it has to stand on its own. What comes back is a \
+         report and its evidence, not a transcript. How the derived runs are shaped is not \
+         yours to choose — the declared topology of the work decides that, and `items` are the \
+         pieces it is applied to. Use this when the work genuinely splits; a task you can \
+         finish yourself is cheaper done than derived.",
+        json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "What the derived agent is to accomplish. It knows only this."
+                },
+                "items": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "The work items to derive over, when the declared topology \
+                                    fans out or partitions. Each item becomes one derived \
+                                    agent's whole task, so write each one so it stands alone."
+                }
+            },
+            "required": ["task"],
+            "additionalProperties": false
+        }),
+    ))
 }
 
 /// Fixtures for tests that exercise what gets derived rather than what comes
@@ -790,6 +1083,7 @@ pub(crate) mod tests_support {
 
     pub fn outcome_for(task: &str) -> DelegateOutcome {
         DelegateOutcome {
+            task: task.to_owned(),
             landing: None,
             contradiction: None,
             report: format!("did: {task}"),
@@ -825,6 +1119,60 @@ mod tests {
         assert!(desc.contains("never its raw output"), "{desc}");
         assert!(desc.contains("no memory of previous delegations"), "{desc}");
         assert_eq!(tool.input_schema["required"], json!(["task"]));
+    }
+
+    /// **A required field that is not declared is a field nobody can fill.**
+    ///
+    /// The schema used to be written twice: once computed — with the policy's set
+    /// ids in it — and once by hand, without them. The hand-written one was the
+    /// one that reached the request, so `outcomes` was *required* while the
+    /// schema declared nothing about it: the layer could not see which sets
+    /// exist, and the only way to satisfy the schema was to invent a set, which
+    /// is the single thing DESIGN says this layer must not do. Two answers to
+    /// one question, and the wrong one shipped.
+    #[test]
+    fn the_schema_carries_the_set_ids_and_declares_every_field_it_requires() {
+        use crate::outcomes::{Expects, OutcomeSet, OutcomeSets, Slot};
+
+        let sets = OutcomeSets::from_sets(vec![OutcomeSet {
+            id: "build".to_owned(),
+            description: Some("A build was attempted.".to_owned()),
+            slots: vec![Slot {
+                name: "pass".to_owned(),
+                expects: Expects::Succeeded,
+            }],
+        }]);
+        let ToolDefinition::Custom(tool) = delegate_tool(&sets) else {
+            panic!("delegate must be a client-defined tool")
+        };
+        let properties = tool.input_schema["properties"]
+            .as_object()
+            .expect("an object schema");
+        let required: Vec<&str> = tool.input_schema["required"]
+            .as_array()
+            .expect("required")
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for name in &required {
+            assert!(
+                properties.contains_key(*name),
+                "`{name}` is required but not declared, so the model is asked for a \
+                 field the schema says nothing about: {}",
+                tool.input_schema
+            );
+        }
+        assert_eq!(
+            tool.input_schema["properties"]["outcomes"]["enum"],
+            json!(["build"]),
+            "the layer selects a set rather than inventing one, which it can only do \
+             if the ids reach it: {}",
+            tool.input_schema
+        );
+        assert!(
+            properties.contains_key("items"),
+            "the items a declared topology derives over are part of the surface too"
+        );
     }
 
     #[test]
@@ -880,6 +1228,7 @@ mod tests {
     #[test]
     fn a_report_with_no_evidence_says_so_explicitly() {
         let outcome = DelegateOutcome {
+            task: "the task that was given".to_owned(),
             landing: None,
             contradiction: None,
             report: "I refactored the parser and it is much cleaner now.".into(),
@@ -905,6 +1254,7 @@ mod tests {
     #[test]
     fn an_incomplete_run_is_not_reported_as_complete() {
         let outcome = DelegateOutcome {
+            task: "the task that was given".to_owned(),
             landing: None,
             contradiction: None,
             report: "gave up".into(),
@@ -927,6 +1277,7 @@ mod tests {
     #[test]
     fn evidence_shows_the_command_and_its_exit_code() {
         let outcome = DelegateOutcome {
+            task: "the task that was given".to_owned(),
             landing: None,
             contradiction: None,
             report: "tests pass".into(),
@@ -948,6 +1299,7 @@ mod tests {
 
     fn outcome_with_report(report: String, address: Option<&str>) -> DelegateOutcome {
         DelegateOutcome {
+            task: "the task that was given".to_owned(),
             landing: None,
             contradiction: None,
             report,
@@ -1046,6 +1398,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let outcome = DelegateOutcome {
+            task: "the task that was given".to_owned(),
             landing: None,
             contradiction: None,
             report: "done".into(),
@@ -1114,6 +1467,95 @@ mod tests {
         assert!(
             !rendered.contains("exit unknown"),
             "the evidence block must conduct: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A turn that hands work to a derived agent.
+    fn delegate_reply(task: &str) -> String {
+        serde_json::json!({
+            "id": "msg-delegate",
+            "model": "fake-model",
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "splitting the work", "signature": "sig"},
+                {"type": "tool_use", "id": "call_00_delegate", "name": DELEGATE,
+                 "input": {"task": task}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })
+        .to_string()
+    }
+
+    /// **A run's evidence is its own.**
+    ///
+    /// The record holds every run in the tree. `outcome_from_run` recovers
+    /// evidence from it — and once an executor can derive, an unscoped read
+    /// hands the parent its child's commands, its child's exit codes and its
+    /// child's landing as its own. The decision layer would then be shown a
+    /// contradiction between a claim this run made and a command this run never
+    /// ran: a harness manufacturing evidence against the wrong agent.
+    #[tokio::test]
+    async fn a_parents_evidence_and_landing_are_not_its_childrens() {
+        use crate::agent::test_support::{FakeEndpoint, endless_tool_use, final_reply};
+        use yu_journal::SessionId;
+
+        let fake = FakeEndpoint::scripted(vec![
+            // The parent runs one command of its own...
+            endless_tool_use("printf 'parent'; exit 0"),
+            // ...then hands the rest to a derived agent, which runs another.
+            delegate_reply("run the child's command"),
+            endless_tool_use("printf 'child'; exit 3"),
+            land_reply("compile_error", "the child's build failed"),
+            final_reply("the child is done"),
+            final_reply("the parent is done"),
+        ]);
+        let dir = scratch_dir("delegate-scoping");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let tools = Arc::new(yu_tools::ToolRegistry::native(&dir));
+        let mut args = DelegateArgs::new("do the work");
+        args.outcomes = Some(planned(&["pass", "compile_error"]));
+        // Where a parent's own delegation sits: able to derive.
+        args.depth = 1;
+
+        let outcome = run_delegation(
+            &args,
+            fake.client(),
+            journal.clone(),
+            tools,
+            Timeline::new(),
+            dir.clone(),
+        )
+        .await
+        .expect("the scripted run finishes");
+
+        assert_eq!(
+            outcome.evidence.len(),
+            1,
+            "the child's command is not this run's evidence: {:?}",
+            outcome
+                .evidence
+                .iter()
+                .map(|e| (&e.label, e.exit_code))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            outcome.evidence[0].exit_code,
+            Some(0),
+            "and the one block it does carry is the command it actually ran"
+        );
+        let landing = outcome.landing.as_ref().expect("a set was pre-registered");
+        assert_eq!(
+            landing.slot,
+            crate::landing::OTHER,
+            "the parent never classified its result, so its landing is the absence of \
+             one — not the landing its child made"
+        );
+        assert!(
+            landing.why.contains("did not classify"),
+            "and the reason names the absence: {}",
+            landing.why
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

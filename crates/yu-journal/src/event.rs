@@ -206,6 +206,30 @@ pub enum EventBody {
         parent_at_seq: u64,
     },
 
+    /// One agent derived another, and this is the edge.
+    ///
+    /// The **parent is the recording agent** — the event's own envelope `agent`
+    /// — so a reader draws the tree from edges rather than inferring it from
+    /// timestamps and task text, which is what an untyped `Note` would have
+    /// forced. DESIGN's lineage requirement ("血缘完整") is about work: who asked
+    /// whom to do what.
+    ///
+    /// Not a [`EventBody::Forked`], deliberately. A fork branches a *record* at
+    /// a point in its own history so a replay can diverge, and DESIGN makes its
+    /// cost explicit ("从分叉点起缓存前缀不再匹配"). A delegation branches *work*:
+    /// the child's events continue this record, and nothing about the cache is
+    /// owed to it. Keeping the two apart is what stops every spawn from
+    /// implying a cache invalidation it does not cause.
+    Delegated {
+        /// The agent that will run the derived task.
+        child: AgentId,
+        /// Which delegation level the child runs at. 1 is the decision layer's
+        /// own delegation; the ceiling is `MAX_DELEGATION_DEPTH` in `yu-core`.
+        depth: u32,
+        /// The task the child was given, as it was given.
+        task: String,
+    },
+
     /// A side effect, recorded before it happens ("先记后做").
     ///
     /// Carries its **state**, because an event's existence alone cannot say
@@ -241,6 +265,7 @@ impl EventBody {
             EventBody::Note { .. } => "note",
             EventBody::Effect { .. } => "effect",
             EventBody::Forked { .. } => "forked",
+            EventBody::Delegated { .. } => "delegated",
         }
     }
 
@@ -432,6 +457,18 @@ impl PartialEq for EventBody {
                     state: s2,
                     tool_use_id: t2,
                 } if k1 == k2 && d1 == d2 && s1 == s2 && t1 == t2
+            ),
+            EventBody::Delegated {
+                child: c1,
+                depth: p1,
+                task: t1,
+            } => matches!(
+                other,
+                EventBody::Delegated {
+                    child: c2,
+                    depth: p2,
+                    task: t2,
+                } if c1 == c2 && p1 == p2 && t1 == t2
             ),
         }
     }
