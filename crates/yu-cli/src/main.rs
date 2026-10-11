@@ -137,6 +137,16 @@ enum Command {
         /// which is what lets one be changed without rebuilding anything.
         #[arg(long)]
         policy: Option<PathBuf>,
+        /// A standing constraint. Repeat for several. These are *injected* into
+        /// every executor rather than restated by the decision layer each round,
+        /// which is the only way one cannot be dropped on the round nobody
+        /// remembered to repeat it.
+        #[arg(long = "constraint")]
+        constraints: Vec<String>,
+        /// The declared topology: how the work is shaped. The declaration
+        /// governs how many executors run, not merely what the view says.
+        #[arg(long)]
+        topology: Option<String>,
     },
 
     /// Summarise a recorded session.
@@ -183,6 +193,8 @@ async fn main() -> ExitCode {
             max_rounds,
             tools,
             policy,
+            constraints,
+            topology,
         } => {
             cmd_decide(
                 &charter,
@@ -192,6 +204,8 @@ async fn main() -> ExitCode {
                 max_rounds,
                 tools,
                 policy.as_deref(),
+                &constraints,
+                topology.as_deref(),
             )
             .await
         }
@@ -699,6 +713,8 @@ async fn cmd_decide(
     max_rounds: u32,
     tool_set: ToolSet,
     policy_path: Option<&Path>,
+    constraints: &[String],
+    topology: Option<&str>,
 ) -> anyhow::Result<()> {
     let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
@@ -716,11 +732,21 @@ async fn cmd_decide(
     // layer. The constructor exists so the sentence lands in exactly one field —
     // setting both `text` and `human_words` renders L0 with the intent twice on
     // every round, which is the layer least able to afford it.
-    let charter = Charter::from_the_humans_own_words(
+    let mut charter = Charter::from_the_humans_own_words(
         charter_text,
         chrono::Utc::now().timestamp_millis(),
         "cli",
     );
+    charter.constraints = constraints.to_vec();
+    if let Some(name) = topology {
+        let kind = yu_core::topology::TopologyKind::from_str(name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "`{name}` is not a topology this harness knows; the shapes are single, chain, \
+                 fan_out, tree, reflection, peer, verification_partition"
+            )
+        })?;
+        charter.topology = Some(yu_core::topology::TopologySpec::new(kind));
+    }
 
     let surface = describe_tools(&tools);
     let mut config = DecisionConfig::new(model);

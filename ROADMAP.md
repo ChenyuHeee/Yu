@@ -171,7 +171,23 @@
 
 - **`delegate` 的 schema 被写了两遍,到达请求的偏偏是错的那一份。** 计算出来的那份带着策略声明的 set ids,手写的那份没有 —— 而发出去的是手写的:于是 `required` 里有 `outcomes`,schema 里却没有它,决策层看不到有哪些集合可选,**唯一能满足 schema 的做法恰好是它唯一被禁止做的事**(发明一个集合)。守:`the_schema_carries_the_set_ids_and_declares_every_field_it_requires`
 
-**M4 的数字**:490 passed / 0 failed / 0 warnings。**没有跑真实模型**(本机没有可用凭据),验收证据全部来自 scripted endpoint;上面每条"回退即失败"都是真的跑过的回退。
+**M4 的数字**:490 passed / 0 failed / 0 warnings。上面每条"回退即失败"都是真的跑过的回退。
+
+**真实运行(M4 之后补的,因为那条线自己的沙箱里没有凭据)。** 给 CLI 加了 `--constraint`(可重复)与 `--topology`,然后跑了一次:
+
+```
+--- agents: 2 derived
+      decision
+        └ executor#1 — RUNTIME: reproduce the failure of check.py and identify the …
+          └ executor#1.1 — Read the file `.yu/decide-20261011T040337.jsonl` in the curr…
+```
+
+深度 3,树是从 L2 读出来的,不是从内存。**约束不只是被注入,是被遵守,而且层自己引用了它**:L1 里那条否决的理由原文是 "The charter constrains this to an investigation: never modify any file" —— 这比机制测试强,它证明约束到达了并且改变了一个判断。执行者也主动对了自己该落的格子:*"slot's declared expectation is `nothing_run`, which is exactly what happened"*。
+
+**两件这次真实运行暴露的:**
+
+- **声明了 `fan_out` 但没有扇出。** `plan()` 在没有 items 时返回 `Direct`(对着空集扇出就是凭空造孩子),而层没有提供 items —— 所以拓扑被声明了、被读了,却没有可作用的对象。树的形状来自执行者自己的递归,不是来自声明。**声明要生效,层得先给 items**;这条留给 M5/M6,不假装它已经成立
+- 层这次 L1 里是 0 decisions、2 rejected —— 两次都是实质性的否决,但"零决策"值得记下来
 
 ---
 
