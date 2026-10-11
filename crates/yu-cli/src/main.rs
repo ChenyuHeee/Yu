@@ -113,6 +113,17 @@ enum Command {
         max_steps: u32,
         #[arg(long, value_enum, default_value_t = ToolSet::ReadOnly)]
         tools: ToolSet,
+        /// The session this run belongs to. Reopening an existing one continues
+        /// its record instead of starting a new one — which is what a run after a
+        /// crash is, and what makes the effect discipline on the way in worth
+        /// anything.
+        #[arg(long)]
+        session: Option<String>,
+        /// The policy resource. `[[reduction]]` rows come from here, so which of
+        /// DESIGN's five paths a tool result takes is a file edit rather than a
+        /// rebuild.
+        #[arg(long)]
+        policy: Option<PathBuf>,
     },
 
     /// Run the decision layer on a charter. The thin vertical slice.
@@ -174,6 +185,42 @@ enum Command {
         #[arg(long, default_value = ".yu")]
         dir: PathBuf,
     },
+
+    /// Fork a session's record at a historical point, showing what it costs.
+    ///
+    /// DESIGN: "fork 是带成本提示的操作,不是免费调试按钮" — the estimate is printed
+    /// before the fork is made, because the two numbers it carries are the
+    /// decision: the storage is one marker line however long the parent is, and
+    /// the prefix from the fork point onward is what a replay has to re-establish
+    /// because the cache stops matching there. The parent is not written to.
+    Fork {
+        #[arg(long, default_value = ".yu")]
+        dir: PathBuf,
+        /// The session whose record is being branched from.
+        #[arg(long)]
+        session: String,
+        /// The seq to branch at: the new branch continues from it and inherits
+        /// everything below it.
+        #[arg(long)]
+        at: u64,
+        /// The new branch's session id.
+        #[arg(long)]
+        into: String,
+    },
+
+    /// Serve sessions over a Unix socket, owning the records they live in.
+    ///
+    /// DESIGN's process model: the session belongs to the daemon, not to the CLI
+    /// that started it, so a client that dies does not take the session with it —
+    /// and a daemon that is killed is recovered from what is on disk.
+    Daemon {
+        /// Where sessions keep their journals and their descriptions.
+        #[arg(long, default_value = ".yu")]
+        dir: PathBuf,
+        /// The socket the protocol is served on.
+        #[arg(long, default_value = ".yu/daemon.sock")]
+        socket: PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -204,7 +251,21 @@ async fn main() -> ExitCode {
             model,
             max_steps,
             tools,
-        } => cmd_run(&task, &dir, cwd, model, max_steps, tools).await,
+            session,
+            policy,
+        } => {
+            cmd_run(
+                &task,
+                &dir,
+                cwd,
+                model,
+                max_steps,
+                tools,
+                session.as_deref(),
+                policy.as_deref(),
+            )
+            .await
+        }
         Command::Decide {
             charter,
             dir,
@@ -236,6 +297,13 @@ async fn main() -> ExitCode {
             .await
         }
         Command::Metrics { dir } => cmd_metrics(&dir).await,
+        Command::Fork {
+            dir,
+            session,
+            at,
+            into,
+        } => cmd_fork(&dir, &session, at, &into).await,
+        Command::Daemon { dir, socket } => cmd_daemon(&dir, &socket).await,
     };
 
     match result {
@@ -360,6 +428,7 @@ async fn cmd_exec(
 // run — the long path
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_run(
     task: &str,
     dir: &PathBuf,
@@ -367,6 +436,8 @@ async fn cmd_run(
     model: Option<String>,
     max_steps: u32,
     tools: ToolSet,
+    session: Option<&str>,
+    policy_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let timeline = Timeline::new();
@@ -376,30 +447,58 @@ async fn cmd_run(
     let client = Arc::new(WireClient::from_env()?.with_timeline(timeline.clone()));
     let model = model.unwrap_or_else(|| client.default_model().to_owned());
 
-    // Session id from the wall clock: a record has to be findable later, and
-    // this is the only thing about it that is knowable at open time.
-    let session = SessionId::new(format!(
-        "run-{}",
-        chrono::Utc::now().format("%Y%m%dT%H%M%S")
-    ));
+    // Session id from the wall clock unless the caller named one: a record has to
+    // be findable later, and a named session is how a run continues one that a
+    // crash ended.
+    let session = SessionId::new(match session {
+        Some(id) => id.to_owned(),
+        None => format!("run-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S")),
+    });
     let journal = Arc::new(
         Journal::open(dir, session.clone())
             .await?
             .with_timeline(timeline.clone()),
     );
 
-    journal
-        .append(
-            AgentId::new("exec"),
-            EventBody::SessionStarted {
-                charter: task.to_owned(),
-                model: model.clone(),
-                quirks: client.quirks().name.clone(),
-            },
-        )
-        .await?;
+    if journal.is_empty() {
+        journal
+            .append(
+                AgentId::new("exec"),
+                EventBody::SessionStarted {
+                    charter: task.to_owned(),
+                    model: model.clone(),
+                    quirks: client.quirks().name.clone(),
+                },
+            )
+            .await?;
+    } else {
+        // Continuing a record that already exists. Reported rather than passed
+        // over: a run that silently resumed would look exactly like a run that
+        // started fresh, and the difference is the whole reason the id was named.
+        let next = journal.len() as u64;
+        eprintln!(
+            "--- resuming session {}: {} event(s) already recorded, continuing at seq {next}",
+            session.as_str(),
+            journal.len()
+        );
+        report_unresolved(&journal).await;
+        journal
+            .append(
+                AgentId::new("exec"),
+                EventBody::Note {
+                    text: format!(
+                        "resumed at seq {next}: this run continues a record that already                          existed. Effects recorded as completed are read from the record                          rather than performed again."
+                    ),
+                },
+            )
+            .await?;
+    }
 
-    let tools = Arc::new(build_tools(tools, cwd.clone()));
+    let policy = match policy_path {
+        Some(path) => Some(load_policy(path)?),
+        None => None,
+    };
+    let tools = Arc::new(build_tools(tools, cwd.clone(), policy.as_ref()));
     eprintln!("--- tool surface: {}", describe_tools(&tools));
     let config = AgentConfig::new(AgentId::new("exec"), model).max_steps(max_steps);
     let mut agent = Agent::new(
@@ -475,10 +574,79 @@ async fn cmd_run(
     Ok(())
 }
 
-fn build_tools(set: ToolSet, cwd: PathBuf) -> ToolRegistry {
-    match set {
+fn build_tools(set: ToolSet, cwd: PathBuf, policy: Option<&Policy>) -> ToolRegistry {
+    let registry = match set {
         ToolSet::ReadOnly => ToolRegistry::read_only(cwd),
         ToolSet::Full => ToolRegistry::native(cwd),
+    };
+    // The policy's `[[reduction]]` rows become the table the tools reduce under.
+    // Until this line existed, a policy could declare reduction rules, load them,
+    // validate them — and nothing that reduces had ever read one.
+    match policy {
+        Some(policy) => registry.with_reducer(Arc::new(
+            yu_tools::Reducer::new(yu_tools::Budget::default())
+                .with_table(Arc::new(policy.clone())),
+        )),
+        None => registry,
+    }
+}
+
+/// Read a policy, and say out loud about any rule that can never fire.
+///
+/// A row naming an axis this build does not understand can never match, which
+/// makes it a dead row — and a dead row is indistinguishable from a row whose
+/// condition simply never came up. The same goes for a path that is not one of
+/// DESIGN's five: the reducer skips it rather than guessing, so the only place the
+/// mistake can be seen is here.
+fn load_policy(path: &Path) -> anyhow::Result<Policy> {
+    let policy = Policy::from_path(path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    let axes = policy.unknown_reduction_axes();
+    if !axes.is_empty() {
+        eprintln!(
+            "--- policy {}: [[reduction]] row(s) name axis/axes this build does not              understand: {} — such a row cannot match anything, so it is dead rather              than merely unsatisfied",
+            path.display(),
+            axes.join(", ")
+        );
+    }
+    let paths = policy.unknown_reduction_paths();
+    if !paths.is_empty() {
+        eprintln!(
+            "--- policy {}: [[reduction]] row(s) name path(s) that are not one of the              five: {} — those rows are skipped, not approximated",
+            path.display(),
+            paths.join(", ")
+        );
+    }
+    Ok(policy)
+}
+
+/// Print the effects the record left in the crash window.
+///
+/// This is the finding a resumed session must not walk past: an effect whose
+/// completion was never written, about which the record says neither "done" nor
+/// "not done". Printing it is not decoration — a run that heard nothing would
+/// conclude the record was clean, and the difference between those two states is
+/// the whole of the effect discipline.
+async fn report_unresolved(journal: &yu_journal::Journal) {
+    let Ok(unfinished) = journal.unresolved_effects().await else {
+        return;
+    };
+    for effect in unfinished {
+        eprintln!(
+            "--- unresolved effect: {} ({}) recorded at seq {} — the record does not say \
+             whether it happened{}",
+            effect.key,
+            effect.description,
+            effect.at_seq,
+            match effect.replay() {
+                yu_journal::ReplayOfUnresolved::Reattempt => {
+                    ", and its key certifies that performing it again is safe"
+                }
+                yu_journal::ReplayOfUnresolved::Surface => {
+                    ", and its key certifies nothing, so it will not be performed again"
+                }
+            }
+        );
     }
 }
 
@@ -702,6 +870,7 @@ async fn boot_decision(
     cwd: PathBuf,
     model: Option<String>,
     tool_set: ToolSet,
+    policy: Option<&Policy>,
     resume: Option<&Handover>,
 ) -> anyhow::Result<DecisionBoot> {
     let timeline = Timeline::new();
@@ -723,7 +892,7 @@ async fn boot_decision(
         None => Journal::open(dir, session.clone()).await?,
     }
     .with_timeline(timeline.clone()));
-    let tools = Arc::new(build_tools(tool_set, cwd));
+    let tools = Arc::new(build_tools(tool_set, cwd, policy));
     init.finish();
 
     Ok(DecisionBoot {
@@ -768,6 +937,14 @@ async fn cmd_decide(
         None => None,
     };
 
+    // The policy is read before the tools are built, because it decides how they
+    // reduce. Reading it afterwards — which is what this did — left the table
+    // loaded and consulted by nobody.
+    let policy = match policy_path {
+        Some(path) => Some(load_policy(path)?),
+        None => None,
+    };
+
     let DecisionBoot {
         client,
         journal,
@@ -775,7 +952,15 @@ async fn cmd_decide(
         timeline,
         model,
         session,
-    } = boot_decision(dir, cwd.clone(), model, tool_set, resumed.as_ref().map(|(h, _)| h)).await?;
+    } = boot_decision(
+        dir,
+        cwd.clone(),
+        model,
+        tool_set,
+        policy.as_ref(),
+        resumed.as_ref().map(|(h, _)| h),
+    )
+    .await?;
 
     // DESIGN: "人类原话原样存活". The charter arrives as the human typed it and is
     // kept that way; there is no summarising step between them and the decision
@@ -843,9 +1028,8 @@ async fn cmd_decide(
         )]);
         *layer.ledger_mut() = seed.ledger.clone();
     }
-    if let Some(path) = policy_path {
-        let policy = Policy::from_path(path)
-            .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+    if let Some(policy) = &policy {
+        let path = policy_path.expect("a policy came from somewhere");
         let ids = policy.outcome_sets.ids();
         eprintln!(
             "--- policy {} — {} outcome set(s){}",
@@ -867,7 +1051,7 @@ async fn cmd_decide(
                  no landing can be checked"
             );
         }
-        layer = layer.with_outcome_sets(policy.outcome_sets);
+        layer = layer.with_outcome_sets(policy.outcome_sets.clone());
     }
 
     eprintln!(
@@ -958,6 +1142,107 @@ async fn cmd_decide(
             ),
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// fork — a historical point, priced before it is taken
+// ---------------------------------------------------------------------------
+
+async fn cmd_fork(dir: &PathBuf, session: &str, at: u64, into: &str) -> anyhow::Result<()> {
+    let parent = Arc::new(Journal::open(dir, SessionId::new(session)).await?);
+    if at > parent.len() as u64 {
+        anyhow::bail!(
+            "session `{session}` holds {} event(s): there is no seq {at} to fork at",
+            parent.len()
+        );
+    }
+    if dir.join(format!("{into}.jsonl")).exists() {
+        // A fork onto an existing record would append a marker to somebody
+        // else's branch, which is the one thing the marker exists to prevent.
+        anyhow::bail!("`{into}` already has a record in {}; pick another name", dir.display());
+    }
+
+    // The estimate, before anything is written.
+    let estimate = parent.estimate_fork(at).await?;
+    eprintln!("--- fork estimate");
+    eprintln!("      {estimate}");
+    eprintln!(
+        "      the parent is not written to: the branch reads its history through it"
+    );
+
+    let child = Journal::open_fork(dir, SessionId::new(into), parent.clone(), at).await?;
+
+    eprintln!(
+        "--- forked {} at seq {at}: {} event(s) inherited by reference, {} byte(s) written",
+        SessionId::new(into),
+        estimate.events,
+        estimate.marker_bytes
+    );
+    match child.cache_diverges_at() {
+        Some((parent_session, at)) => eprintln!(
+            "--- cache prefix diverges at {parent_session}:{at}; requests on this branch \n\
+             --- from that point onward match nothing cached"
+        ),
+        None => eprintln!("--- this branch is not a fork and diverges nowhere"),
+    }
+    eprintln!(
+        "--- parent {} still holds {} event(s), whole",
+        parent.session(),
+        parent.len()
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// daemon — sessions the process owns
+// ---------------------------------------------------------------------------
+
+async fn cmd_daemon(dir: &Path, socket: &Path) -> anyhow::Result<()> {
+    // A socket file outlives the process that bound it, so a killed daemon leaves
+    // one behind. Removing it blindly would steal the address from a live daemon;
+    // refusing blindly would mean a killed daemon could never be restarted. The
+    // question is answered by trying to connect.
+    if socket.exists() {
+        match tokio::net::UnixStream::connect(socket).await {
+            Ok(_) => anyhow::bail!(
+                "{} is already served by a live daemon; stop it before starting another",
+                socket.display()
+            ),
+            Err(_) => {
+                eprintln!(
+                    "--- {} is a socket nobody is serving: the daemon that bound it is gone \
+                     (a kill -9 leaves exactly this). Rebinding.",
+                    socket.display()
+                );
+                std::fs::remove_file(socket)
+                    .map_err(|e| anyhow::anyhow!("removing {}: {e}", socket.display()))?;
+            }
+        }
+    }
+    if let Some(parent) = socket.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let listener = tokio::net::UnixListener::bind(socket)
+        .map_err(|e| anyhow::anyhow!("binding {}: {e}", socket.display()))?;
+    let host = yu_server::daemon::Daemon::open(dir)?;
+    let config = yu_server::session::ServerConfig {
+        host: yu_server::session::Host::LocalDaemon {
+            socket: socket.to_path_buf(),
+        },
+        state_dir: dir.to_path_buf(),
+    };
+    // Printed after the bind, so a client that waits for this line is waiting for
+    // something that is true.
+    eprintln!(
+        "--- daemon up: sessions in {}, protocol on {}",
+        dir.display(),
+        socket.display()
+    );
+    yu_server::session::serve(listener, &host, config).await?;
     Ok(())
 }
 
@@ -1098,7 +1383,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yu-cli-init-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let boot = boot_decision(&dir, dir.clone(), None, ToolSet::ReadOnly, None)
+        let boot = boot_decision(&dir, dir.clone(), None, ToolSet::ReadOnly, None, None)
             .await
             .expect("the boot sequence");
 
