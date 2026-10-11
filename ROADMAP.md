@@ -223,10 +223,26 @@
 
 **验收**
 
-- [ ] 进程被 `kill -9` 后能从最后一条完好记录续跑
-- [ ] fork 一个历史点 → **显示预估成本** → 真的分叉,原分支不动
-- [ ] 一次副作用工具落在崩溃窗口里:(a) 记了意图没动手 → 重放时**不会被当成已完成**;(b) 做了没记完 → 能检出
-- [ ] **改一条 `[reduction]` 规则、重启,行为改变 —— 不重新编译**
+- [x] 进程被 `kill -9` 后能从最后一条完好记录续跑
+      —— 守:`a_killed_daemon_resumes_from_the_last_record_it_wrote`。**杀的是真进程**:`yu daemon` 起在 Unix socket 上,发两条消息,`kill -9` 并断言 `signal() == Some(9)`;第二个 daemon 起在同一状态目录上,`Resume` 答 `last_seq: Some(2)`,记录读回 `[0,1,2,3]` 且杀前字节逐字节保留为前缀。再加一轮:杀、在最后一个换行后追加半行、重启 —— 最后一条完整 seq 仍是 3,碎片被**丢弃而不是焊上**,编号接着走 4
+      —— **没证明什么**:那个撕裂碎片是**测试写的,不是竞态出来的**(从外部按需制造一次"恰好落在两次写之间"的崩溃做不到)。碎片逐字节是那种崩溃会留下的东西,之后对它做的一切(重开、修尾、编号)都是生产路径。**它也没有证明任何关于"崩在模型调用里"的事** —— daemon 里根本不跑 turn
+- [x] fork 一个历史点 → **显示预估成本** → 真的分叉,原分支不动
+      —— 守:`a_fork_shows_its_price_takes_the_branch_and_leaves_the_parent_alone`。预估在**写任何东西之前**打印,含两半(`5 event(s)`、`4321 input tokens`、`the parent is not written to`);分支自己的文件只有标记那一行;**父文件前后逐字节相同**(`std::fs::read` 比对),没有追加。重名 fork 被拒
+- [x] 一次副作用工具落在崩溃窗口里:(a) 记了意图没动手 → 重放时**不会被当成已完成**;(b) 做了没记完 → 能检出
+      —— 两条都**杀真进程**。(a) 让脚本化的模型去写一个**没有读者的 FIFO** —— `std::fs::write` 阻塞在 `open(2)`,所以那件事**可证明没有发生**;看着 `intended` 落盘,断言目标还是 FIFO,再 `kill -9`。恢复的那次报出未完成的 effect,重新尝试,字节落地。**我独立撤了 `may_skip`**:让它把 `Intended` 也算作可跳过,两条测试双双失败于 "the work is silently skipped and the run reports success"
+      —— (b) 让 `exec` 跑 `printf … >> P; kill -9 $PPID` —— 产物**由命令写出**,harness **被它杀掉**,所以死亡瞬间那件事已经发生、完成记录不可能写下。恢复的那次检出未完成的 effect、**拒绝重跑一个什么都证明不了的 key**、产物原封不动
+      —— **没证明什么**:窗口各自只由一种装置进入(阻塞在 `open(2)` 之前 / 在调用飞行中被杀)。工具内 panic、OOM、做了之后 `ToolResult` 之前崩 —— 都没走到。而且**没有 turn 级别的回放驱动**:第二次之所以重发,是脚本让它重发,不是 harness 回放了记录的模型轮次
+- [x] **改一条 `[reduction]` 规则、重启,行为改变 —— 不重新编译**
+      —— 守:`editing_one_reduction_rule_changes_what_the_model_is_sent_without_a_rebuild`。同一二进制**跑两个进程**,中间只改 TOML 里一行的一个值(`pass_through` → `drop_with_manifest`),观测量是执行者**真的发出去的请求**:前者 60kB 原文在,后者不在且有清单元数据。**并核对了二进制的 (size, mtime) 没变** —— 否则"它变了"也可能只是重新编译了
+      —— 回退到本里程碑之前的状态(`build_tools` 忽略策略)→ 失败,并打印出规则说 pass_through 而请求里没有原文
+
+**M6 期间撞出来的:ROADMAP 以为接好了、实际没接的八处**
+
+`EventBody::Effect` **没有任何生产者**(不补这条,验收 3 无法实现);`EffectLog::from_events`/`replay_seed` 无生产调用者;`EffectGuard` 仍无调用者且已与记录级的意图/完成对冗余(我留下没删 —— 删一个被文档化的机制该由你决定);**`ModelRequest.est_input_tokens` 两个生产者都字面写 `None`**,于是 fork 成本所依赖的字段什么都没记;`[reduction]` 表到不了任何做归约的地方;**`SessionHost` 是同步的且 `Send`/`Resume` 是占位**;**fork 的血缘只活在造它的那个 handle 里** —— `Journal::open` 重开同一分支时对父一无所知,记录的标记没人读;`ROADMAP.md` 的 M6 勾由我打,不是我打。
+
+**一处值得单独说的过程教训(那条线自己交代的)**:它的第一个 revert 工具用了 `shutil.copy2`,**保留了 mtime**;还原时 mtime 往回走,cargo 认为目标文件是新的,于是下一轮证明跑在**已经 revert 过的构建**上 —— 污染了一对证明。它换了 `copyfile` + `utime`、打印前后 hash、并把每一条证明**重做了一遍**。
+
+**M6 的数字**:526 passed / 0 failed / 0 warnings。
 
 ---
 
