@@ -81,6 +81,15 @@ impl DecisionConfig {
     }
 }
 
+/// How many turns in a row may run nothing before the round ends.
+///
+/// Three, because the decision layer's own prompt sets the rule: "The same
+/// failure twice. Stop. Do not ask for a third correction — a third attempt at a
+/// failure that has already happened twice is not a correction, it is a loop."
+/// Two barren turns are a mistake and its correction; the third is the loop, and
+/// the round ends there rather than paying for it.
+const MAX_BARREN_TURNS_PER_ROUND: u32 = 3;
+
 /// What the decision layer reports back to whoever invoked it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionOutcome {
@@ -103,6 +112,13 @@ pub struct DecisionOutcome {
     /// bounded, and a claim of boundedness is only checkable against the shape
     /// of this curve rather than against its last point.
     pub contexts: Vec<ContextComposition>,
+    /// Why the run ended without the layer deciding, when it did.
+    ///
+    /// `None` means the layer reached a decision. `Some` means it did not — and
+    /// the caller has to be able to tell, because `final_text` for a stopped run
+    /// is the layer's last narration rather than its answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_early: Option<String>,
     /// Every delegation's reduced outcome, for the caller's own audit.
     pub outcomes: Vec<DelegateOutcome>,
 }
@@ -195,6 +211,10 @@ impl DecisionLayer {
         let mut contexts: Vec<ContextComposition> = Vec::new();
         let mut all_outcomes: Vec<DelegateOutcome> = Vec::new();
         let mut delegations = 0u32;
+        // The last thing the layer said. A run that exhausts its rounds still
+        // produced one, and discarding it would leave the caller an error with
+        // nothing in it — the shape this replaced, one layer down.
+        let mut last_text = String::new();
         // Taken from the tool the view actually advertises rather than written
         // out again here: a copy of the name is a second source of truth, and
         // the failure it produces — advertising one tool and accepting another —
@@ -245,6 +265,7 @@ impl DecisionLayer {
 
             // ---- one round: delegate until the layer stops asking
             let mut round_delegations = 0u32;
+            let mut barren_turns = 0u32;
             loop {
                 // The context this request will actually carry. Recorded before
                 // it is sent, because this is the thing the criterion asks about.
@@ -280,6 +301,9 @@ impl DecisionLayer {
                 let mut sink = SilentSink::default();
                 let outcome = self.client.stream(&req, &mut sink).await?;
                 usage.add(&outcome.message.usage.to_observed());
+                if !sink.text.trim().is_empty() {
+                    last_text = sink.text.clone();
+                }
 
                 let assistant = outcome.message.content.clone();
                 let stop = outcome
@@ -312,6 +336,7 @@ impl DecisionLayer {
                             usage,
                             composition,
                             contexts,
+                            stopped_early: None,
                             outcomes: all_outcomes,
                         });
                     }
@@ -343,6 +368,11 @@ impl DecisionLayer {
                 messages.push(assistant_msg);
 
                 let mut result_blocks = Vec::new();
+                // How many calls this turn actually *ran*, as opposed to were
+                // answered. A turn whose every request was refused has nothing
+                // to react to, and continuing to converse with it is how a run
+                // spends without moving.
+                let mut executed = 0u32;
                 for tu in &uses {
                     // Check the name before the arguments. Every `tool_use` used
                     // to be deserialised straight into `DelegateArgs`, so a call
@@ -417,6 +447,7 @@ impl DecisionLayer {
                         &tu.id, rendered,
                     )));
                     all_outcomes.push(outcome);
+                    executed += 1;
                 }
 
                 let results = Message::user(result_blocks);
@@ -432,28 +463,68 @@ impl DecisionLayer {
                 if let Err(problem) = self.client.quirks().check_history(&messages) {
                     return Err(LoopError::History(problem));
                 }
+
+                // ---- the round boundary.
+                //
+                // A round is `render() -> converse -> write back`, and it ends
+                // when the view it was rendered from can no longer serve the
+                // next request.
+                //
+                // **A turn that ran nothing is not by itself a reason to end
+                // it.** A call the layer got wrong — a name that does not exist,
+                // arguments that do not parse — is answered with an error, and
+                // the answer is only worth anything if the layer is given a
+                // request to read it in. Breaking on the first barren turn threw
+                // that answer away: the results message was pushed and then
+                // discarded unread when the next round re-rendered. Measured, by
+                // the test that asserts a misnamed call is *answered*.
+                //
+                // What does end a round is a turn that could not move three
+                // times running. DESIGN's own intervention trigger is "the same
+                // failure twice. Stop. Do not ask for a third correction" — so a
+                // third barren turn is a loop, and a fresh round is the one
+                // thing that breaks it: the per-round delegation ceiling resets,
+                // and the layer sees state it wrote rather than state it
+                // remembers writing.
+                //
+                // (The round also ends when the ledger changes. That condition
+                // arrives with `decide` and `retire`, which are not wired in
+                // yet — see `crate::decide`.)
+                //
+                // It is never "the model stopped talking": that is `end_turn`,
+                // which ends the run, not the round.
+                barren_turns = if executed == 0 { barren_turns + 1 } else { 0 };
+                if barren_turns >= MAX_BARREN_TURNS_PER_ROUND {
+                    tracing::debug!(round, barren_turns, "round ends: the layer is looping");
+                    break;
+                }
             }
         }
 
-        // Reachable **only** when `max_rounds` is zero. The inner loop above has
-        // no `break` — a round converses until the model stops asking — so for
-        // any `max_rounds >= 1` a completed run always returned from inside it,
-        // and the outer `for` never advanced past its first iteration. Measured:
-        // a run with `--max-rounds 1` makes as many requests as it likes, and
-        // every run that ends reports `1 round(s)`.
+        // Running out of rounds is an ending, not a failure. The layer worked
+        // every round; what it stopped doing is moving. Returning `Err` here
+        // meant the caller got no final text, no composition and no acceptance
+        // number — and this is one of the two ways a long task ends, so the
+        // headline metric was missing from exactly the runs it exists to judge.
         //
-        // That is not a metric defect — the reported round count is true — but
-        // `max_rounds` is a user-facing knob that bounds nothing, and this arm
-        // reading like a live guard is worse than it being absent.
-        //
-        // It belongs to the milestone that makes re-rendering mean something:
-        // rounds only differ once L1 is written between them, and today the
-        // ledger is never written during a run. The guard that pins this is
-        // `the_round_ceiling_does_not_bound_a_run_that_keeps_asking` in
-        // `tests/decision_layer_loop.rs`, which fails the moment a round can
-        // actually end — forcing whoever makes it real to say so deliberately
-        // rather than to discover it.
-        Err(LoopError::StepCeiling(self.config.max_rounds))
+        // `stopped_early` is a description rather than a flag because the reason
+        // is what makes the outcome usable, and it mirrors
+        // `DelegateOutcome::stopped_early` so a caller reads both layers the same
+        // way.
+        Ok(DecisionOutcome {
+            rounds: self.config.max_rounds,
+            delegations,
+            final_text: last_text,
+            usage,
+            composition: contexts.last().copied().unwrap_or_default(),
+            contexts,
+            stopped_early: Some(format!(
+                "the round ceiling of {} was reached: the layer stopped moving, it did \
+                 not stop working",
+                self.config.max_rounds
+            )),
+            outcomes: all_outcomes,
+        })
     }
 
     fn build_view(&self, report: Option<&str>, outcomes: &[DelegateOutcome]) -> View {

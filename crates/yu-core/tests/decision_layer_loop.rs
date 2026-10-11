@@ -900,79 +900,90 @@ async fn a_tool_use_naming_another_tool_is_answered_rather_than_run_as_a_delegat
 }
 
 // ---------------------------------------------------------------------------
-// What the round ceiling does not do
+// The round ceiling, which now bounds
 // ---------------------------------------------------------------------------
 
-/// **`max_rounds` bounds nothing, and this writes that fact down.**
+/// A model that keeps asking is stopped, told why, and still hands back a number.
 ///
-/// A round converses until the model stops asking — the inner loop in
-/// `DecisionLayer::run` has no `break` — so the outer `for` never advances past
-/// its first iteration, and a completed run always reports `1 round(s)`.
-/// Measured here: with `max_rounds = 1` the layer still makes four requests,
-/// because nothing in the loop counts them.
+/// This replaces a characterization test. Until this milestone the run could not
+/// leave its first round — the inner loop had no `break` — so `max_rounds` and
+/// `yu decide --max-rounds` bounded nothing, and a layer that kept asking made as
+/// many requests as it liked. A round now ends when the layer has failed to move
+/// three turns running, which is DESIGN's own trigger ("The same failure twice.
+/// Stop. Do not ask for a third correction").
 ///
-/// This is a *characterization* test, not a guard on correct behaviour. It pins
-/// the state this milestone inherits so that making rounds real has to be a
-/// deliberate act: it fails the moment a round can end, and whoever makes that
-/// happen must also decide what `max_rounds` means, because today
-/// `yu decide --max-rounds` is a knob that does nothing.
-///
-/// It is in this file because of what the tail of `run` looks like without it:
-/// `Err(LoopError::StepCeiling)` reads like a live guard and is reachable only
-/// for `max_rounds == 0`. An arm that looks alive and is not is the exact class
-/// of thing this milestone exists to find, and a comment saying so is not a test.
-///
-/// Rounds only differ once L1 is written between them, and nothing writes the
-/// ledger during a run yet — which is why this is not fixed here.
+/// The two halves both matter. Ending the run at the ceiling is *not* enough on
+/// its own: `run` used to return `Err(LoopError::StepCeiling)` there, so the
+/// caller lost the final text, the composition and the acceptance number — from
+/// one of the two ways a long task actually ends.
 #[tokio::test]
-async fn the_round_ceiling_does_not_bound_a_run_that_keeps_asking() {
+async fn a_loop_that_keeps_asking_is_stopped_at_the_round_ceiling_and_says_so() {
     let endpoint = FakeEndpoint::start(vec![
         Reply::Json(tool_use_reply(
-            "msg-r1",
+            "msg-a1",
             "first",
-            "call-r1",
+            "call-a1",
             "delegate",
             json!({"task": "one"}),
         )),
-        // Consumed by the executor the first attempt derives, not by the layer:
-        // the two converse over the same socket.
-        Reply::Json(text_reply("msg-e1", "REPORT: one done")),
+        Reply::Json(text_reply("msg-ae", "REPORT: one done")),
+        // Three turns that cannot move. The first two are the mistake and its
+        // correction; the third is the loop.
         Reply::Json(tool_use_reply(
-            "msg-r2",
+            "msg-a2",
             "again",
-            "call-r2",
+            "call-a2",
             "delegate",
             json!({"task": "two"}),
         )),
         Reply::Json(tool_use_reply(
-            "msg-r3",
+            "msg-a3",
             "again",
-            "call-r3",
+            "call-a3",
             "delegate",
             json!({"task": "three"}),
         )),
-        Reply::Json(text_reply("msg-r4", "decided with what I have")),
+        Reply::Json(tool_use_reply(
+            "msg-a4",
+            "again",
+            "call-a4",
+            "delegate",
+            json!({"task": "four"}),
+        )),
     ]);
     let run = decide("round-ceiling", &endpoint, 1).await;
 
-    assert_eq!(
-        run.outcome.rounds, 1,
-        "a completed run always reports the first round"
+    let stopped = run
+        .outcome
+        .stopped_early
+        .as_deref()
+        .expect("a run that never decided must say so rather than return an error");
+    assert!(
+        stopped.contains("round ceiling of 1"),
+        "the reason has to name what ran out: {stopped}"
     );
+    assert_eq!(run.outcome.rounds, 1);
     assert_eq!(
         run.outcome.delegations, 1,
-        "the per-round delegation ceiling does hold — only the first ran"
+        "the per-round delegation ceiling held: only the first ran"
     );
-    assert_eq!(
-        endpoint.to_an_executor().len(),
-        1,
-        "and the other two attempts never reached an executor"
-    );
+    assert_eq!(endpoint.to_an_executor().len(), 1);
     assert_eq!(
         endpoint.to_the_decision_layer().len(),
         4,
-        "`max_rounds = 1` permitted four requests, so it bounds nothing. If this \
-         assertion now fails, a round can end — `max_rounds` has become real, and \
-         this test plus the unreachable comment in `run` both need revisiting."
+        "one turn to delegate, then the three that could not move"
     );
+    assert_eq!(
+        endpoint.beyond_the_script(),
+        0,
+        "the ceiling stopped the run before the script ran dry — if this fails, \
+         the loop is asking for more turns than a round is allowed"
+    );
+    // The floor of the report: a stopped run still measured itself. Before this,
+    // `Err` meant no composition was returned at all.
+    assert!(
+        run.outcome.composition.total_chars > 0,
+        "a run that ends at the ceiling still has a context worth reporting"
+    );
+    assert_eq!(run.outcome.contexts.len(), 4);
 }
