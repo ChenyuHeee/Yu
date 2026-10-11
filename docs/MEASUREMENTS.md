@@ -109,7 +109,54 @@ the *N*th time — the view grows with the square of the number of rounds. A run
 that produces no evidence (as above) hides this completely, which is why the
 previous measurement, taken the same way, could not see it.
 
-## Harness cost versus model cost
+## The same measurement after the loop was closed
+
+Same fixture, same charter plus one clause — *"record what you conclude before
+you answer"* — read-only surface, four rounds allowed:
+
+```
+--- 4 round(s), 1 delegation(s) in 127.9s
+--- tokens in=25705 out=17047 cache_read=17536
+--- L1: 2 decision(s), 2 rejected, 0 open question(s)
+--- decision layer context: raw material 0.0% of 29557 chars (raw 0 + reduced 10670 + calls 0 + definitions 2450; tool machinery 44.4%)
+--- decision-layer context per request: 10127 23433 31342 29034 29859 29557
+--- peak context: 31342 chars, raw material 0.0%
+--- executor #0 context: raw material 29.9% of 28170 chars (raw 8427 + reduced 0 + calls 1579 + definitions 502; tool machinery 37.3%)
+```
+
+Three things moved, and each is the mechanism rather than the number.
+
+**L1 is no longer empty.** The layer recorded two decisions with their reasons
+and ruled two things out. The second rejection is the one worth reading:
+
+> ruled out: A third read-only pass re-deriving why check.py fails. — because Two
+> independent passes over identical file contents agree on the same root cause.
+> Further reading cannot produce the one thing still missing — an observed run —
+> and the charter forbids the change that would make one meaningful. The last pass
+> spent 44 tool calls and 20 file reads to reach the conclusion already on the
+> ledger; another would spend the same for nothing.
+
+That is the layer doing the thing the design says only it can do: noticing that
+its own executor is looping and stopping it, with the evidence for the judgement
+written down. Before this milestone it had nowhere to write it.
+
+**The curve is no longer monotonic.** `10127 23433 31342 29034 29859 29557` — it
+rises inside a round as the conversation grows, then *falls* when the next round
+re-renders, from 31342 to 29034. The peak is round one's, not the last round's.
+DESIGN's "大小有界、永不退化" is a claim about this shape, and the shape is now
+testable rather than asserted.
+
+What still grows is L1, which is supposed to: the later rounds' fresh views are
+larger than the first (10127 → 29034) because the ledger gained four entries. That
+is state, not history, and it is the difference the metric exists to keep visible.
+
+**Raw material is still zero.** 0 of 29 557 characters in the decision layer, with
+tool machinery at 44.4% — nearly all of it the one reduced report (10 670) and the
+tool definitions (2 450). The executor's 29.9% is the contrast the design rests
+on, and it is higher than the first run's 8.3% because this charter's executor
+read more.
+
+**Harness cost versus model cost**
 
 From the run above — the number DESIGN says flower never managed to take:
 
