@@ -103,11 +103,24 @@
 
 **验收**
 
-- [ ] 跑一个真实任务,结束后 **L1 里有这次运行的决策与理由** —— 是决策,不是报告
-- [ ] 该任务里**否决过的方案不会在后续轮次被重新提出**(用一个刻意构造的重提来验)
-- [ ] **连续 8 轮后视野不随轮数单调增长**(阈值由你定;关键是有界)
-- [ ] 清单的"完整"断言有测试守:**对记录里任意一条被省略的项,清单里要么有它,要么有它为什么不在**
-- [ ] prompt 广告的工具面 == 实际发出的工具面,且**有测试断言这件事**
+- [x] 跑一个真实任务,结束后 **L1 里有这次运行的决策与理由** —— 是决策,不是报告
+      —— 实测:2 决策 + 2 否决,含"再跑第三遍只读复核"被自己否掉。守:`the_decisions_the_layer_makes_are_in_l1_when_the_run_ends`(同时断言 L1 与 L2 都有,理由在内)
+- [x] 该任务里**否决过的方案不会在后续轮次被重新提出**(用一个刻意构造的重提来验)
+      —— 守:`a_ruled_out_proposal_is_in_front_of_the_layer_when_it_comes_back`(脚本构造执行者重提同一方案,断言后续**每一个**携带该重提的请求里都有那条否决、且在 "Already rejected" 标题下)
+- [x] **连续 8 轮后视野不随轮数单调增长**
+      —— 守:`eight_rounds_that_decide_nothing_do_not_grow_the_view`(8 轮全空转,8 个新渲染视野逐字节同大)。实测曲线 10127 23433 31342 **29034** 29859 29557:轮内升,换轮**降**
+- [x] 清单的"完整"断言有测试守:对记录里任意一条被省略的项,清单里要么有它,要么有它为什么不在
+      —— 守:`every_superseded_piece_of_evidence_is_named_in_the_manifest` + `evidence_with_nowhere_to_point_says_so_rather_than_inventing_an_address`
+- [x] prompt 广告的工具面 == 实际发出的工具面,且**有测试断言这件事**
+      —— 守:`the_prompt_advertises_exactly_the_tools_the_layer_is_offered`(从 prompt 里读出清单,不重抄一份;双向报差)。它当场生效过一次:给 `decision_surface()` 加上 decide/retire 后,测试先失败,才去改 prompt
+
+**M2 期间做的事(超出验收,但是必须做的)**
+
+- **轮次真的会结束了。** M1 留下的 `max_rounds` 形同虚设,由这一轮修掉;判据是 DESIGN 自己的触发器("同一个失败两次就停")。同时 `DecisionOutcome::stopped_early` 让"用完轮数"变成**结局**而不是 `Err` —— 否则最长的那类运行恰恰报不出验收数字
+- **视野里两处随轮数增长的东西被拿掉**:证据(轮 N 把第 1 轮的工具输出重渲 N 遍,于是 O(轮²))与 `retired`(已完成的项不是状态)。前者的守是单元层 `carry_for_this_round` 的测试 —— 端到端那条**看不见它**,因为测试用的 registry 没有 `exec`,不产证据。这一点写在那条测试的注释里,而不是让它看起来覆盖面更大
+- **`Applied::record`**:journal 里原来写的是模型看的 `text`,于是**理由进不了 L2**。从结果看不出来(L1 在内存里还有),是守测抓到的
+
+**M2 的数字**:428 passed / 0 failed / 0 warnings。
 
 ---
 
