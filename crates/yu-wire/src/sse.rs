@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::error::{ErrorKind, WireError};
+use crate::error::{ErrorKind, WireError, redact_key_material};
 use crate::types::{
     ContentBlock, RedactedThinkingBlock, ServerToolUseBlock, StopReason, TextBlock, ThinkingBlock,
     ToolUseBlock, Usage, WebSearchToolResultBlock,
@@ -253,7 +253,12 @@ impl StreamAccumulator {
                     "authentication_error" => ErrorKind::Auth,
                     _ => ErrorKind::StreamError,
                 };
-                return Err(WireError::new(kind, message));
+                // A second ingestion point for endpoint text, and this arm maps
+                // `authentication_error` — the class measured to echo key
+                // material (WIRE-FACTS Quirk 6). Redacted where the copy is
+                // made, exactly as `WireError::from_response` does, so no
+                // consumer and no future copy can leak what was never stored.
+                return Err(WireError::new(kind, redact_key_material(&message)));
             }
             // Unknown event kinds are ignored rather than fatal: a newer server
             // may add events, and refusing to continue would be a regression.
@@ -502,5 +507,45 @@ mod tests {
         let err = acc.apply(&ev).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Overloaded);
         assert!(err.is_retryable());
+    }
+
+    /// The stream path is a second place endpoint text becomes a `WireError`,
+    /// and this arm maps `authentication_error` — the class that echoes key
+    /// material (WIRE-FACTS Quirk 6). The captured 401 body is wrapped in the
+    /// event shape the endpoint sends it in, so the redaction is tested against
+    /// the real text rather than a paraphrase.
+    #[test]
+    fn a_mid_stream_auth_error_does_not_keep_the_key_characters_the_mask_preserved() {
+        let captured: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/error_401_auth.json")).unwrap();
+        let ev = SseEvent {
+            event: Some("error".into()),
+            data: serde_json::json!({"type": "error", "error": captured["error"].clone()})
+                .to_string(),
+            offset: 0,
+        };
+
+        let mut acc = StreamAccumulator::new();
+        let err = acc.apply(&ev).unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Auth);
+
+        // What the message is for survives: the failure, and the mask that says
+        // a credential was involved.
+        assert!(err.message.contains("Authentication Fails"), "{}", err.message);
+        assert!(err.message.contains("****"), "{}", err.message);
+
+        // Every form a consumer would copy or persist is free of the suffix.
+        let copies = [
+            ("message", err.message.clone()),
+            ("Display", format!("{err}")),
+            ("Debug", format!("{err:?}")),
+            ("serde", serde_json::to_string(&err).unwrap()),
+        ];
+        for (shape, text) in copies {
+            assert!(
+                !text.contains("0000"),
+                "key characters reached {shape}: {text}"
+            );
+        }
     }
 }

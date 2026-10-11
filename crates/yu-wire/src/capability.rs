@@ -58,6 +58,20 @@ struct Probe {
     betas: &'static [&'static str],
 }
 
+/// What a 2xx means for a probe.
+///
+/// `Yes` only where the response itself is the evidence; everything else is
+/// `AcceptedUnverified`, because "the endpoint accepted the field" and "the
+/// field works" are different states, and reporting the first as the second is
+/// how silent no-ops ship.
+fn acceptance_support(probe: &Probe) -> Support {
+    if probe.observable {
+        Support::Yes
+    } else {
+        Support::AcceptedUnverified
+    }
+}
+
 const OK_USER: &str = "Reply with the single word: ok";
 
 fn messages_body(model: &str, extra: Value) -> Value {
@@ -367,12 +381,12 @@ impl Capabilities {
 
             entries.push(match result {
                 Ok((status, text, _)) if (200..300).contains(&status) => {
-                    let support = if probe.observable {
-                        Support::Yes
-                    } else {
-                        Support::AcceptedUnverified
-                    };
-                    Capability::ok(probe.feature, support, status, summarize_body(&text))
+                    Capability::ok(
+                        probe.feature,
+                        acceptance_support(&probe),
+                        status,
+                        summarize_body(&text),
+                    )
                 }
                 Ok((status, text, _)) => {
                     let err = WireError::from_response(status, &text, None);
@@ -605,7 +619,12 @@ impl std::fmt::Display for Capabilities {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::time::Duration;
+
     use super::*;
+    use crate::client::Auth;
 
     #[test]
     fn probe_bodies_are_all_well_formed_json() {
@@ -654,26 +673,60 @@ mod tests {
         }
     }
 
+    /// The distinction that stops silent no-ops from shipping.
+    ///
+    /// It has to be asserted through the table itself. The first version of
+    /// this test hand-built one `Capability` and asserted it equalled itself,
+    /// so nothing about it was connected to the probe table: flipping
+    /// `observable` back to `true` — the exact bug the flag was introduced for
+    /// — made no difference to it, and the real regression it claimed to guard
+    /// would have passed straight through.
     #[test]
     fn unobservable_features_are_not_reported_as_plain_yes() {
-        // The distinction that stops silent no-ops from shipping.
-        let caps = Capabilities {
-            base_url: "https://example.test".into(),
-            model: "m".into(),
-            probed_at_ms: 0,
-            entries: vec![Capability::ok(
-                "server-side compaction",
+        // Which features are in that class is a judgement about the endpoint,
+        // not a property the code can derive, so it is written out here: each
+        // of these is accepted with a 200 while the effect it asks about
+        // cannot be read off that response.
+        const UNOBSERVABLE: [&str; 7] = [
+            "output_config.effort",
+            "output_config.format (structured outputs)",
+            "cache_control",
+            "context_management.edits",
+            "server-side compaction",
+            "task_budget",
+            "server-side fallback",
+        ];
+
+        let table = probes();
+        for feature in UNOBSERVABLE {
+            let probe = table
+                .iter()
+                .find(|p| p.feature == feature)
+                .unwrap_or_else(|| panic!("`{feature}` is no longer in the probe table"));
+            assert!(
+                !probe.observable,
+                "`{feature}` is marked observable, but one response cannot show it working; \
+                 a 200 would be reported as a plain Yes"
+            );
+            let support = acceptance_support(probe);
+            assert_eq!(
+                support,
                 Support::AcceptedUnverified,
-                200,
-                "ok",
-            )],
-            quirks: Quirks::unknown(),
-        };
-        assert_eq!(
-            caps.get("server-side compaction").unwrap().support,
-            Support::AcceptedUnverified
-        );
-        assert!(!caps.get("server-side compaction").unwrap().support.is_yes());
+                "`{feature}` must report accepted-but-unverified"
+            );
+            assert!(!support.is_yes(), "`{feature}` was reported as a capability");
+        }
+
+        // The mapping must still say Yes where the response *is* the evidence,
+        // or the rule above would be satisfied by a constant.
+        for probe in table.iter().filter(|p| p.observable) {
+            assert_eq!(
+                acceptance_support(probe),
+                Support::Yes,
+                "`{}` is observable; its 200 is the evidence",
+                probe.feature
+            );
+        }
     }
 
     #[test]
@@ -728,6 +781,129 @@ mod tests {
         assert!(s.contains("cr=128"), "{s}");
         assert!(s.contains("blocks=[thinking,text]"), "{s}");
     }
+
+    // -----------------------------------------------------------------------
+    // The caching probe
+    //
+    // Its answer exists only as the *difference* between two requests, so it
+    // cannot be tested against a hand-built value — that would assert nothing
+    // about what was sent. These tests use a loopback endpoint that answers in
+    // the shape the probe reads, and records what it was asked.
+    // -----------------------------------------------------------------------
+
+    fn loopback_listener() -> TcpListener {
+        TcpListener::bind("127.0.0.1:0").expect("a loopback port")
+    }
+
+    /// Read one complete HTTP/1.1 request: the head, then `content-length` bytes.
+    fn read_request(sock: &mut TcpStream) -> String {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if raw.len() >= head_end + 4 + body_len {
+                    break;
+                }
+            }
+            match sock.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        }
+        String::from_utf8_lossy(&raw).into_owned()
+    }
+
+    /// Answers like an Anthropic-shaped endpoint: a prefix is cached **only
+    /// when the request carries a `cache_control` breakpoint**, and requests
+    /// without one report no cache activity at all.
+    ///
+    /// That is the case the probe has to get right, and the one it could not
+    /// see while it never sent a breakpoint.
+    fn breakpoint_honouring_endpoint() -> (SocketAddr, std::sync::mpsc::Receiver<String>) {
+        let listener = loopback_listener();
+        let addr = listener.local_addr().expect("listener address");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut written = false;
+            // Four requests: two per arm of `probe_caching`.
+            for _ in 0..4 {
+                let Ok((mut sock, _)) = listener.accept() else {
+                    return;
+                };
+                let raw = read_request(&mut sock);
+                let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                let usage = if body.contains("cache_control") {
+                    if written {
+                        json!({"cache_read_input_tokens": 5000})
+                    } else {
+                        written = true;
+                        json!({"cache_creation_input_tokens": 5000})
+                    }
+                } else {
+                    json!({})
+                };
+                let reply = format!(
+                    r#"{{"id":"msg-loopback","model":"m","content":[],"stop_reason":"end_turn","usage":{usage}}}"#
+                );
+                let _ = sock.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    )
+                    .as_bytes(),
+                );
+                let _ = tx.send(raw);
+            }
+        });
+        (addr, rx)
+    }
+
+    /// `body(with_breakpoint)` was defined but only `body(false)` was ever
+    /// called, so the probe answered "are breakpoints effective?" from requests
+    /// that carried none: on this endpoint that is a `No` about a question
+    /// never asked, and `infer_quirks` writes it over the correct default.
+    #[tokio::test]
+    async fn the_caching_probe_tests_breakpoints_against_a_breakpoint_honouring_endpoint() {
+        let (addr, seen) = breakpoint_honouring_endpoint();
+        let client = WireClient::builder()
+            .base_url(format!("http://{addr}"))
+            .auth(Auth::ApiKey("sk-test".to_owned()))
+            .build()
+            .expect("building the client");
+
+        let (breakpoints, automatic) = probe_caching(&client, "test-model").await;
+
+        // What went out on the wire, because the point is that the breakpoint
+        // arm exists at all: a "yes" below would otherwise be an answer to a
+        // question the probe never asked.
+        let mut bodies = Vec::new();
+        while let Ok(raw) = seen.recv_timeout(Duration::from_secs(5)) {
+            bodies.push(raw);
+        }
+        assert!(
+            bodies.iter().any(|b| b.contains("cache_control")),
+            "no request carried a breakpoint; the probe never exercised the path \
+             ({} requests seen, none of them with one)",
+            bodies.len()
+        );
+
+        // And the answer is the endpoint's, not a default: this endpoint caches
+        // only when asked, so breakpoints are effective and nothing is
+        // automatic.
+        assert_eq!(
+            breakpoints,
+            Support::Yes,
+            "a breakpoint-honouring endpoint must not be reported as inert"
+        );
+        assert_eq!(automatic, Support::No);
+    }
 }
 
 /// What comparing two requests revealed about caching.
@@ -746,44 +922,96 @@ pub struct CachingProbe {
 /// *entire* mechanism rather than a hint to a breakpoint placer. That is only
 /// knowable by sending the same prefix twice and reading `cache_read_input_tokens`
 /// on the second — which is why one 200 could never have answered it.
+///
+/// Two arms, because "does the server cache prefixes by itself" and "does a
+/// breakpoint change anything" are different questions: a server may cache
+/// automatically (a breakpoint then adds nothing) or only on request (the
+/// breakpoint is the whole mechanism). Only the *difference* between the arms
+/// answers the second question.
 async fn probe_caching(client: &WireClient, model: &str) -> (Support, Support) {
     // Long enough to clear any minimum cacheable prefix, and byte-identical
-    // between the two requests.
+    // between the two requests in an arm.
     let prefix = "You are a meticulous assistant. ".repeat(200);
-    let body = |with_breakpoint: bool| {
-        let system = if with_breakpoint {
-            json!([{"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}}])
-        } else {
-            json!([{"type": "text", "text": prefix}])
-        };
-        json!({
-            "model": model,
-            "max_tokens": 16,
-            "system": system,
-            "messages": [{"role": "user", "content": "Say ok"}],
-        })
+
+    let plain = caching_arm(client, model, &prefix, false).await;
+    let explicit = caching_arm(client, model, &prefix, true).await;
+
+    // Automatic: with no breakpoint anywhere in the request, a cache read on
+    // the second identical request can only be the server deciding to cache on
+    // its own.
+    let automatic = if !plain.second_ok {
+        Support::Unknown
+    } else if plain.read_second > 0 {
+        Support::Yes
+    } else {
+        Support::No
     };
 
-    let read_of = |text: &str| -> Option<u64> {
-        let v: Value = serde_json::from_str(text).ok()?;
-        v.get("usage")?
-            .get("cache_read_input_tokens")?
-            .as_u64()
-    };
-    let created_of = |text: &str| -> Option<u64> {
-        let v: Value = serde_json::from_str(text).ok()?;
-        v.get("usage")?
-            .get("cache_creation_input_tokens")?
-            .as_u64()
+    // Breakpoints: effective only if asking for one produced cache activity the
+    // unadorned requests did not. On an endpoint that caches by itself both
+    // arms behave identically and the breakpoint is inert — accepted, and doing
+    // nothing (this endpoint's measured Quirk 3). Reading this answer off the
+    // no-breakpoint arm — which is all this probe did while `body(true)` was
+    // dead code — can only ever say `No`, and on a breakpoint-honouring
+    // endpoint that `No` overwrites the correct default.
+    let breakpoints = if !plain.second_ok || !explicit.second_ok {
+        // One arm is not evidence about the other. An unmeasured answer must
+        // not be written into the profile as a measurement.
+        Support::Unknown
+    } else if explicit.cached() && !plain.cached() {
+        Support::Yes
+    } else {
+        Support::No
     };
 
-    // Without a breakpoint: does the server cache anyway?
-    let mut automatic = Support::Unknown;
-    let mut first_read = None;
-    let mut wrote_anything = false;
+    (breakpoints, automatic)
+}
+
+fn caching_body(model: &str, prefix: &str, with_breakpoint: bool) -> Value {
+    let system = if with_breakpoint {
+        json!([{"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}}])
+    } else {
+        json!([{"type": "text", "text": prefix}])
+    };
+    json!({
+        "model": model,
+        "max_tokens": 16,
+        "system": system,
+        "messages": [{"role": "user", "content": "Say ok"}],
+    })
+}
+
+/// One arm of [`probe_caching`]: the same prefix sent twice, with or without a
+/// `cache_control` breakpoint.
+#[derive(Debug, Default)]
+struct CacheArm {
+    /// The second request came back 2xx, so its cache counters mean something.
+    second_ok: bool,
+    /// The server wrote cache on a request in this arm.
+    wrote: bool,
+    /// `cache_read_input_tokens` on the second request.
+    read_second: u64,
+}
+
+impl CacheArm {
+    /// The server cached this prefix: it wrote something, or read something
+    /// back. The two arms' answers are only meaningful as a difference.
+    fn cached(&self) -> bool {
+        self.wrote || self.read_second > 0
+    }
+}
+
+async fn caching_arm(
+    client: &WireClient,
+    model: &str,
+    prefix: &str,
+    with_breakpoint: bool,
+) -> CacheArm {
+    let body = caching_body(model, prefix, with_breakpoint);
+    let mut arm = CacheArm::default();
     for attempt in 0..2 {
         let Ok((status, text, _)) = client
-            .raw_request(reqwest::Method::POST, "/v1/messages", Some(&body(false)), &[])
+            .raw_request(reqwest::Method::POST, "/v1/messages", Some(&body), &[])
             .await
         else {
             continue;
@@ -791,30 +1019,27 @@ async fn probe_caching(client: &WireClient, model: &str) -> (Support, Support) {
         if !(200..300).contains(&status) {
             continue;
         }
-        if created_of(&text).unwrap_or(0) > 0 {
-            wrote_anything = true;
+        if cache_created(&text).unwrap_or(0) > 0 {
+            arm.wrote = true;
         }
         if attempt == 1 {
-            automatic = match (first_read, read_of(&text)) {
-                // The second identical request read the prefix back.
-                (_, Some(read)) if read > 0 => Support::Yes,
-                _ => Support::No,
-            };
+            arm.second_ok = true;
+            arm.read_second = cache_read(&text).unwrap_or(0);
         }
-        first_read = read_of(&text);
     }
+    arm
+}
 
-    // With a breakpoint: does anything differ?
-    let breakpoints = if wrote_anything {
-        Support::Yes
-    } else {
-        // `cache_creation_input_tokens` stayed at zero even when asked to write.
-        // The breakpoint is accepted and does nothing, which is a different
-        // finding from "caching does not work" — the caching is automatic.
-        Support::No
-    };
+fn cache_read(text: &str) -> Option<u64> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    v.get("usage")?.get("cache_read_input_tokens")?.as_u64()
+}
 
-    (breakpoints, automatic)
+fn cache_created(text: &str) -> Option<u64> {
+    let v: Value = serde_json::from_str(text).ok()?;
+    v.get("usage")?
+        .get("cache_creation_input_tokens")?
+        .as_u64()
 }
 
 /// Does the endpoint check a thinking block's signature?
