@@ -24,7 +24,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use yu_journal::{EventBody, Journal};
-use yu_observe::{AgentId, ContextComposition, SpanKind, Timeline, TokenUsage};
+use yu_observe::{AgentId, ContextComposition, ShapeSignal, SpanKind, Timeline, TokenUsage};
 use yu_tools::ToolRegistry;
 use yu_wire::client::{StreamSink, WireClient};
 use yu_wire::types::{
@@ -34,7 +34,9 @@ use yu_wire::types::{
 
 use crate::agent::LoopError;
 use crate::delegate::{self, DelegateArgs, DelegateOutcome};
-use crate::render::{render, Charter, CompositionMeter, Ledger, RenderInput, View};
+use crate::render::{
+    render, Charter, CompositionMeter, Evidence, Ledger, NotLoadedEntry, RenderInput, View,
+};
 
 /// DESIGN: "`output_config.effort`: … 决策层 `xhigh`,执行层降档".
 pub const DECISION_EFFORT: Effort = Effort::Xhigh;
@@ -528,53 +530,186 @@ impl DecisionLayer {
     }
 
     fn build_view(&self, report: Option<&str>, outcomes: &[DelegateOutcome]) -> View {
-        // Evidence from every delegation so far is carried, because DESIGN makes
-        // an assertion without runnable evidence unverified, and the decision
-        // layer is the one that has to notice.
-        //
-        // **This is unbounded, and it is the reason the view is not.** Each
-        // `Evidence.content` is a tool's output rendered verbatim, and this
-        // carries all of them for the whole run, so round N re-renders round 1's
-        // evidence for the Nth time — the view grows with the square of the
-        // number of rounds. An earlier version of this comment said evidence was
-        // "bounded by construction"; it is not, and the measurement now says so
-        // (`ContextComposition::raw_material_chars` counts exactly this).
-        //
-        // It is left as it is here deliberately rather than trimmed, because
-        // trimming it in place would be compression — guessing which evidence
-        // mattered. DESIGN's answer is that the decision layer should not be
-        // reading raw evidence at all: M3 replaces this section with
-        // pre-registered landing slots, and `spot_check` becomes the one channel
-        // that can pull a tool's output in, charged to this layer's own account.
-        let evidence: Vec<_> = outcomes
-            .iter()
-            .flat_map(|o| o.evidence.iter().cloned())
-            .collect();
-        let shape: Vec<_> = outcomes
-            .iter()
-            .flat_map(|o| o.shape.iter().cloned())
-            .collect();
-        // Only the last delegation's manifest. Earlier rounds' omissions are
-        // already addressed by the record; restating them every round would make
-        // the manifest grow with the number of rounds, which is the accumulation
-        // this whole module exists to avoid. The manifest is addresses rather than
-        // payloads, so unlike the evidence above it really is bounded — by the
-        // record's size, not by the run's length.
-        let omitted: Vec<_> = outcomes
-            .last()
-            .map(|o| o.omitted.clone())
-            .unwrap_or_default();
-
+        let (evidence, shape, omitted) = carry_for_this_round(outcomes);
         render(RenderInput {
             prompt: DECISION_PROMPT,
             charter: &self.charter,
             ledger: &self.ledger,
-            tools: &[delegate::delegate_tool()],
+            tools: &delegate::decision_surface(),
             report,
             evidence: &evidence,
             shape: &shape,
             omitted: &omitted,
         })
+    }
+}
+
+/// Everything a round's view carries from the delegations so far.
+///
+/// **A round's view is a function of the latest round, not of the run.** DESIGN
+/// states the rule as "渲染出来的,不是累积出来的 → 大小有界、前缀字节稳定、永不退化",
+/// and the version before this one broke it: every delegation's evidence was
+/// carried, every round, so round *N* re-rendered round 1's tool output for the
+/// *N*th time and the view grew with the square of the round count. The earlier
+/// reading of this file said evidence was "bounded by construction"; it was not,
+/// and a read-only run could not show it, because nothing produces evidence
+/// without `exec`.
+///
+/// Nothing is dropped. An earlier round's evidence, shape and manifest are
+/// **addressed** in the manifest, which is the one structure whose job is to say
+/// what is not in front of you and how to reach it. The manifest's own claim —
+/// that it is complete — is what the addresses exist to keep true.
+///
+/// The manifest is a single budget rather than one per delegation: it is the
+/// list of what this view left out, and there is one view.
+fn carry_for_this_round(
+    outcomes: &[DelegateOutcome],
+) -> (Vec<Evidence>, Vec<ShapeSignal>, Vec<NotLoadedEntry>) {
+    let latest = outcomes.last();
+    let evidence = latest.map(|o| o.evidence.clone()).unwrap_or_default();
+    let shape = latest.map(|o| o.shape.clone()).unwrap_or_default();
+    let mut omitted = latest.map(|o| o.omitted.clone()).unwrap_or_default();
+
+    // What this round's view supersedes. Each entry names the delegation it came
+    // from, because "evidence from delegation 1" and "evidence from delegation
+    // 4" are different things to a reader deciding what to go and look at.
+    for (index, older) in outcomes.iter().enumerate().rev().skip(1) {
+        for e in &older.evidence {
+            let (address, how_to_load) = match &e.address {
+                Some(address) => (address.clone(), "delegate a reader for it".to_owned()),
+                // Saying "not addressable" is the honest entry. The manifest's
+                // contract is that an omitted thing is either reachable or
+                // explained, and inventing a plausible-looking address for
+                // something with nowhere to point would break it silently.
+                None => (
+                    "not addressable".to_owned(),
+                    "it cannot be loaded: this block has no record behind it".to_owned(),
+                ),
+            };
+            omitted.push(NotLoadedEntry {
+                what: format!("evidence from delegation {}: `{}`", index + 1, e.label),
+                address,
+                bytes: e.content.len() as u64,
+                why: "an earlier round's evidence — this view carries the latest round's"
+                    .to_owned(),
+                how_to_load,
+            });
+        }
+    }
+    (evidence, shape, omitted)
+}
+
+#[cfg(test)]
+mod round_material_tests {
+    use super::*;
+    use crate::render::Evidence;
+
+    fn outcome_with(index: usize, evidence_bytes: usize) -> DelegateOutcome {
+        let mut outcome = crate::delegate::tests_support::outcome_for(&format!("task {index}"));
+        outcome.evidence = vec![
+            Evidence::command(format!("cmd {index}"), "x".repeat(evidence_bytes), 0)
+                .addressed_to(format!("blob:digest{index}")),
+        ];
+        outcome.omitted = vec![NotLoadedEntry {
+            what: format!("`read_file` result {index}"),
+            address: format!("journal:seq={index}"),
+            bytes: 10,
+            why: "raw tool output".to_owned(),
+            how_to_load: "delegate a reader for it".to_owned(),
+        }];
+        outcome
+    }
+
+    /// The view does not grow with the number of rounds.
+    ///
+    /// Same latest round, ten times the history: the view's own material must be
+    /// identical. This is the property DESIGN's "大小有界" actually names, and
+    /// the one the accumulating version failed — its evidence grew with the
+    /// square of the round count.
+    #[test]
+    fn the_rounds_material_does_not_grow_with_the_runs_history() {
+        let short = vec![outcome_with(0, 500)];
+        let long: Vec<_> = (0..10).map(|i| outcome_with(i, 500)).collect();
+
+        let (short_evidence, _, short_omitted) = carry_for_this_round(&short);
+        let (long_evidence, _, long_omitted) = carry_for_this_round(&long);
+
+        assert_eq!(
+            short_evidence.len(),
+            long_evidence.len(),
+            "the evidence carried is the latest round's, however long the run"
+        );
+        assert_eq!(
+            short_evidence[0].content.len(),
+            long_evidence[0].content.len(),
+            "and it is the same size: {} vs {}",
+            short_evidence[0].content.len(),
+            long_evidence[0].content.len()
+        );
+        assert_eq!(
+            long_evidence[0].label, "cmd 9",
+            "the latest delegation's evidence is the one carried"
+        );
+
+        // More history means a longer *manifest*, not a longer view. That is the
+        // trade: addresses grow, payloads do not.
+        assert!(
+            long_omitted.len() > short_omitted.len(),
+            "the superseded evidence has to appear in the manifest, or the              manifest is claiming a completeness it does not have"
+        );
+    }
+
+    /// Nothing is dropped without being named.
+    ///
+    /// M2's criterion: "对记录里任意一条被省略的项,清单里要么有它,要么有它为什么不在".
+    #[test]
+    fn every_superseded_piece_of_evidence_is_named_in_the_manifest() {
+        let outcomes: Vec<_> = (0..4).map(|i| outcome_with(i, 100)).collect();
+        let (evidence, _, omitted) = carry_for_this_round(&outcomes);
+
+        assert_eq!(evidence.len(), 1, "only the latest is carried");
+        for superseded in 0..3 {
+            let needle = format!("evidence from delegation {}: `cmd {superseded}`", superseded + 1);
+            let entry = omitted
+                .iter()
+                .find(|e| e.what == needle)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "`{needle}` was dropped from the view and is not in the                          manifest either:
+{:#?}",
+                        omitted.iter().map(|e| &e.what).collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(
+                entry.address,
+                format!("blob:digest{superseded}"),
+                "an omitted thing has to be reachable, not merely mentioned"
+            );
+        }
+    }
+
+    #[test]
+    fn evidence_with_nowhere_to_point_says_so_rather_than_inventing_an_address() {
+        let mut old = outcome_with(0, 10);
+        old.evidence[0].address = None;
+        let outcomes = vec![old, outcome_with(1, 10)];
+        let (_, _, omitted) = carry_for_this_round(&outcomes);
+        let entry = omitted
+            .iter()
+            .find(|e| e.what.contains("cmd 0"))
+            .expect("the unaddressable block is still named");
+        assert_eq!(entry.address, "not addressable");
+        assert!(
+            entry.how_to_load.contains("cannot be loaded"),
+            "and the reader is told it cannot be fetched: {}",
+            entry.how_to_load
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_delegations_carries_nothing() {
+        let (evidence, shape, omitted) = carry_for_this_round(&[]);
+        assert!(evidence.is_empty() && shape.is_empty() && omitted.is_empty());
     }
 }
 

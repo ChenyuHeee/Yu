@@ -260,6 +260,19 @@ pub struct Evidence {
     pub content: String,
     /// `None` means nothing was actually executed.
     pub exit_code: Option<i32>,
+    /// Where the *full* output lives in the record.
+    ///
+    /// `content` can be a prefix — the executor's `render` shows twenty lines of
+    /// each block and says how many more there are — so an evidence block that
+    /// cannot be addressed is a claim whose proof is unreachable. It matters
+    /// most for the ones this view does not carry: a round's view holds the
+    /// latest delegation's evidence, and the earlier ones are *addressed* in the
+    /// manifest rather than rendered again.
+    ///
+    /// `None` when there is nothing behind it to reach: a block the executor
+    /// synthesised, or one whose output was already reduced to a pointer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
 }
 
 impl Evidence {
@@ -268,6 +281,7 @@ impl Evidence {
             label: label.into(),
             content: output.into(),
             exit_code: Some(exit_code),
+            address: None,
         }
     }
 
@@ -277,7 +291,14 @@ impl Evidence {
             label: label.into(),
             content: claim.into(),
             exit_code: None,
+            address: None,
         }
+    }
+
+    /// The same block, saying where its full output is.
+    pub fn addressed_to(mut self, address: impl Into<String>) -> Self {
+        self.address = Some(address.into());
+        self
     }
 
     pub fn passed(&self) -> Option<bool> {
@@ -842,12 +863,15 @@ fn render_l1(ledger: &Ledger) -> String {
             out.push_str(&format!("- {r}\n"));
         }
     }
-    if !ledger.retired.is_empty() {
-        out.push_str("\n## Retired (done, removed from state)\n");
-        for r in &ledger.retired {
-            out.push_str(&format!("- {} — {}\n", r.item, r.reason));
-        }
-    }
+    // `retired` is deliberately absent.
+    //
+    // DESIGN puts L1 under one rule: state contracts by **completion**, and
+    // "完成即移出,带理由" — the item leaves. A retirement log rendered here would
+    // be the one part of L1 that only ever grows, which is monotonic growth by
+    // round count: exactly what "渲染出来的,不是累积出来的 → 大小有界" forbids.
+    // A retired item is not state; it is a thing that happened, and things that
+    // happened live in the record, where the reason and the `removed` count are
+    // auditable and reversible. The ledger keeps the entries for the caller.
     out
 }
 
@@ -1072,9 +1096,46 @@ mod tests {
         assert_eq!(l.retired[0].reason, "done in commit 4f2a");
         // DESIGN: contraction is by completion, and the reason is what makes it
         // auditable and reversible.
+        // The reason is kept where it can be audited, which is the ledger and
+        // the record — not the view. See `retiring_does_not_grow_the_view`.
+        assert_eq!(l.retired[0].removed, 0, "nothing matched, and that is recorded");
+    }
+
+    /// Retirement contracts the view; it does not lengthen it.
+    ///
+    /// `retired` used to render here, which made it the one part of L1 that only
+    /// ever grew: eight rounds of finishing things meant eight more lines, and
+    /// DESIGN's rule for L1 is the opposite — "完成即移出,带理由", the item
+    /// leaves. A retirement is a thing that happened, and things that happened
+    /// live in the record. This is the guard on that, and it is also M2's
+    /// "视野不随轮数单调增长" at its smallest scale.
+    #[test]
+    fn retiring_does_not_grow_the_view() {
         let c = charter();
-        let view = render_with(&c, &l, &[], &[]);
-        assert!(intent(&view).contains("done in commit 4f2a"));
+        let l = empty_ledger();
+        let before = render_with(&c, &l, &[], &[]);
+
+        let mut l = empty_ledger();
+        for i in 0..8 {
+            l.retire(format!("finished item {i}"), format!("done in commit {i}"));
+        }
+        let after = render_with(&c, &l, &[], &[]);
+
+        assert_eq!(
+            l.retired.len(),
+            8,
+            "the ledger keeps the history for the caller's audit"
+        );
+        assert_eq!(
+            before.composition.total_chars, after.composition.total_chars,
+            "eight retirements changed the size of the view, so retirement is \
+             growing state rather than contracting it"
+        );
+        assert!(
+            !intent(&after).contains("finished item 3"),
+            "a retired item is not state and must not be rendered as any: {}",
+            intent(&after)
+        );
     }
 
     #[test]
@@ -1171,13 +1232,16 @@ mod tests {
 
         assert_eq!(l.retire("rewrite the parser", "done"), 1);
         assert!(!l.holds("rewrite the parser"));
-        // It appears once, under retired — not under both.
+        // It leaves state entirely. It used to stay in `decisions` *and* appear
+        // under `retired` — counted twice, with the view growing every round.
+        // Now it appears nowhere in the view, which is the stronger form of the
+        // same rule: a retired item is not state.
         let c = charter();
         let view = render_with(&c, &l, &[], &[]);
         assert_eq!(
             intent(&view).matches("rewrite the parser").count(),
-            1,
-            "a retired item must be stated once, not counted twice"
+            0,
+            "a retired item is done and gone, not restated"
         );
 
         assert_eq!(l.retire("should we cache?", "answered by the load test"), 1);

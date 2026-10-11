@@ -256,10 +256,21 @@ pub async fn outcome_from_run(
                     // as genuinely unknown — never defaulted to success.
                     let text = inline.clone().unwrap_or_default();
                     let exit_code = parse_exit_code(command, &text);
+                    // Where the full output is, so a block this view does not
+                    // carry can still be pulled back. The same address the
+                    // omitted entries below use, computed the same way: a
+                    // spilled result is reachable by digest, an inline one by
+                    // its position in the record.
+                    let address = match (blob, inline.is_some()) {
+                        (Some(digest), _) => format!("blob:{digest}"),
+                        (None, true) => format!("journal:seq={}", event.seq),
+                        (None, false) => format!("journal:seq={} (dropped by reduction)", event.seq),
+                    };
                     evidence.push(Evidence {
                         label: command.clone(),
                         content: text,
                         exit_code,
+                        address: Some(address),
                     });
                     pending = None;
                     continue;
@@ -407,6 +418,18 @@ fn describe_signal(s: &ShapeSignal) -> String {
 /// The description is part of the prompt surface: it is where the decision layer
 /// learns that a delegation returns a report and not a transcript, so it should
 /// ask a question rather than expect to inspect the work.
+/// The whole surface the decision layer is offered, in one place.
+///
+/// A function rather than a list assembled at the call site, because the prompt
+/// advertises a surface and the request must carry the same one. Two places that
+/// name the tools drift, and the drift is invisible in both directions: the
+/// model is told about a tool it cannot call, or handed one it was never told
+/// about. `decision_layer_advertises_exactly_the_tools_it_is_offered` compares
+/// this list against the prompt's own.
+pub fn decision_surface() -> Vec<ToolDefinition> {
+    vec![delegate_tool()]
+}
+
 pub fn delegate_tool() -> ToolDefinition {
     ToolDefinition::Custom(CustomTool::new(
         "delegate",
