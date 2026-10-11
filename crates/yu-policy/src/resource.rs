@@ -446,7 +446,7 @@ respect; do not assume any constraint you were not given.
 
 [tool_descriptions]
 delegate = "Hand a self-contained task to a fresh execution agent."
-spot_check = "Ask for a runnable artifact that proves a claim. Expensive."
+spot_check = "Pull one thing from the record into your own context, by its address. Billed to the context you have least of, so it is a scarce action, not a habit."
 
 [roles.decision]
 prompt = "decision_charter"
@@ -505,9 +505,14 @@ mod tests {
             .expect("the example declares a decision charter");
         assert!(charter.contains("You are the decision layer"));
 
+        // The description has to describe the tool that exists: this one pulls
+        // a thing out of the record by its address. It said "ask for a runnable
+        // artifact that proves a claim", which is a different tool — and a
+        // policy that advertises a description the loop does not use is a
+        // second, contradicting account of the surface.
         assert_eq!(
             policy.tool_description("spot_check"),
-            Some("Ask for a runnable artifact that proves a claim. Expensive.")
+            Some("Pull one thing from the record into your own context, by its address. Billed to the context you have least of, so it is a scarce action, not a habit.")
         );
         assert_eq!(
             policy.roles["decision"].prompt.as_deref(),

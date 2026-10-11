@@ -314,7 +314,15 @@ impl Evidence {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotLoadedEntry {
     pub what: String,
-    /// How to reach it: a record seq range, a blob digest, or a path.
+    /// How to reach it, in a form something can actually follow.
+    ///
+    /// The producers in `crate::delegate` emit exactly three forms —
+    /// `blob:<digest>`, `journal:seq=<n>`, and `journal:seq=<n> (dropped by
+    /// reduction)` — and `crate::spot::resolve` follows exactly those. An
+    /// earlier version of this comment advertised "a record seq range, or a
+    /// path", neither of which any producer emits and neither of which anything
+    /// can resolve: a doc comment that describes an address language nobody
+    /// speaks is how a manifest starts promising things it cannot deliver.
     pub address: String,
     pub bytes: u64,
     /// Why it was left out. A manifest that does not say why is a shrug.

@@ -346,7 +346,13 @@ pub async fn outcome_from_run(
                     omitted.push(NotLoadedEntry {
                         what: "reasoning from an executor turn".to_owned(),
                         address: format!("blob:{}", record.text_blob),
-                        bytes: 0,
+                        // The blob's real size, not zero. A manifest that says
+                        // an entry is free while the bytes sit in the store is
+                        // understating what the run cost — and the entry above
+                        // this one exists precisely so a reader can decide what
+                        // is worth fetching, which they cannot do from a size
+                        // that is always wrong in the same direction.
+                        bytes: journal.blobs().size(&record.text_blob).unwrap_or(0),
                         why: "the executor's reasoning is not evidence of anything".to_owned(),
                         how_to_load: "delegate a reader for it".to_owned(),
                     });
