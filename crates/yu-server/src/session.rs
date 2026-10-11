@@ -23,8 +23,10 @@
 //! the final line, and [`decode_line`] rejects it instead of acting on half a
 //! request.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use yu_observe::AgentId;
 
@@ -418,6 +420,14 @@ mod tests {
 // A host whose sessions live on disk
 // ---------------------------------------------------------------------------
 
+/// The file that makes a directory a session.
+///
+/// `launch` writes it and the scan reads it, so there is exactly one definition
+/// of what a session is. The alternative — a filter on the entry's *name* — is a
+/// second definition that no writer is obliged to agree with, and it would rot
+/// the moment ids change shape.
+const SESSION_RECORD: &str = "info.json";
+
 /// Sessions backed by a directory: one subdirectory each, holding the session's
 /// own record.
 ///
@@ -445,7 +455,7 @@ impl DirectoryHost {
     }
 
     fn info_path(&self, session: &str) -> PathBuf {
-        self.dir_for(session).join("info.json")
+        self.dir_for(session).join(SESSION_RECORD)
     }
 
     fn write_info(&self, info: &SessionInfo) -> Result<(), ServerError> {
@@ -473,6 +483,13 @@ impl DirectoryHost {
 impl DirectoryHost {
     /// One session directory, read back. Split out so both the trait's
     /// `sessions` and `thread_recovery` read the same way.
+    ///
+    /// The state directory holds more than sessions. DESIGN puts L2 beside the
+    /// state it describes, so the CLI lays its journal (`<session>.jsonl`) and
+    /// its blob store (`blobs/`) down in this same directory; neither is a
+    /// session, and reporting them as crashed ones would grow the session list
+    /// by whatever else happens to live there — a daemon that invents a dead
+    /// session every time the CLI runs cannot be used to ask what died.
     fn read_sessions(&self) -> Result<Vec<SessionInfo>, ServerError> {
         let mut out = Vec::new();
         let entries = match std::fs::read_dir(&self.root) {
@@ -482,25 +499,56 @@ impl DirectoryHost {
             Err(e) => return Err(ServerError::Io(e)),
         };
         for entry in entries.flatten() {
-            let id = entry.file_name().to_string_lossy().into_owned();
-            match std::fs::read_to_string(entry.path().join("info.json"))
-                .ok()
-                .and_then(|text| serde_json::from_str::<SessionInfo>(&text).ok())
-            {
-                Some(info) => out.push(info),
-                None => out.push(SessionInfo {
-                    id,
-                    status: SessionStatus::Crashed {
-                        at_ms: yu_observe::now_ms(),
-                    },
-                    created_ms: 0,
-                    last_active_ms: 0,
-                    journal_dir: entry.path(),
-                }),
+            if let Some(info) = Self::session_at(&entry.path()) {
+                out.push(info);
             }
         }
         out.sort_by_key(|s| s.created_ms);
         Ok(out)
+    }
+
+    /// One entry of the state directory, read as a session — or `None` when the
+    /// entry is something else that lives here (a journal file, the blob store,
+    /// anything a human left behind).
+    ///
+    /// What decides it is the record `launch` writes, not the entry's name: a
+    /// directory holding [`SESSION_RECORD`] is a session, whether or not the
+    /// record still decodes. A record that is *present and broken* is the
+    /// damaged case recovery exists for, so it is reported as [`SessionStatus::
+    /// Crashed`] rather than dropped; a record that was never there says nothing
+    /// was ever a session, so there is nothing to report.
+    fn session_at(path: &Path) -> Option<SessionInfo> {
+        if !path.is_dir() {
+            return None;
+        }
+        let id = path.file_name()?.to_string_lossy().into_owned();
+        match std::fs::read_to_string(path.join(SESSION_RECORD)) {
+            Ok(text) => Some(
+                serde_json::from_str::<SessionInfo>(&text)
+                    .unwrap_or_else(|_| unreadable_session(id, path)),
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(unreadable_session(id, path)),
+        }
+    }
+}
+
+/// A session whose record cannot be read: known by the directory it lives in,
+/// and reported as the interruption recovery is for.
+///
+/// The timestamps are zero because the record that would have carried them is
+/// exactly what is missing; inventing `now` for `created_ms` would put the
+/// session at the end of a `created_ms`-ordered list, which is a claim about
+/// when it was made that nothing supports.
+fn unreadable_session(id: String, dir: &Path) -> SessionInfo {
+    SessionInfo {
+        id,
+        status: SessionStatus::Crashed {
+            at_ms: yu_observe::now_ms(),
+        },
+        created_ms: 0,
+        last_active_ms: 0,
+        journal_dir: dir.to_path_buf(),
     }
 }
 
@@ -564,40 +612,98 @@ impl SessionHost for DirectoryHost {
 /// daemon half; `Embedded` is the same protocol with the socket removed, which is
 /// why nothing here holds session state that a caller could not hold itself.
 ///
-/// One connection is one client. Frames are decoded one line at a time and a
-/// malformed line produces an error frame rather than closing the connection —
-/// a client that sent one bad frame should not lose the session it was talking
-/// about.
-pub async fn serve<S: SessionHost>(
+/// One connection is one client, and clients do not take turns: every accepted
+/// connection is driven *alongside* this loop rather than inside it, so a client
+/// that is waiting — mid-frame, or simply holding its connection open between
+/// requests, which is what a live client looks like — cannot keep the next one
+/// out. DESIGN's daemon is the process several front ends attach to; attaching
+/// is only independent if it does not queue behind whoever attached first.
+///
+/// The accept loop's own failure is still fatal (the listener is the daemon's,
+/// not a client's), but nothing a *connection* does reaches it: a client whose
+/// socket fails takes its own connection down and nobody else's. See
+/// [`serve_frames`], where that boundary is drawn.
+///
+/// Frames are decoded one line at a time and a malformed line produces an error
+/// frame rather than closing the connection — a client that sent one bad frame
+/// should not lose the session it was talking about.
+///
+/// `S: Sync` is what lets several connections hold the host at once. The
+/// connections are borrowed from this frame instead of spawned, which is why the
+/// loop drives them itself: a task per connection would need an owned host and
+/// therefore a different signature. That trade has a floor worth naming, since
+/// `SessionHost`'s methods are synchronous: a host call that blocks is felt by
+/// every connection this loop is driving, where a task would confine it. Nothing
+/// in the host blocks today — revisit here, not at the call sites, when
+/// something does.
+pub async fn serve<S: SessionHost + Sync>(
     listener: tokio::net::UnixListener,
     host: &S,
     config: ServerConfig,
 ) -> Result<(), ServerError> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let mut clients = FuturesUnordered::new();
 
     loop {
-        let (stream, _) = listener.accept().await?;
-        let (read, mut write) = stream.into_split();
-        let mut lines = BufReader::new(read).lines();
-
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                clients.push(serve_client(stream, host, &config));
             }
-            let responses = match decode_line::<Request>(&line) {
-                Ok(request) => handle(host, &config, request),
-                Err(e) => vec![Response::Error {
-                    message: format!("could not read the request: {e}"),
-                }],
-            };
-            for response in responses {
-                // A frame that cannot be written ends the connection: the client
-                // is gone, and pretending otherwise leaves a half-written frame
-                // on a socket nobody is reading.
-                write.write_all(encode_line(&response)?.as_bytes()).await?;
-            }
+            // The guard is load-bearing: an empty `FuturesUnordered` is ready at
+            // once with `None`, and a select branch that is always ready spins.
+            _ = clients.next(), if !clients.is_empty() => {}
         }
     }
+}
+
+/// One client's conversation, with the error boundary around it.
+///
+/// Everything a connection can fail at — a read that goes wrong, a write to a
+/// client that has already gone away (EPIPE: the client asked and left before
+/// the answer could land) — stops here. Returning it to the accept loop would
+/// end the daemon for every *other* client, which is the one outcome a socket
+/// error must never have: a client's problem is not allowed to become the
+/// server's. It is logged because by this point there is nobody else to tell —
+/// the client that would have heard it is the one that is gone.
+async fn serve_client<S: SessionHost + Sync>(
+    stream: tokio::net::UnixStream,
+    host: &S,
+    config: &ServerConfig,
+) {
+    if let Err(e) = serve_frames(stream, host, config).await {
+        tracing::warn!("closing a client connection that failed: {e}");
+    }
+}
+
+/// The framing loop for one connection.
+async fn serve_frames<S: SessionHost>(
+    stream: tokio::net::UnixStream,
+    host: &S,
+    config: &ServerConfig,
+) -> Result<(), ServerError> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+
+    while let Some(line) = lines.next_line().await? {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let responses = match decode_line::<Request>(&line) {
+            Ok(request) => handle(host, config, request),
+            Err(e) => vec![Response::Error {
+                message: format!("could not read the request: {e}"),
+            }],
+        };
+        for response in responses {
+            // A frame that cannot be written ends the connection: the client
+            // is gone, and pretending otherwise leaves a half-written frame
+            // on a socket nobody is reading.
+            write.write_all(encode_line(&response)?.as_bytes()).await?;
+        }
+    }
+    Ok(())
 }
 
 /// `handle`, exposed for tests. The socket loop is the only production caller.
