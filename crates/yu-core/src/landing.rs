@@ -57,6 +57,12 @@ pub struct PlannedOutcomes {
 /// What the executor said about its own result.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Landing {
+    /// Which set this landing was read against.
+    ///
+    /// Carried because a landing without its set is unreadable: `pass` means
+    /// nothing until you know what the alternatives were, and a tally keyed by
+    /// slot alone would merge two different sets' vocabularies.
+    pub set: String,
     /// The slot it chose. Always a member of the set, or [`OTHER`].
     pub slot: String,
     /// Its one-line reason, in its own words.
@@ -132,7 +138,7 @@ pub fn land_tool(slots: &[String], description: Option<&str>) -> ToolDefinition 
 /// what [`OTHER`] is for, and refusing it would push the executor into picking a
 /// slot it does not believe in. The raw word is kept so the difference between
 /// "a surprise" and "a badly named set" stays visible downstream.
-pub fn read_landing(input: &Value, slots: &[String]) -> Landing {
+pub fn read_landing(input: &Value, slots: &[String], set: &str) -> Landing {
     let named = input
         .get("slot")
         .and_then(Value::as_str)
@@ -148,11 +154,13 @@ pub fn read_landing(input: &Value, slots: &[String]) -> Landing {
 
     match named {
         Some(name) if name == OTHER || slots.iter().any(|s| s == &name) => Landing {
+            set: set.to_owned(),
             slot: name,
             why,
             unlisted: None,
         },
         Some(name) => Landing {
+            set: set.to_owned(),
             slot: OTHER.to_owned(),
             why,
             unlisted: Some(name),
@@ -161,6 +169,7 @@ pub fn read_landing(input: &Value, slots: &[String]) -> Landing {
         // not follow it; the result is still unpredicted, which is what `other`
         // says, and `why` carries whatever it did say.
         None => Landing {
+            set: set.to_owned(),
             slot: OTHER.to_owned(),
             why,
             unlisted: None,
@@ -232,6 +241,7 @@ mod tests {
         let landing = read_landing(
             &json!({"slot": "compile_error", "why": "error[E0308] on line 4"}),
             &slots(),
+            "build",
         );
         assert_eq!(landing.slot, "compile_error");
         assert_eq!(landing.why, "error[E0308] on line 4");
@@ -250,6 +260,7 @@ mod tests {
         let landing = read_landing(
             &json!({"slot": "disk_full", "why": "no space left on device"}),
             &slots(),
+            "build",
         );
         assert_eq!(landing.slot, OTHER);
         assert!(landing.is_other());
@@ -264,7 +275,7 @@ mod tests {
 
     #[test]
     fn a_call_with_no_slot_is_other_rather_than_a_refusal() {
-        let landing = read_landing(&json!({"why": "it went sideways"}), &slots());
+        let landing = read_landing(&json!({"why": "it went sideways"}), &slots(), "build");
         assert_eq!(landing.slot, OTHER);
         assert_eq!(landing.unlisted, None);
         assert_eq!(landing.why, "it went sideways");
@@ -273,7 +284,7 @@ mod tests {
     #[test]
     fn a_slot_that_is_not_a_string_is_other_rather_than_a_panic() {
         for bad in [json!({"slot": 7}), json!({"slot": null}), json!({"slot": ""}), json!({})] {
-            let landing = read_landing(&bad, &slots());
+            let landing = read_landing(&bad, &slots(), "build");
             assert_eq!(
                 landing.slot, OTHER,
                 "a malformed slot is still an unpredicted result: {bad}"

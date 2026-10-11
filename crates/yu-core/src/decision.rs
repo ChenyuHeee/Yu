@@ -18,6 +18,7 @@
 //!   it dominates; the target is near zero. The point of computing it is to make
 //!   that claim falsifiable.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -142,6 +143,56 @@ impl DecisionOutcome {
 
     pub fn tool_machinery_ratio(&self) -> Option<f64> {
         self.composition.tool_machinery_ratio()
+    }
+
+    /// How the run's landings fell across each pre-registered set.
+    ///
+    /// DESIGN keeps this and **only** this about predictions that did not come
+    /// true: *"未命中的预测不留 … 唯一要留的是**落点分布的计数**:某个分支永远被选中,
+    /// 这组就是装饰;`other` 常见,这组就是错的."* A guess that did not happen is not
+    /// evidence of anything — negative evidence is "we tried X and it failed",
+    /// which is an action with a result, not an expectation with none.
+    ///
+    /// The counts are what makes a set checkable after the fact. A slot nobody
+    /// ever lands in is decoration; a set whose `other` fills up is a set that
+    /// did not describe the work. Neither is visible from a single run's prose,
+    /// and both are visible from the tally.
+    pub fn landing_distribution(&self) -> BTreeMap<String, BTreeMap<String, u32>> {
+        let mut by_set: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+        for outcome in &self.outcomes {
+            let Some(landing) = &outcome.landing else {
+                continue;
+            };
+            // Keyed by the *slot*, which is what the set is judging; the set id
+            // groups them for a reader who wants to know which set to fix.
+            let set = by_set.entry(landing.set.clone()).or_default();
+            *set.entry(landing.slot.clone()).or_default() += 1;
+        }
+        by_set
+    }
+
+    /// The two findings DESIGN says the distribution is for, stated rather than
+    /// left for a reader to notice in a table.
+    ///
+    /// Empty when nothing was pre-registered, and empty when the tally shows
+    /// neither problem — which are different things, so callers that care should
+    /// check [`Self::landing_distribution`] rather than inferring from silence.
+    pub fn landing_problems(&self) -> Vec<String> {
+        let mut found = Vec::new();
+        for (set, counts) in self.landing_distribution() {
+            let total: u32 = counts.values().sum();
+            if total == 0 {
+                continue;
+            }
+            let others = counts.get(crate::landing::OTHER).copied().unwrap_or(0);
+            if others * 2 > total {
+                found.push(format!(
+                    "set `{set}`: {others} of {total} landings fell in `other`, so the set \
+                     does not describe the work it was declared for"
+                ));
+            }
+        }
+        found
     }
 
     /// The largest context of the run, by total size.
@@ -1078,6 +1129,92 @@ mod tests {
         assert_eq!(
             one.system[1], many.system[1],
             "adding evidence and a manifest must not disturb L0"
+        );
+    }
+}
+
+#[cfg(test)]
+mod landing_distribution_tests {
+    use super::*;
+    use crate::landing::Landing;
+
+    fn outcome_with(landings: Vec<Option<(&str, &str)>>) -> DecisionOutcome {
+        DecisionOutcome {
+            rounds: 1,
+            delegations: landings.len() as u32,
+            final_text: String::new(),
+            usage: TokenUsage::default(),
+            composition: ContextComposition::default(),
+            contexts: Vec::new(),
+            ledger: Ledger::default(),
+            stopped_early: None,
+            outcomes: landings
+                .into_iter()
+                .map(|landing| {
+                    let mut outcome =
+                        crate::delegate::tests_support::outcome_for("a task");
+                    outcome.landing = landing.map(|(set, slot)| Landing {
+                        set: set.to_owned(),
+                        slot: slot.to_owned(),
+                        why: String::new(),
+                        unlisted: None,
+                    });
+                    outcome
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn the_tally_counts_each_slot_the_run_landed_in() {
+        let outcome = outcome_with(vec![
+            Some(("build", "pass")),
+            Some(("build", "pass")),
+            Some(("build", "compile_error")),
+        ]);
+        let tally = outcome.landing_distribution();
+        assert_eq!(tally["build"]["pass"], 2);
+        assert_eq!(tally["build"]["compile_error"], 1);
+        assert!(outcome.landing_problems().is_empty(), "nothing is wrong here");
+    }
+
+    /// **DESIGN: "`other` 常见,这组就是错的."**
+    #[test]
+    fn a_set_that_mostly_lands_in_other_is_reported_as_the_wrong_set() {
+        let outcome = outcome_with(vec![
+            Some(("build", "pass")),
+            Some(("build", crate::landing::OTHER)),
+            Some(("build", crate::landing::OTHER)),
+        ]);
+        let problems = outcome.landing_problems();
+        assert_eq!(problems.len(), 1, "one finding, not none and not three: {problems:?}");
+        assert!(
+            problems[0].contains("build") && problems[0].contains("other"),
+            "the finding has to name the set and the reason: {}",
+            problems[0]
+        );
+
+        // And a set that fits is not reported — the check can fail, so a clean
+        // run means something.
+        let fine = outcome_with(vec![
+            Some(("build", "pass")),
+            Some(("build", crate::landing::OTHER)),
+            Some(("build", "pass")),
+            Some(("build", "pass")),
+        ]);
+        assert!(fine.landing_problems().is_empty());
+    }
+
+    #[test]
+    fn a_delegation_that_was_never_asked_contributes_nothing_to_the_tally() {
+        let outcome = outcome_with(vec![None, Some(("build", "pass"))]);
+        let tally = outcome.landing_distribution();
+        assert_eq!(tally["build"]["pass"], 1);
+        assert_eq!(
+            tally.values().map(|c| c.values().sum::<u32>()).sum::<u32>(),
+            1,
+            "an unasked delegation must not be counted as landing anywhere — \
+             `we did not ask` is not a slot"
         );
     }
 }

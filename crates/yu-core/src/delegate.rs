@@ -396,12 +396,17 @@ pub async fn outcome_from_run(
     // unreachable prose (see `LoopOutcome::stopped_early`).
     let stopped_early = run.stopped_early;
     let landing = match (planned, landing_input) {
-        (Some(planned), Some(input)) => Some(crate::landing::read_landing(&input, &planned.slots)),
+        (Some(planned), Some(input)) => Some(crate::landing::read_landing(
+            &input,
+            &planned.slots,
+            &planned.id,
+        )),
         // Asked, and did not answer. That is itself a finding, and it is
         // reported as an unpredicted result rather than as an absent one: the
         // report may still be prose, but nothing in it was classified, so
         // nothing in it has been checked.
-        (Some(_), None) => Some(crate::landing::Landing {
+        (Some(planned), None) => Some(crate::landing::Landing {
+            set: planned.id.clone(),
             slot: crate::landing::OTHER.to_owned(),
             why: "the executor did not classify its result".to_owned(),
             unlisted: None,
