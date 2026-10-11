@@ -1,0 +1,1688 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="Command surface, configuration, and integration reference for the Yu agent harness.">
+      
+      
+      
+        <link rel="canonical" href="https://chenyuheee.github.io/Yu/integration/endpoint/">
+      
+      
+        <link rel="prev" href="../embedding/">
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Endpoint compatibility - Yu — CLI and Developer Manual</title>
+      
+    
+    
+      <link rel="stylesheet" href="../../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("../..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#endpoint-compatibility" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href="../.." title="Yu — CLI and Developer Manual" class="md-header__button md-logo" aria-label="Yu — CLI and Developer Manual" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            Yu — CLI and Developer Manual
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Endpoint compatibility
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m17.75 4.09-2.53 1.94.91 3.06-2.63-1.81-2.63 1.81.91-3.06-2.53-1.94L12.44 4l1.06-3 1.06 3zm3.5 6.91-1.64 1.25.59 1.98-1.7-1.17-1.7 1.17.59-1.98L15.75 11l2.06-.05L18.5 9l.69 1.95zm-2.28 4.95c.83-.08 1.72 1.1 1.19 1.85-.32.45-.66.87-1.08 1.27C15.17 23 8.84 23 4.94 19.07c-3.91-3.9-3.91-10.24 0-14.14.4-.4.82-.76 1.27-1.08.75-.53 1.93.36 1.85 1.19-.27 2.86.69 5.83 2.89 8.02a9.96 9.96 0 0 0 8.02 2.89m-1.64 2.02a12.08 12.08 0 0 1-7.8-3.47c-2.17-2.19-3.33-5-3.49-7.82-2.81 3.14-2.7 7.96.31 10.98 3.02 3.01 7.84 3.12 10.98.31"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 7a5 5 0 0 1 5 5 5 5 0 0 1-5 5 5 5 0 0 1-5-5 5 5 0 0 1 5-5m0 2a3 3 0 0 0-3 3 3 3 0 0 0 3 3 3 3 0 0 0 3-3 3 3 0 0 0-3-3m0-7 2.39 3.42C13.65 5.15 12.84 5 12 5s-1.65.15-2.39.42zM3.34 7l4.16-.35A7.2 7.2 0 0 0 5.94 8.5c-.44.74-.69 1.5-.83 2.29zm.02 10 1.76-3.77a7.131 7.131 0 0 0 2.38 4.14zM20.65 7l-1.77 3.79a7.02 7.02 0 0 0-2.38-4.15zm-.01 10-4.14.36c.59-.51 1.12-1.14 1.54-1.86.42-.73.69-1.5.83-2.29zM12 22l-2.41-3.44c.74.27 1.55.44 2.41.44.82 0 1.63-.17 2.37-.44z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/ChenyuHeee/Yu" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+
+<nav class="md-nav md-nav--primary" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href="../.." title="Yu — CLI and Developer Manual" class="md-nav__button md-logo" aria-label="Yu — CLI and Developer Manual" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    Yu — CLI and Developer Manual
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/ChenyuHeee/Yu" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    GitHub
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../.." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../install/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../configuration/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Configuration
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+          
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <div class="md-nav__link md-nav__container">
+            <a href="../../commands/" class="md-nav__link ">
+              
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Commands
+  
+
+    
+  </span>
+  
+  
+
+            </a>
+            
+              
+              <label class="md-nav__link " for="__nav_3" id="__nav_3_label" tabindex="">
+                <span class="md-nav__icon md-icon"></span>
+              </label>
+            
+          </div>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Commands
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/probe/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    yu probe
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/exec/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    yu exec
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/run/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    yu run
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/decide/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    yu decide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/metrics/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    yu metrics
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/fork/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    yu fork
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../commands/daemon/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    yu daemon
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/tools/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Tools
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/policy/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Policy file
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../reference/record/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Record format
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+      
+        
+      
+        
+      
+    
+    
+    
+      
+        
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Integration
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_5">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Integration
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../embedding/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Embedding the crates
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Endpoint compatibility
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Endpoint compatibility
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#capability-matrix" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Capability matrix
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Capability matrix">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-this-costs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What this costs
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#quirks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirks
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Quirks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#quirk-1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 1 — thinking blocks must be replayed
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quirk-2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 2 — identifier shapes differ
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quirk-3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 3 — prefix caching is automatic, cache_control is inert
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quirk-4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 4 — input_tokens excludes thinking blocks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quirk-5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 5 — 422 and 400 are different failure classes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quirk-6" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 6 — 401 leaks the last 4 characters of the key
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#streaming-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Streaming notes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#stop_reason" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        stop_reason
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#running-against-anthropic" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Running against Anthropic
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+              
+              <div class="md-sidebar md-sidebar--secondary" data-md-component="sidebar" data-md-type="toc" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#capability-matrix" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Capability matrix
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Capability matrix">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#what-this-costs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        What this costs
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#quirks" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirks
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Quirks">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#quirk-1" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 1 — thinking blocks must be replayed
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quirk-2" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 2 — identifier shapes differ
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quirk-3" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 3 — prefix caching is automatic, cache_control is inert
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quirk-4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 4 — input_tokens excludes thinking blocks
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quirk-5" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 5 — 422 and 400 are different failure classes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#quirk-6" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quirk 6 — 401 leaks the last 4 characters of the key
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#streaming-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Streaming notes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#stop_reason" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        stop_reason
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#running-against-anthropic" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Running against Anthropic
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="endpoint-compatibility">Endpoint compatibility<a class="headerlink" href="#endpoint-compatibility" title="Permanent link">&para;</a></h1>
+<p>The Messages API is a specification. Against any endpoint but Anthropic's it is
+a hypothesis, and a server that accepts a field and ignores it will let a client
+believe it has a feature it does not have.</p>
+<p>Everything on this page was <strong>measured</strong>, not assumed. Re-measure against your
+own endpoint before relying on any of it:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>yu<span class="w"> </span>probe
+</code></pre></div>
+<div class="admonition note">
+<p class="admonition-title">Reference measurement</p>
+<p>Endpoint <code>https://api.deepseek.com/anthropic</code>, model <code>deepseek-flash[1m]</code>,
+measured 2026-10-10. Treat the values below as one endpoint's answers, not
+as properties of the API.</p>
+</div>
+<h2 id="capability-matrix">Capability matrix<a class="headerlink" href="#capability-matrix" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Feature</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>POST /v1/messages</code></td>
+<td>works</td>
+</tr>
+<tr>
+<td>SSE streaming</td>
+<td>works — Anthropic event names verbatim, including <code>ping</code></td>
+</tr>
+<tr>
+<td><code>thinking</code></td>
+<td><strong>always emitted</strong>, even for <code>"reply ok"</code> at <code>max_tokens: 16</code></td>
+</tr>
+<tr>
+<td><code>thinking: {type:"adaptive"}</code></td>
+<td>accepted</td>
+</tr>
+<tr>
+<td><code>thinking: {type:"adaptive", display:"summarized"}</code></td>
+<td>accepted</td>
+</tr>
+<tr>
+<td><code>thinking: {type:"enabled", budget_tokens:N}</code></td>
+<td>accepted — Anthropic rejects this</td>
+</tr>
+<tr>
+<td><code>thinking.display</code> effect</td>
+<td><strong>unverified</strong> — thinking text came back non-empty either way</td>
+</tr>
+<tr>
+<td><code>output_config.effort</code></td>
+<td>accepted, effect unverified</td>
+</tr>
+<tr>
+<td><code>output_config.format</code></td>
+<td>accepted, effect unverified</td>
+</tr>
+<tr>
+<td><code>cache_control</code> breakpoints</td>
+<td><strong>inert</strong> — caching is automatic</td>
+</tr>
+<tr>
+<td>Mid-conversation <code>{"role":"system"}</code></td>
+<td>accepted</td>
+</tr>
+<tr>
+<td><code>stop_sequences</code></td>
+<td>accepted</td>
+</tr>
+<tr>
+<td><code>POST /v1/messages/count_tokens</code></td>
+<td>works</td>
+</tr>
+<tr>
+<td>Custom tools with <code>input_schema</code></td>
+<td>works</td>
+</tr>
+<tr>
+<td><code>strict: true</code> on a tool</td>
+<td>accepted</td>
+</tr>
+<tr>
+<td><code>tool_choice: {type:"any"}</code></td>
+<td>accepted — Anthropic rejects this on current models</td>
+</tr>
+<tr>
+<td>Parallel <code>tool_use</code> (2 in one turn)</td>
+<td>works</td>
+</tr>
+<tr>
+<td><code>tool_result.is_error</code></td>
+<td>works</td>
+</tr>
+<tr>
+<td><code>web_search_20260209</code> (server tool)</td>
+<td>works — cost 67 372 input tokens in one call</td>
+</tr>
+<tr>
+<td><code>web_search_20250305</code></td>
+<td>accepted</td>
+</tr>
+<tr>
+<td><code>bash_20250124</code></td>
+<td><strong>rejected, 422 <code>unknown variant</code></strong></td>
+</tr>
+<tr>
+<td><code>text_editor_20250728</code></td>
+<td><strong>rejected, 422 <code>unknown variant</code></strong></td>
+</tr>
+<tr>
+<td><code>tool_search_tool_*</code> + <code>defer_loading</code></td>
+<td><strong>rejected, 422</strong></td>
+</tr>
+<tr>
+<td><code>mcp_servers</code> / <code>mcp_toolset</code></td>
+<td><strong>rejected, 422</strong></td>
+</tr>
+<tr>
+<td><code>GET /v1/models</code></td>
+<td><strong>404</strong></td>
+</tr>
+<tr>
+<td><code>context_management.edits</code></td>
+<td>accepted, <strong>assumed inert</strong></td>
+</tr>
+<tr>
+<td><code>task_budget</code></td>
+<td>accepted, <strong>assumed inert</strong></td>
+</tr>
+<tr>
+<td><code>fallbacks</code></td>
+<td>accepted, <strong>assumed inert</strong></td>
+</tr>
+<tr>
+<td><code>anthropic-beta</code> header</td>
+<td><strong>ignored</strong> — accepted fields are accepted with or without it</td>
+</tr>
+<tr>
+<td>Authentication</td>
+<td>enforced. <code>x-api-key</code> works; a bad key returns 401</td>
+</tr>
+</tbody>
+</table>
+<h3 id="what-this-costs">What this costs<a class="headerlink" href="#what-this-costs" title="Permanent link">&para;</a></h3>
+<ul>
+<li><strong>Schema-less server tools are unavailable.</strong> <code>bash_20250124</code> and
+  <code>text_editor_20250728</code> are both rejected, so every tool must declare an
+  <code>input_schema</code>.</li>
+<li><strong><code>tool_search</code> and <code>defer_loading</code> are unavailable</strong>, so the startup cost of
+  a large tool surface cannot be reduced this way.</li>
+<li><strong>Server-side compaction is accepted and does nothing.</strong> Treat
+  <code>context_management</code>, server compaction, and <code>task_budget</code> as inert. Anything
+  that manages context has to be done client-side.</li>
+<li><strong><code>web_search_20260209</code> is the one working server tool</strong>, and it produces
+  exactly the unbounded result shape the reduction table exists to handle.</li>
+</ul>
+<h2 id="quirks">Quirks<a class="headerlink" href="#quirks" title="Permanent link">&para;</a></h2>
+<p>Behavioural divergences from Anthropic. Each one is something a client must
+special-case.</p>
+<h3 id="quirk-1">Quirk 1 — thinking blocks must be replayed<a class="headerlink" href="#quirk-1" title="Permanent link">&para;</a></h3>
+<p>Reconstructing an assistant turn without its <code>thinking</code> block fails:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>400 invalid_request_error
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>The `content[].thinking` in the thinking mode must be passed back to the API.
+</code></pre></div>
+<p>The message does not name the offending message. The precise rule, established
+over 16 probe cases:</p>
+<table>
+<thead>
+<tr>
+<th>Case</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fabricated <code>tool_use</code> id, no <code>thinking</code></td>
+<td><strong>400</strong> — for every id format tried</td>
+</tr>
+<tr>
+<td>Fabricated id, <strong>any</strong> <code>thinking</code> block</td>
+<td><strong>200</strong> — the <code>signature</code> is <strong>not validated</strong></td>
+</tr>
+<tr>
+<td>An id the endpoint itself issued, no <code>thinking</code></td>
+<td><strong>200</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The endpoint keeps its issued tool calls server-side and only demands the
+<code>thinking</code> block when it cannot recognise the id.</p>
+<p><strong>Consequences.</strong></p>
+<ol>
+<li><strong>Replay <code>thinking</code> blocks byte-exact.</strong> It is free, it satisfies the strict
+   case, and it is what Anthropic's preserved thinking requires anyway.
+   <code>yu-wire</code> enforces this when assembling history rather than letting a doomed
+   request go out and fail with a confusing error.</li>
+<li><strong>Fork and replay are feasible.</strong> Because <code>signature</code> is unvalidated, a
+   forked branch may carry synthesised thinking blocks. Rewriting history does
+   not fail the way Anthropic's preserved-thinking check would.</li>
+</ol>
+<h3 id="quirk-2">Quirk 2 — identifier shapes differ<a class="headerlink" href="#quirk-2" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Anthropic</th>
+<th>This endpoint</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Message id</td>
+<td><code>msg_01…</code></td>
+<td>UUID, e.g. <code>4aeac4b3-5f44-4b94-bef3-cb721ea7bef0</code></td>
+</tr>
+<tr>
+<td><code>tool_use</code> id</td>
+<td><code>toolu_01…</code></td>
+<td><code>call_00_&lt;base62&gt;</code>, e.g. <code>call_00_4Ykgo3t3AxTqrrfx12mk4590</code></td>
+</tr>
+</tbody>
+</table>
+<p>Nothing may parse, validate, or synthesise an id. Ids are opaque bytes and are
+replayed verbatim. They are also the key the endpoint indexes its issued-call
+record by — see Quirk 1 — so rewriting one silently changes behaviour.</p>
+<h3 id="quirk-3">Quirk 3 — prefix caching is automatic, <code>cache_control</code> is inert<a class="headerlink" href="#quirk-3" title="Permanent link">&para;</a></h3>
+<p><code>cache_creation_input_tokens</code> is <strong>always 0</strong>. Only <code>cache_read_input_tokens</code> is
+populated. Two identical requests with the same long system prefix: the first
+reports <code>cache_read=0</code>, the second <code>cache_read=2299</code>. Adding an explicit
+<code>cache_control</code> breakpoint changes nothing.</p>
+<p><strong>Consequence: byte-stability of the rendered prefix is the entire caching
+mechanism.</strong> There is no breakpoint to place and no way to steer the cache.
+<code>cache_control</code> is still emitted — it is correct for Anthropic and costs nothing
+here — but no strategy may depend on it.</p>
+<h3 id="quirk-4">Quirk 4 — <code>input_tokens</code> excludes thinking blocks<a class="headerlink" href="#quirk-4" title="Permanent link">&para;</a></h3>
+<p>An assistant turn carrying 86 characters of thinking and the same turn with the
+thinking stripped both reported <code>input_tokens: 256</code>. Token accounting cannot be
+used to detect whether thinking survived into a request.</p>
+<h3 id="quirk-5">Quirk 5 — 422 and 400 are different failure classes<a class="headerlink" href="#quirk-5" title="Permanent link">&para;</a></h3>
+<p>A malformed <em>schema</em> returns <code>422</code>, and the message enumerates the valid
+variants:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>422 Failed to deserialize the JSON body into the target type:
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>    tools[0]: unknown variant `bash_20250124`,
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>    expected `web_search_20250305` or `web_search_20260209` at line 1 column 94
+</code></pre></div>
+<p>This is not retryable and not a normal <code>invalid_request_error</code> — it means the
+client sent a field the endpoint does not model. <code>yu-wire</code> classifies it
+separately so it is never retried and never mistaken for a prompt bug.</p>
+<p>It is also the cheapest possible capability probe: send a deliberately unknown
+variant and read the <code>expected</code> list back.</p>
+<h3 id="quirk-6">Quirk 6 — 401 leaks the last 4 characters of the key<a class="headerlink" href="#quirk-6" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>401 authentication_error: Authentication Fails, Your api key: ****0000 is invalid
+</code></pre></div>
+<p>Error bodies must be handled carefully; this one embeds key material. See
+<a href="../../configuration/#credentials">Credentials</a>.</p>
+<h2 id="streaming-notes">Streaming notes<a class="headerlink" href="#streaming-notes" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong><code>ping</code> events</strong> are emitted between blocks and must be tolerated and
+  skipped.</li>
+<li><strong><code>signature</code> arrives as a <code>signature_delta</code> delta type</strong>, carried inside an
+  ordinary <code>content_block_delta</code> event — it is not an event name of its own. It
+  arrives after the <code>thinking_delta</code>s and before <code>content_block_stop</code>.</li>
+<li><strong><code>content_block_start</code> for a thinking block carries <code>"signature": ""</code></strong>, so
+  an accumulator must treat empty-signature-then-delta as the normal path rather
+  than as a malformed block.</li>
+<li><strong><code>web_search</code> results interleave</strong>: <code>thinking</code> → <code>text</code> → <code>server_tool_use</code>
+  → <code>web_search_tool_result</code> → <code>thinking</code> → … Many blocks per turn. This is the
+  unbounded shape the reduction table handles.</li>
+</ul>
+<h2 id="stop_reason"><code>stop_reason</code><a class="headerlink" href="#stop_reason" title="Permanent link">&para;</a></h2>
+<p>Observed: <code>end_turn</code>, <code>tool_use</code>, <code>max_tokens</code>. <code>refusal</code> and <code>pause_turn</code> never
+appeared across roughly 40 requests, and are still handled — an unhandled
+variant must not be silently treated as success.</p>
+<h2 id="running-against-anthropic">Running against Anthropic<a class="headerlink" href="#running-against-anthropic" title="Permanent link">&para;</a></h2>
+<p>Set the profile explicitly if you do not probe:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="nb">export</span><span class="w"> </span><span class="nv">YU_QUIRKS</span><span class="o">=</span>anthropic
+</code></pre></div>
+<p>On Anthropic's endpoint the schema-less server tools are available,
+<code>tool_search</code> and <code>defer_loading</code> work, and <code>cache_control</code> breakpoints are
+honoured rather than inert. The probe is still the authority — measure rather
+than assume.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "../..", "features": ["navigation.sections", "navigation.indexes", "navigation.top", "search.highlight", "search.suggest", "content.code.copy"], "search": "../../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
