@@ -747,6 +747,7 @@ mod tests {
     use std::net::{SocketAddr, TcpListener, TcpStream};
 
     use super::*;
+    use crate::quirks::Support;
     use crate::types::Message;
 
     #[test]
@@ -778,6 +779,59 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(c.url(MESSAGES_PATH), "https://example.test/anthropic/v1/messages");
+    }
+
+    /// The injection point, end to end.
+    ///
+    /// `yu probe --json` writes a `Capabilities` report; `YU_QUIRKS_JSON` names
+    /// the file a run then loads its constraints from, and DESIGN's "约束靠注入"
+    /// holds only if the two ends agree. Nothing used to touch this variable,
+    /// and nothing serialized the real `Capabilities` into it either — so a
+    /// renamed field would have dropped every run back to an unmeasured profile
+    /// with no test failing. The file written here comes from the real
+    /// serializer, which is what makes a rename fail here.
+    #[test]
+    fn a_saved_capability_report_reaches_the_client_through_yu_quirks_json() {
+        let mut measured = Quirks::deepseek_anthropic();
+        measured.name = "probed:https://example.test".to_owned();
+        measured.cache_breakpoints = Support::No;
+        measured.automatic_prefix_cache = Support::Yes;
+        measured.thinking_signature_validated = false;
+
+        let report = crate::capability::Capabilities {
+            base_url: "https://example.test".to_owned(),
+            model: "m".to_owned(),
+            probed_at_ms: 0,
+            entries: Vec::new(),
+            quirks: measured.clone(),
+        };
+        let path = std::env::temp_dir().join(format!(
+            "yu-wire-quirks-{}-from-env.json",
+            std::process::id()
+        ));
+        std::fs::write(&path, serde_json::to_string(&report).expect("serializing the report"))
+            .expect("writing the report");
+
+        // SAFETY: no other test in this binary reads these two variables, and
+        // this is the only test that writes them. `from_env`'s interface *is*
+        // the process environment, so there is no narrower way to exercise it.
+        unsafe {
+            std::env::set_var("YU_QUIRKS_JSON", &path);
+            std::env::set_var("ANTHROPIC_API_KEY", "sk-test-never-sent");
+        }
+        let loaded = WireClient::from_env().expect("from_env must build").quirks().clone();
+        // Cleanup happens before the assertions, so a failure leaves nothing
+        // behind for another test to trip over.
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("YU_QUIRKS_JSON");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+
+        // `probed:<url>` is a name the built-in table deliberately cannot
+        // answer, so this profile could only have come from the file.
+        assert!(Quirks::is_probed_name(&loaded.name), "name: {}", loaded.name);
+        assert_eq!(loaded, measured, "the constraints in force must be the measured ones");
     }
 
     #[test]

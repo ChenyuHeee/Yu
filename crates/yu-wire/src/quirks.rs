@@ -451,6 +451,7 @@ impl std::error::Error for HistoryProblem {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::{Capabilities, Capability};
     use crate::types::{ThinkingBlock, ToolResultBlock, ToolUseBlock, Thinking};
 
     fn tool_use(id: &str) -> ContentBlock {
@@ -614,15 +615,27 @@ mod tests {
         measured.thinking_signature_validated = false;
         measured.unsupported_is_422 = true;
 
-        let report = serde_json::json!({
-            "base_url": "https://example.test",
-            "model": "m",
-            "probed_at_ms": 0,
-            "entries": [],
-            "quirks": measured,
-        });
+        // The real writer, not a hand-built literal: `yu probe --json`
+        // serializes a `Capabilities` through this derive, and a field renamed
+        // on either side of the pipeline must break this test rather than the
+        // injection. A `json!` literal spells every field name itself, so a
+        // rename moved nothing and the pipeline broke silently.
+        let report = Capabilities {
+            base_url: "https://example.test".to_owned(),
+            model: "m".to_owned(),
+            probed_at_ms: 0,
+            entries: vec![Capability {
+                feature: "cache_control".to_owned(),
+                support: Support::No,
+                status: Some(200),
+                detail: "stop=end_turn blocks=[text] in=12 out=1 cr=0".to_owned(),
+                expected_variants: Vec::new(),
+            }],
+            quirks: measured.clone(),
+        };
+        let json = serde_json::to_string(&report).expect("a capability report must serialize");
 
-        let recovered = Quirks::from_capabilities_json(&report.to_string()).unwrap();
+        let recovered = Quirks::from_capabilities_json(&json).unwrap();
         assert_eq!(recovered, measured, "a measured profile must survive intact");
         // Including the fields the old `infer_quirks` never set at all.
         assert_eq!(recovered.automatic_prefix_cache, Support::Yes);
