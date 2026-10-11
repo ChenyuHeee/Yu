@@ -1007,7 +1007,6 @@ mod tests {
             ledger: &ledger,
             tools: &decision_tools(),
             report: None,
-            evidence: &[],
             shape: &[],
             omitted: &[],
         });

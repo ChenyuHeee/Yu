@@ -178,6 +178,30 @@ impl DelegateOutcome {
             out.push_str(stopped);
             out.push('\n');
         }
+        // **The landing, before the prose.** It is the report — DESIGN: "报告从
+        // 散文收缩成一次**选择**" — so a reader who stops after this line has the
+        // delegation's own classification, and the prose below is the working.
+        if let Some(landing) = &self.landing {
+            out.push_str(&format!("LANDED: {}/{}", landing.set, landing.slot));
+            match &landing.unlisted {
+                Some(word) => out.push_str(&format!(
+                    " — unpredicted; the executor called it `{word}`"
+                )),
+                None if landing.is_other() => out.push_str(" — unpredicted"),
+                None => {}
+            }
+            if !landing.why.is_empty() {
+                out.push_str(&format!(" — {}", landing.why));
+            }
+            out.push('\n');
+        }
+        // And the contradiction, marked and unmissable. This is the one line in
+        // the report that is not the executor's account of itself but a fact the
+        // harness holds against it — DESIGN: "矛盾发生时作为**事件**上报(执行者误报
+        // 本身是决策相关的事实)".
+        if let Some(caught) = &self.contradiction {
+            out.push_str(&format!("!! HARNESS: {caught}\n"));
+        }
         out.push_str(&format!(
             "({} step(s), {} tool call(s))\n\n",
             self.steps, self.tool_calls
@@ -581,6 +605,10 @@ pub fn decision_surface(sets: &crate::outcomes::OutcomeSets) -> Vec<ToolDefiniti
     // `decide` and `retire` after `delegate`, in that fixed order: the order is
     // part of the cache prefix, so it must not depend on anything.
     surface.extend(crate::decide::decision_tools());
+    // Last, because `spot_check` is the exception rather than the instrument:
+    // DESIGN calls it a scarce action billed to the context this layer has
+    // least of, and a surface that led with it would read as encouragement.
+    surface.push(crate::spot::spot_check_tool());
     surface
 }
 
@@ -1310,6 +1338,59 @@ mod tests {
             "the contradiction has to reach the record as an event: {notes:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The report *is* the landing, so it comes first.**
+    ///
+    /// With raw evidence gone from the decision layer's view, this render is the
+    /// only channel by which a landing reaches it. A reader who stops after the
+    /// first line still has the delegation's own classification; the prose below
+    /// is the working, and a contradiction is marked so it cannot be read as
+    /// part of that account.
+    #[test]
+    fn the_report_leads_with_the_landing_and_marks_a_contradiction() {
+        use crate::landing::Landing;
+
+        let mut outcome = outcome_with_report("a long account of the work".to_owned(), None);
+        outcome.landing = Some(Landing {
+            set: "build".to_owned(),
+            slot: "compile_error".to_owned(),
+            why: "error[E0308]".to_owned(),
+            unlisted: None,
+        });
+        outcome.contradiction = Some("the executor landed on `compile_error`, but every command that ran succeeded".to_owned());
+
+        let rendered = outcome.render();
+        let landing_at = rendered.find("LANDED: build/compile_error").expect("the landing");
+        let prose_at = rendered.find("a long account").expect("the prose");
+        assert!(
+            landing_at < prose_at,
+            "the landing has to come before the prose, or a reader has to read \
+             past the working to reach the report: {rendered}"
+        );
+        let marked = rendered.find("!! HARNESS:").expect("the contradiction is marked");
+        assert!(
+            marked < prose_at,
+            "and the contradiction has to be above the account it contradicts"
+        );
+    }
+
+    #[test]
+    fn an_unpredicted_landing_says_so_and_names_the_word_used() {
+        use crate::landing::Landing;
+        let mut outcome = outcome_with_report("did the thing".to_owned(), None);
+        outcome.landing = Some(Landing {
+            set: "build".to_owned(),
+            slot: crate::landing::OTHER.to_owned(),
+            why: "no space left".to_owned(),
+            unlisted: Some("disk_full".to_owned()),
+        });
+        let rendered = outcome.render();
+        assert!(
+            rendered.contains("LANDED: build/other") && rendered.contains("`disk_full`"),
+            "a surprise has to be legible as one, and the word the executor used \
+             is what tells a surprise from a badly named set: {rendered}"
+        );
     }
 
     /// And the check does not fire on a landing the record supports.

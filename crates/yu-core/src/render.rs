@@ -416,8 +416,13 @@ pub struct RenderInput<'a> {
     /// two authors drifts.
     pub tools: &'a [ToolDefinition],
     /// This round's report from the executor.
+    ///
+    /// The landing and any contradiction are inside it, because the landing *is*
+    /// the report — DESIGN: "报告从散文收缩成一次**选择**". There is deliberately
+    /// no separate evidence channel: the context is "L0 + L1 + 本轮报告 + 落位 +
+    /// 形状指标 + 未装载清单", and raw tool output is not on that list. What is not
+    /// shown is addressed in the manifest, which is what the manifest is for.
     pub report: Option<&'a str>,
-    pub evidence: &'a [Evidence],
     /// Cheap proxies the decision layer watches instead of reading the tool stream.
     pub shape: &'a [ShapeSignal],
     pub omitted: &'a [NotLoadedEntry],
@@ -725,25 +730,6 @@ pub fn render(input: RenderInput<'_>) -> View {
         ),
     }
 
-    let mut evidence = String::new();
-    if !input.evidence.is_empty() {
-        evidence.push_str("\n## Evidence\n");
-        for e in input.evidence {
-            match e.exit_code {
-                Some(code) => evidence.push_str(&format!(
-                    "- [{}] exit {}\n{}\n",
-                    e.label, code, e.content
-                )),
-                // DESIGN: an assertion with no runnable evidence is unverified.
-                // Saying so in the view is cheaper than hoping the reader notices.
-                None => evidence.push_str(&format!(
-                    "- [{}] UNVERIFIED — no command was run\n{}\n",
-                    e.label, e.content
-                )),
-            }
-        }
-    }
-
     let mut shape = String::new();
     if !input.shape.is_empty() {
         shape.push_str("\n## Shape\n");
@@ -762,7 +748,7 @@ pub fn render(input: RenderInput<'_>) -> View {
         format!("\n{manifest}")
     };
 
-    let text = format!("{this_round}{evidence}{shape}{manifest_section}")
+    let text = format!("{this_round}{shape}{manifest_section}")
         .trim()
         .to_owned();
     let messages = vec![Message::user(vec![TextBlock {
@@ -774,19 +760,19 @@ pub fn render(input: RenderInput<'_>) -> View {
     let mut meter = CompositionMeter::new();
     meter.add_tools(&tools);
     meter.add_system(&system);
-    // The evidence section is charged whole: it exists only to carry what a tool
-    // printed, and it is the one place raw material can still reach this layer.
-    let evidence_chars = evidence.len() as u64;
+    // No raw material, and that is the design rather than an accident of this
+    // render: `render` has no way to be handed a tool's output any more. The
+    // report is charged as a reduction, which it is — `DelegateOutcome::render`
+    // truncated it to a budget and gave an address for the rest.
     debug_assert!(
-        report_chars + evidence_chars <= text.len() as u64,
-        "the classified sections are interior, so trimming the ends cannot have removed them"
+        report_chars <= text.len() as u64,
+        "the classified section is interior, so trimming the ends cannot have removed it"
     );
-    meter.add_raw_material(evidence_chars);
     meter.add_reduced_material(report_chars);
     // Whatever is left — the headings, the shape counts, the manifest's
     // addresses — is neither raw nor a reduction, and is counted all the same so
     // the denominator is the context's real size.
-    meter.add_context((text.len() as u64).saturating_sub(report_chars + evidence_chars));
+    meter.add_context((text.len() as u64).saturating_sub(report_chars));
     let composition = meter.snapshot();
 
     let mut view = View {
@@ -947,7 +933,6 @@ mod tests {
         charter: &'a Charter,
         ledger: &'a Ledger,
         omitted: &'a [NotLoadedEntry],
-        evidence: &'a [Evidence],
     ) -> View {
         render(RenderInput {
             prompt: TEST_PROMPT,
@@ -955,7 +940,6 @@ mod tests {
             ledger,
             tools: &[],
             report: Some("did the thing"),
-            evidence,
             shape: &[],
             omitted,
         })
@@ -965,8 +949,8 @@ mod tests {
     fn rendering_twice_produces_byte_identical_output() {
         let c = charter();
         let l = empty_ledger();
-        let a = render_with(&c, &l, &[], &[]);
-        let b = render_with(&c, &l, &[], &[]);
+        let a = render_with(&c, &l, &[]);
+        let b = render_with(&c, &l, &[]);
         assert_eq!(a.digest, b.digest, "the view must be deterministic");
         assert_eq!(a.messages, b.messages);
     }
@@ -984,7 +968,7 @@ mod tests {
             why: "not needed for this decision".into(),
             how_to_load: "delegate_read(seq=41..97, \"did anything fail?\")".into(),
         }];
-        let view = render_with(&c, &l, &omitted, &[]);
+        let view = render_with(&c, &l, &omitted);
         let rendered = view.messages[0].content.concat_text();
         assert!(!rendered.contains(SECRET));
         assert!(rendered.contains("journal:seq=41..97"));
@@ -1015,21 +999,6 @@ mod tests {
     }
 
     #[test]
-    fn evidence_with_no_command_is_marked_unverified() {
-        // DESIGN: an assertion without runnable evidence counts as unverified.
-        let c = charter();
-        let l = empty_ledger();
-        let evidence = vec![
-            Evidence::command("cargo test", "ok", 0),
-            Evidence::unverified("perf", "it is definitely faster now"),
-        ];
-        let view = render_with(&c, &l, &[], &evidence);
-        let rendered = view.messages[0].content.concat_text();
-        assert!(rendered.contains("exit 0"));
-        assert!(rendered.contains("UNVERIFIED"));
-    }
-
-    #[test]
     fn rejected_proposals_are_carried_so_they_are_not_re_proposed() {
         let c = charter();
         let l = Ledger {
@@ -1039,7 +1008,7 @@ mod tests {
             }],
             ..Ledger::default()
         };
-        let view = render_with(&c, &l, &[], &[]);
+        let view = render_with(&c, &l, &[]);
         assert!(intent(&view).contains("do not re-propose"));
         assert!(intent(&view).contains("rewrite it in Go"));
     }
@@ -1048,7 +1017,7 @@ mod tests {
     fn the_humans_own_words_survive_verbatim() {
         let c = charter();
         let l = empty_ledger();
-        let view = render_with(&c, &l, &[], &[]);
+        let view = render_with(&c, &l, &[]);
         assert!(
             intent(&view).contains("just make it work, but don't touch release"),
             "DESIGN: 人类原话原样存活"
@@ -1121,13 +1090,13 @@ mod tests {
     fn retiring_does_not_grow_the_view() {
         let c = charter();
         let l = empty_ledger();
-        let before = render_with(&c, &l, &[], &[]);
+        let before = render_with(&c, &l, &[]);
 
         let mut l = empty_ledger();
         for i in 0..8 {
             l.retire(format!("finished item {i}"), format!("done in commit {i}"));
         }
-        let after = render_with(&c, &l, &[], &[]);
+        let after = render_with(&c, &l, &[]);
 
         assert_eq!(
             l.retired.len(),
@@ -1152,7 +1121,7 @@ mod tests {
         // 50 entries of a megabyte each are described in a few kB of addresses.
         let c = charter();
         let l = empty_ledger();
-        let small = render_with(&c, &l, &[], &[]);
+        let small = render_with(&c, &l, &[]);
         let many: Vec<NotLoadedEntry> = (0..50)
             .map(|i| NotLoadedEntry {
                 what: format!("segment {i}"),
@@ -1162,7 +1131,7 @@ mod tests {
                 how_to_load: "delegate_read(...)".into(),
             })
             .collect();
-        let large = render_with(&c, &l, &many, &[]);
+        let large = render_with(&c, &l, &many);
         let small_len = small.messages[0].content.concat_text().len();
         let large_len = large.messages[0].content.concat_text().len();
         assert!(large_len < 50 * 400);
@@ -1183,7 +1152,7 @@ mod tests {
         let c = charter();
         let mut l = empty_ledger();
 
-        let size_with = |l: &Ledger| intent(&render_with(&c, l, &[], &[])).len();
+        let size_with = |l: &Ledger| intent(&render_with(&c, l, &[])).len();
         let empty_size = size_with(&l);
 
         // 40 decisions accumulate; the view must reflect that, or the metric
@@ -1245,7 +1214,7 @@ mod tests {
         // Now it appears nowhere in the view, which is the stronger form of the
         // same rule: a retired item is not state.
         let c = charter();
-        let view = render_with(&c, &l, &[], &[]);
+        let view = render_with(&c, &l, &[]);
         assert_eq!(
             intent(&view).matches("rewrite the parser").count(),
             0,
@@ -1270,11 +1239,19 @@ mod tests {
         assert_eq!(l.active_len(), 0);
     }
 
+    /// **M3: "决策层的视野里不出现原始证据 —— 原始材料占比 ≈ 0."**
+    ///
+    /// This is no longer a property `render` happens to have; it is one it
+    /// cannot fail to have. `RenderInput` has no field that accepts a tool's
+    /// output, so a view carrying raw material is not a bug to be caught but a
+    /// program that does not compile. The test is kept because the *number* is
+    /// what the acceptance criterion names, and a number nobody asserts is a
+    /// number that can quietly stop being zero.
     #[test]
     fn a_view_with_no_evidence_carries_no_raw_material() {
         let c = charter();
         let l = empty_ledger();
-        let view = render_with(&c, &l, &[], &[]);
+        let view = render_with(&c, &l, &[]);
         // Everything in a view is either written by the harness or was reduced
         // before it arrived. The manifest's addresses are neither raw nor judged,
         // and they are counted anyway so the denominator is the real size.
@@ -1291,103 +1268,6 @@ mod tests {
     /// text — or classified by block type — would have to give them the same
     /// answer. `render` charges them as what they are because it is the code that
     /// wrote them.
-    #[test]
-    fn a_view_charges_evidence_as_raw_material_and_its_report_as_a_reduction() {
-        let c = charter();
-        let l = empty_ledger();
-        let report = "r".repeat(2000);
-        let evidence = Evidence::command("cargo test", "t".repeat(2000), 1);
-
-        let with_both = render(RenderInput {
-            prompt: TEST_PROMPT,
-            tools: &[delegate_tool()],
-            charter: &c,
-            ledger: &l,
-            report: Some(&report),
-            evidence: &[evidence],
-            shape: &[],
-            omitted: &[],
-        });
-        assert_eq!(
-            with_both.composition.reduced_result_chars,
-            report.len() as u64,
-            "this round's report is a reduction and must be charged as one"
-        );
-        assert!(
-            with_both.composition.raw_material_chars >= 2000,
-            "the evidence block is a tool's output carried verbatim: {}",
-            with_both.composition.raw_material_chars
-        );
-
-        // And the number moves when the evidence does — a metric that could not
-        // tell a clean view from one carrying a tool's whole output would be the
-        // vacuous metric this replaced.
-        let without = render(RenderInput {
-            prompt: TEST_PROMPT,
-            tools: &[delegate_tool()],
-            charter: &c,
-            ledger: &l,
-            report: Some(&report),
-            evidence: &[],
-            shape: &[],
-            omitted: &[],
-        });
-        assert_eq!(without.composition.raw_material_chars, 0);
-        assert!(
-            with_both.raw_material_ratio().unwrap()
-                > without.raw_material_ratio().unwrap() + 0.2,
-            "carrying raw evidence has to show up in the ratio"
-        );
-    }
-
-    /// The instrument has to be able to see evidence accumulate.
-    ///
-    /// DESIGN says the view is bounded, and the evidence section is the one part
-    /// of it that is not: `build_view` carries every delegation's evidence and
-    /// each block's output is rendered verbatim. This is a guard on the
-    /// *instrument*, not a claim about where the bound is — it asserts that the
-    /// number moves with the volume, because a metric that could not see this
-    /// would leave the boundedness claim unfalsifiable, and a bound nobody can
-    /// measure is a bound nobody has.
-    #[test]
-    fn the_measurement_moves_when_evidence_accumulates() {
-        let c = charter();
-        let l = empty_ledger();
-        let blocks = |n: usize| -> Vec<Evidence> {
-            (0..n)
-                .map(|i| Evidence::command(format!("cmd {i}"), "x".repeat(1000), 0))
-                .collect()
-        };
-        let measure = |n: usize| {
-            let evidence = blocks(n);
-            render(RenderInput {
-                prompt: TEST_PROMPT,
-                tools: &[delegate_tool()],
-                charter: &c,
-                ledger: &l,
-                report: Some("a report"),
-                evidence: &evidence,
-                shape: &[],
-                omitted: &[],
-            })
-        };
-
-        let one = measure(1);
-        let twelve = measure(12);
-        assert!(
-            twelve.composition.raw_material_chars
-                > one.composition.raw_material_chars + 10_000,
-            "evidence is rendered verbatim, so twelve blocks must cost about \
-             twelve times one: {} vs {}",
-            twelve.composition.raw_material_chars,
-            one.composition.raw_material_chars
-        );
-        assert!(
-            twelve.raw_material_ratio().unwrap() > one.raw_material_ratio().unwrap(),
-            "and the ratio has to move with it, or the growth stays invisible"
-        );
-    }
-
     #[test]
     fn ratio_is_undefined_for_an_empty_view_rather_than_zero() {
         // Zero and "undefined" are different claims; conflating them would let a
@@ -1407,7 +1287,6 @@ mod tests {
             charter: &c,
             ledger: &l,
             report: Some("first"),
-            evidence: &[],
             shape: &[],
             omitted: &[],
         });
@@ -1417,7 +1296,6 @@ mod tests {
             charter: &c,
             ledger: &l,
             report: Some("second"),
-            evidence: &[],
             shape: &[],
             omitted: &[],
         });
@@ -1436,7 +1314,6 @@ mod tests {
             charter: &c,
             ledger: &l,
             report: Some("one"),
-            evidence: &[],
             shape: &[],
             omitted: &[],
         });
@@ -1446,7 +1323,6 @@ mod tests {
             charter: &c,
             ledger: &l,
             report: Some("a completely different report"),
-            evidence: &[],
             shape: &[],
             omitted: &[],
         });
@@ -1473,7 +1349,6 @@ mod tests {
             charter: &c,
             ledger: &l,
             report: None,
-            evidence: &[],
             shape: &shape,
             omitted: &[],
         });

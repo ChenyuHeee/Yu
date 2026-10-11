@@ -764,7 +764,6 @@ async fn every_request_carries_a_freshly_rendered_view_and_its_own_measurement()
             ledger: &ledger,
             tools: &decision_surface(&Default::default()),
             report: None,
-            evidence: &[],
             shape: &[],
             omitted: &[],
         })

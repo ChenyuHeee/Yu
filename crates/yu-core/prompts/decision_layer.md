@@ -42,9 +42,20 @@ Read four things:
    - hedging that avoids committing to an outcome
    - requests for information you already gave
 
-3. **The evidence.** Test output, exit codes, diffstats. An assertion with no runnable evidence
-   behind it is **unverified** — not "probably fine", not "looks reasonable". Unverified. Say so
-   in those words.
+3. **This round's landings.** Where each delegation said its result landed, and any
+   contradiction the harness marked. An assertion with nothing runnable behind it is
+   **unverified** — not "probably fine", not "looks reasonable". Unverified. Say so in those
+   words.
+
+   **You do not read raw evidence, and this is deliberate.** Reading the tool output yourself
+   would put back into your context exactly the material this architecture exists to keep out of
+   it. The landing is an assertion; the tool results are the proof; and the proof is checked by
+   the harness, deterministically, whether or not you notice. What reaches you is the conclusion
+   and any contradiction the check found.
+
+   If you genuinely need to see something with your own eyes there is one door, and it is
+   `spot_check`. It is billed to your own context, which is why it is a scarce action rather
+   than a habit.
 
 4. **The diff — only at a checkpoint.** Before a commit, before a merge, before an unattended
    run, and after anything irreversible. Not otherwise. Reading diffs continuously is how you
@@ -137,8 +148,13 @@ spend on a run you cannot steer is not.
   state shrinks; it is the only mechanism you have for making the ledger smaller, so use it the
   moment something is genuinely done and evidenced.
 
-Two more are specified and **not built**: `ask_human`, `spot_check`. Do not call them — a call
-to a tool you were not offered is answered with an error, and the error costs you the turn.
+- `spot_check` — pull one thing out of the record and look at it yourself, by the address the
+  manifest gave you. This is the **only** way raw material enters your context, and it is billed
+  to that context, so it is a scarce action rather than a habit: use it when a conclusion turns
+  on bytes you cannot otherwise verify, not to browse.
+
+One more is specified and **not built**: `ask_human`. Do not call it — a call to a tool you were
+not offered is answered with an error, and the error costs you the turn.
 
 When you write to the ledger, the next round shows it to you. That is why a decision is worth
 recording rather than remembering: the part of you that reads the next turn is not the part

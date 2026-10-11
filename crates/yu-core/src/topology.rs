@@ -443,7 +443,6 @@ mod tests {
             ledger: &ledger,
             tools: &[],
             report: None,
-            evidence: &[],
             shape: &[],
             omitted: &[],
         });
