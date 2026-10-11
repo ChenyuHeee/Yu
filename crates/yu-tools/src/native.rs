@@ -355,17 +355,58 @@ impl Tool for Exec {
     }
 }
 
+/// The header's two halves, defined once because the writer and the reader must
+/// not drift: the bug this replaces was a writer emitting `exit: 3` and a reader
+/// searching for `exit ` — with a space — which returned `None` on every real
+/// command, so the decision layer's evidence block read `exit unknown` always.
+const COMMAND_ECHO: &str = "$ ";
+const EXIT_MARKER: &str = "exit: ";
+
 /// The evidence block: what was run, what it exited with, and both streams.
+///
+/// Producer for [`parse_exit_code`], and the pair is the point. The block opens
+/// with the echoed command and the exit marker, and only after both come the
+/// streams, so the marker's position is a function of the command rather than a
+/// property of the text. A reader therefore never has to search for it — and
+/// searching is exactly how a command that merely *printed* something shaped
+/// like a marker would get away with reporting another command's status.
 fn render_exec_output(command: &str, status: &ExitStatus, stdout: &str, stderr: &str) -> String {
-    let mut out = format!("$ {command}\n");
+    let mut out = format!("{COMMAND_ECHO}{command}\n");
     match status.code() {
-        Some(code) => out.push_str(&format!("exit: {code}\n")),
+        Some(code) => out.push_str(&format!("{EXIT_MARKER}{code}\n")),
         // Killed by a signal has no exit code, and inventing one would be a lie.
-        None => out.push_str("exit: terminated by signal\n"),
+        None => out.push_str(&format!("{EXIT_MARKER}terminated by signal\n")),
     }
     out.push_str(&format!("stdout ({} bytes):\n{stdout}\n", stdout.len()));
     out.push_str(&format!("stderr ({} bytes):\n{stderr}\n", stderr.len()));
     out
+}
+
+/// Read the exit status back out of `output`, which must be what
+/// [`render_exec_output`] wrote for `command`.
+///
+/// This lives beside the producer because the producer owns the format; the
+/// consumer (`yu-core`'s evidence) calls it rather than re-deriving it, so there
+/// is one definition of the contract instead of two that have to agree.
+///
+/// The parse is structural, not a search. The block begins with `$ ` and the
+/// command verbatim, so the marker sits at a byte offset computed from the
+/// command the caller already has — it is the command it ran. Nothing that
+/// follows the marker is read. That matters: `printf 'exit 0\n'; exit 1` exits
+/// nonzero while printing a line that reads exactly like a success, and a
+/// parser that scanned the tail for something marker-shaped would hand the
+/// decision layer `0` — an assertion reported as verified when it is false.
+///
+/// `None` means "no exit status was recovered" and never "it passed": a command
+/// killed by a signal has no code to recover, and text that is not a render at
+/// all (a reduction's pointer, a reader's answer, an older hand-written format)
+/// is not guessed at.
+pub fn parse_exit_code(command: &str, output: &str) -> Option<i32> {
+    let rest = output.strip_prefix(COMMAND_ECHO)?;
+    let rest = rest.strip_prefix(command)?;
+    let rest = rest.strip_prefix('\n')?;
+    let marker = rest.lines().next()?;
+    marker.strip_prefix(EXIT_MARKER)?.trim().parse().ok()
 }
 
 fn text_result(
@@ -638,6 +679,52 @@ mod tests {
             Some("printf 'out'; exit 3"),
             "the provenance must be enough to re-run the command"
         );
+    }
+
+    /// The round trip that makes the marker a contract rather than a string two
+    /// modules happen to share: a real command in, the code it exited with out.
+    ///
+    /// Changing what `render_exec_output` writes without teaching
+    /// `parse_exit_code` the same format fails here, which is the point — the
+    /// two ends were written once, ten lines apart, disagreeing about a colon.
+    #[test]
+    fn the_exit_marker_round_trips_from_a_real_command_to_its_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = "printf 'six bytes'; exit 3";
+        let result = Exec.execute(&json!({"command": command}), &ctx(dir.path()));
+        let text = result.payload.text().unwrap();
+        assert_eq!(parse_exit_code(command, text), Some(3));
+        assert_eq!(parse_exit_code(command, "some output\nexit 3\n"), None);
+    }
+
+    /// A command that prints a line shaped like the marker is not the marker.
+    ///
+    /// This command fails while its output ends with a line reading exactly like
+    /// a success. The tail scan that this replaced found that line and reported
+    /// `0` — a passing verdict drawn from the failed command's own noise. The
+    /// structural read never looks into the streams, so the status it returns is
+    /// the one the shell exited with.
+    #[test]
+    fn stdout_that_resembles_the_marker_does_not_become_the_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = "printf 'done\\nexit 0'; exit 1";
+        let result = Exec.execute(&json!({"command": command}), &ctx(dir.path()));
+        let text = result.payload.text().unwrap();
+        assert_eq!(parse_exit_code(command, text), Some(1));
+    }
+
+    #[test]
+    fn a_marker_that_is_not_an_evidence_block_is_not_guessed_at() {
+        // A reduction's pointer or a reader's answer is not a render, and the
+        // honest answer for it is "no status", never a number.
+        assert_eq!(
+            parse_exit_code("true", "the full log result is on disk"),
+            None
+        );
+        // A signal has no exit code to recover; `None`, not an invented one.
+        let killed =
+            "$ sleep 5\nexit: terminated by signal\nstdout (0 bytes):\n\nstderr (0 bytes):\n\n";
+        assert_eq!(parse_exit_code("sleep 5", killed), None);
     }
 
     #[test]

@@ -129,10 +129,55 @@ pub enum LoopError {
     StepCeiling(u32),
 }
 
+/// A stop the loop's own machinery caused, rather than the model ending its
+/// turn.
+///
+/// Kept out of [`StopDisposition`] because that vocabulary belongs to the
+/// endpoint: the dispositions are readings of a `stop_reason`, and "the budget
+/// ran out" is not one. It is the harness's own stop, and it is the most common
+/// way a run ends — so it is reported as a fact about the run, not raised as an
+/// error that erases the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoopStop {
+    /// `max_steps` was reached while the model was still working: the last step
+    /// ended in a tool call whose result it never got to see.
+    StepCeiling(u32),
+    /// The endpoint answered `pause_turn`, which no layer of this harness can
+    /// serve: it means a **server-side** tool paused mid-turn, and re-sending
+    /// continues it — but every tool this harness registers is a custom tool
+    /// with an explicit schema, so there is nothing here to resume.
+    PauseTurn,
+}
+
+impl LoopStop {
+    /// The account to give whoever reads the outcome.
+    ///
+    /// The decision layer gets an account of what happened instead of a hole
+    /// where the delegation was, so a stop is something to decide on rather than
+    /// a failure it has to survive.
+    pub fn describe(self) -> String {
+        match self {
+            LoopStop::StepCeiling(limit) => format!(
+                "The executor reached its step ceiling of {limit} while still working and \
+                 produced no final answer; what follows is where it got to, and the evidence \
+                 is what it ran."
+            ),
+            LoopStop::PauseTurn => "The endpoint answered `pause_turn`, which this layer cannot \
+                 serve: it means a server-side tool paused mid-turn, and no server-side tool \
+                 exists here. Re-sending would continue nothing and spend the step anyway, so \
+                 the run was stopped and is reported."
+                .to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LoopOutcome {
     pub steps: u32,
     pub text: String,
+    /// The model's last `stop_reason`, as a disposition. For a run that ends on
+    /// the step ceiling this is what the model was asking for when the budget
+    /// ran out — not a completion.
     pub stop: StopDisposition,
     pub usage: TokenUsage,
     pub tool_calls: u32,
@@ -141,6 +186,16 @@ pub struct LoopOutcome {
     pub signals: Vec<ShapeSignal>,
     /// Which reduction each tool result took, for M1's accounting.
     pub reductions: Vec<Reduction>,
+    /// Set when the loop stopped for its own reason rather than the model
+    /// ending its turn. `None` means the run reported completion.
+    ///
+    /// This is the field the decision layer's "did it finish" question is
+    /// answered from. Before it existed, `run` returned `Ok` only on
+    /// [`StopDisposition::Complete`] and the ceiling was an `Err`, so every
+    /// outcome that could actually occur looked complete — the caller's
+    /// `completed` was true by construction, and its "stopped without
+    /// completing" branch described a state production could not reach.
+    pub stopped_early: Option<LoopStop>,
     /// What this executor's context was made of.
     ///
     /// The other half of DESIGN's acceptance criterion. The decision layer's
@@ -211,6 +266,14 @@ impl Agent {
     }
 
     pub async fn run(&mut self, task: &str) -> Result<LoopOutcome, LoopError> {
+        // Zero is not a run: no request can be sent, so no outcome — not even
+        // the ceiling's — could describe what happened. The error remains for
+        // the configuration mistake; every run with a budget stops as an
+        // outcome (see the loop's tail).
+        if self.config.max_steps == 0 {
+            return Err(LoopError::StepCeiling(0));
+        }
+
         self.journal
             .append(
                 self.config.id.clone(),
@@ -225,6 +288,12 @@ impl Agent {
         let mut signals = Vec::new();
         let mut reductions = Vec::new();
         let mut tool_calls = 0u32;
+
+        // The last step's answer and stop reason, kept because the ceiling is a
+        // real ending and the account of where the run got to is made of them.
+        // Only a step that asked for tools reaches the assignment below, so
+        // neither a completion nor a stop the loop reports itself passes here.
+        let mut last: Option<(u32, String, StopDisposition)> = None;
 
         for step in 1..=self.config.max_steps {
             self.timeline.enter(self.config.id.clone());
@@ -337,9 +406,29 @@ impl Agent {
                     self.messages.push(Message::user(blocks));
                 }
                 StopDisposition::Resume => {
-                    // `pause_turn`: a server tool paused mid-turn. Re-send to let
-                    // it continue; the assistant turn is already recorded.
-                    tracing::debug!(step, "pause_turn — resuming");
+                    // `pause_turn` says a **server-side** tool paused mid-turn and
+                    // re-sending lets it continue. This layer serves no server
+                    // tools, so it cannot be in that state, and re-sending is
+                    // what turned this into a spin: one step per iteration until
+                    // the budget was gone, after which the run reported a *step
+                    // ceiling* — an account that named the budget instead of the
+                    // cause. `decision.rs` refuses `pause_turn` for the same
+                    // reason; this arm is that policy applied to a loop that can
+                    // still hand back an account instead of an error. The two
+                    // arms live in different files, so they change together: a
+                    // layer that ever serves server tools is the one case that
+                    // makes `Resume` legitimate again, and it makes it for both.
+                    return Ok(LoopOutcome {
+                        steps: step,
+                        text: sink.text.clone(),
+                        stop: disposition,
+                        usage,
+                        tool_calls,
+                        signals,
+                        reductions,
+                        stopped_early: Some(LoopStop::PauseTurn),
+                        composition: self.measure_context(),
+                    });
                 }
                 StopDisposition::Complete => {
                     return Ok(LoopOutcome {
@@ -350,6 +439,7 @@ impl Agent {
                         tool_calls,
                         signals,
                         reductions,
+                        stopped_early: None,
                         composition: self.measure_context(),
                     });
                 }
@@ -360,9 +450,45 @@ impl Agent {
                     return Err(LoopError::UnrecognizedStop(raw));
                 }
             }
+
+            // Only a step that asked for tools to run reaches this point, and
+            // it is the account a ceiling would report.
+            last = Some((step, sink.text.clone(), disposition));
         }
 
-        Err(LoopError::StepCeiling(self.config.max_steps))
+        // The step ceiling, reported as an outcome rather than raised as an
+        // error.
+        //
+        // DESIGN's rule is that the decision layer receives an account of what
+        // happened. The ceiling is the most common way an executor's run ends —
+        // a loop that keeps calling tools reaches it — and as an `Err` it
+        // travelled up `run_delegation`'s `?` into `DecisionLayer::run`, which
+        // then returned `Err` with no report, no evidence and no acceptance
+        // numbers. Everything the account needs is still in hand here: the
+        // record holds what ran, and the counters and signals below are the
+        // run's own shape.
+        let (steps, text, stop) = last.unwrap_or_else(|| {
+            // Unreachable: a positive budget sends at least one request, and
+            // every request lands in `last`. Stated rather than asserted, since
+            // a panic here would be the same lost run this branch exists to
+            // prevent.
+            (
+                0,
+                String::new(),
+                StopDisposition::Unrecognized("<no step was taken>".to_owned()),
+            )
+        });
+        Ok(LoopOutcome {
+            steps,
+            text,
+            stop,
+            usage,
+            tool_calls,
+            signals,
+            reductions,
+            stopped_early: Some(LoopStop::StepCeiling(self.config.max_steps)),
+            composition: self.measure_context(),
+        })
     }
 
     /// What this agent's context is made of, measured over the whole of it.
@@ -767,6 +893,177 @@ pub(crate) fn request_digest(req: &MessagesRequest) -> String {
     hex::encode(&hasher.finalize()[..16])
 }
 
+/// Fixtures for tests that need a run to *repeat* rather than finish.
+///
+/// The loop's budget can only be reached by a model that keeps asking for
+/// tools, which no real endpoint will do on request — and `WireClient` is a
+/// concrete type, so there is nothing to substitute inside the loop. What this
+/// provides is the double at the system's edge instead: a real HTTP server on a
+/// real loopback socket, the same shape `yu-wire`'s redirect tests use, with
+/// everything between the socket and the assertion left as production code.
+///
+/// Gated on `cfg(test)` so it cannot become a production shortcut.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use yu_wire::client::{Auth, WireClient};
+
+    /// A scratch directory this test owns. `tempfile` is not a dependency of
+    /// this crate, and the directory is re-created empty, so a leftover from a
+    /// failed run can never be read as part of a passing one.
+    pub fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("yu-core-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A turn that asks for one `exec` call and is nowhere near done.
+    ///
+    /// The thinking block is not decoration: the strict history rule requires
+    /// one with every `tool_use`, and the loop validates before it sends.
+    pub fn endless_tool_use(command: &str) -> String {
+        serde_json::json!({
+            "id": "msg-fake",
+            "model": "fake-model",
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "keep going", "signature": "sig"},
+                {"type": "tool_use", "id": "call_00_fake", "name": "exec",
+                 "input": {"command": command}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })
+        .to_string()
+    }
+
+    /// A turn the endpoint says it wants to resume: a server-side tool paused
+    /// mid-turn. A layer with no server tools cannot be in that state, which is
+    /// what makes it the interesting reply here.
+    pub fn paused_turn_reply() -> String {
+        serde_json::json!({
+            "id": "msg-fake",
+            "model": "fake-model",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "pausing"}],
+            "stop_reason": "pause_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })
+        .to_string()
+    }
+
+    /// A turn that answers and ends.
+    pub fn final_reply(text: &str) -> String {
+        serde_json::json!({
+            "id": "msg-fake",
+            "model": "fake-model",
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })
+        .to_string()
+    }
+
+    /// A model endpoint that answers from a fixed script.
+    pub struct FakeEndpoint {
+        addr: SocketAddr,
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl FakeEndpoint {
+        /// Answer every request with the same reply.
+        pub fn always(reply: impl Into<String>) -> Self {
+            Self::scripted(vec![reply.into()])
+        }
+
+        /// Answer the nth request with the nth reply, repeating the last.
+        pub fn scripted(replies: Vec<String>) -> Self {
+            assert!(!replies.is_empty(), "a script needs at least one reply");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+            let addr = listener.local_addr().expect("the listener's address");
+            let requests = Arc::new(AtomicUsize::new(0));
+            let counter = requests.clone();
+            std::thread::spawn(move || {
+                while let Ok((mut sock, _)) = listener.accept() {
+                    if read_request(&mut sock).is_none() {
+                        continue;
+                    }
+                    let index = counter.fetch_add(1, Ordering::SeqCst);
+                    let reply = replies
+                        .get(index)
+                        .unwrap_or_else(|| replies.last().expect("checked at construction"));
+                    // An answer that arrives before the client has finished
+                    // writing would be read as a connection reset, so the
+                    // request is fully drained above before this one.
+                    let _ = sock.write_all(&http_json(reply));
+                }
+            });
+            Self { addr, requests }
+        }
+
+        /// A client pointed at this endpoint, with the strict history rules a
+        /// measured profile would impose.
+        pub fn client(&self) -> Arc<WireClient> {
+            Arc::new(
+                WireClient::builder()
+                    .base_url(format!("http://{}", self.addr))
+                    .auth(Auth::ApiKey("test-credential".to_owned()))
+                    .default_model("fake-model")
+                    .build()
+                    .expect("a loopback base url is a valid endpoint"),
+            )
+        }
+
+        /// How many requests actually arrived, for asserting what stopped a run.
+        pub fn requests(&self) -> usize {
+            self.requests.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Read one complete HTTP request: the head, then `content-length` bytes.
+    fn read_request(sock: &mut TcpStream) -> Option<()> {
+        let mut raw = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            if let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if raw.len() >= head_end + 4 + body_len {
+                    return Some(());
+                }
+            }
+            match sock.read(&mut buf) {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => raw.extend_from_slice(&buf[..n]),
+            }
+        }
+    }
+
+    /// A plain JSON message under a 200. The client accepts one — a proxy that
+    /// drops `stream: true` is a real thing, and this keeps the double simple
+    /// without pretending the endpoint is something it is not.
+    fn http_json(body: &str) -> Vec<u8> {
+        format!(
+            "HTTP/1.1 200 OK\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .into_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,6 +1243,96 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // The loop's own stop is an outcome, not an error
+    // -----------------------------------------------------------------------
+
+    /// A run that exhausts its step budget comes back as an outcome.
+    ///
+    /// The budget is the harness's own stop and the most common way an
+    /// executor's run ends. As an `Err` it erased the run: `run_delegation`'s
+    /// `?` carried it up into `DecisionLayer::run`, which returned `Err` with no
+    /// report, no evidence and no numbers — and because `Ok` was returned only
+    /// on completion, a caller asking "did it finish?" was answered yes for
+    /// every outcome the loop could actually produce.
+    #[tokio::test]
+    async fn a_run_that_exhausts_its_steps_is_an_outcome_rather_than_an_error() {
+        let fake = test_support::FakeEndpoint::always(test_support::endless_tool_use("true"));
+        let dir = scratch_dir("step-ceiling");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let mut agent = Agent::new(
+            fake.client(),
+            journal,
+            Arc::new(ToolRegistry::native(&dir)),
+            Timeline::new(),
+            AgentConfig::new(AgentId::new("executor"), "fake-model").max_steps(2),
+            dir.clone(),
+        );
+
+        let outcome = agent
+            .run("keep going")
+            .await
+            .expect("a run that runs out of steps is an outcome, not an error");
+
+        assert_eq!(outcome.steps, 2);
+        assert_eq!(outcome.tool_calls, 2);
+        assert_eq!(outcome.stopped_early, Some(LoopStop::StepCeiling(2)));
+        assert_ne!(
+            outcome.stop,
+            StopDisposition::Complete,
+            "the last turn asked for a tool, so it cannot read as completion"
+        );
+        assert_eq!(fake.requests(), 2, "the budget is what stopped the run");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `pause_turn` stops the run and says so, instead of being re-sent.
+    ///
+    /// The disposition presupposes a server-side tool that paused mid-turn, and
+    /// nothing in this harness registers one, so "not servable here" is the
+    /// honest reading. Re-sending — which this loop did — spends a step per
+    /// iteration to learn the same thing, and the run then reports a step
+    /// ceiling: an account of a spin that names the budget rather than the
+    /// cause. The request count is what separates the two behaviours: one turn
+    /// asked, one turn answered.
+    ///
+    /// `decision.rs` refuses the same disposition, so the two loops now apply
+    /// one policy — see the `Resume` arm in `run` for why it is stated in both.
+    #[tokio::test]
+    async fn a_pause_turn_is_stopped_with_an_account_rather_than_re_sent() {
+        let fake = test_support::FakeEndpoint::always(test_support::paused_turn_reply());
+        let dir = scratch_dir("pause-turn");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let mut agent = Agent::new(
+            fake.client(),
+            journal,
+            Arc::new(ToolRegistry::read_only(&dir)),
+            Timeline::new(),
+            AgentConfig::new(AgentId::new("executor"), "fake-model").max_steps(3),
+            dir.clone(),
+        );
+
+        let outcome = agent
+            .run("keep going")
+            .await
+            .expect("an unservable stop reason is an outcome, not an error");
+
+        assert_eq!(fake.requests(), 1, "re-sending is the spin this replaced");
+        assert_eq!(outcome.steps, 1);
+        assert_eq!(outcome.stopped_early, Some(LoopStop::PauseTurn));
+        assert_eq!(outcome.stop, StopDisposition::Resume);
+        assert_eq!(outcome.text, "pausing");
+        assert!(
+            outcome
+                .stopped_early
+                .expect("set above")
+                .describe()
+                .contains("pause_turn"),
+            "the account has to name what happened"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -----------------------------------------------------------------------
     // A spill the store refused must not become a pointer
     // -----------------------------------------------------------------------
 
@@ -998,14 +1385,7 @@ mod tests {
         Arc::new(registry)
     }
 
-    /// A scratch directory this test owns. `tempfile` is not a dependency of
-    /// this crate, and the directory is re-created empty, so a leftover from a
-    /// failed run can never be read as part of a passing one.
-    fn scratch_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("yu-core-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        dir
-    }
+    use super::test_support::scratch_dir;
 
     /// The text the model receives — the place a pointer would lie in.
     fn block_text(block: &ContentBlock) -> String {
