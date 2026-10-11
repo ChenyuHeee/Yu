@@ -13,6 +13,7 @@
 //! implementations. `core` must not depend on `yu-policy`.
 
 pub mod agent;
+pub mod decide;
 pub mod decision;
 pub mod delegate;
 pub mod gate;
