@@ -250,6 +250,16 @@ pub struct DecisionLayer {
     /// Two delegations that both numbered from one would put two runs under one
     /// name, and the record is the only thing that says which of them ran.
     derived: u32,
+    /// Material carried in from before this session began, addressed.
+    ///
+    /// A generation change hands the next session its state — L0 and L1 — and
+    /// an *index* of everything else it carried. The state is rendered; the
+    /// index has to be in the manifest, because a manifest is the one structure
+    /// whose job is to say what exists in the record and how to reach it. Left
+    /// out, the carried state would be a summary the next session cannot check
+    /// (`yu_workflow::handover`), which is the failure the whole flow exists to
+    /// prevent.
+    carried: Vec<NotLoadedEntry>,
 }
 
 impl DecisionLayer {
@@ -273,7 +283,19 @@ impl DecisionLayer {
             cwd,
             outcome_sets: crate::outcomes::OutcomeSets::default(),
             derived: 0,
+            carried: Vec::new(),
         }
+    }
+
+    /// Give the layer the state a generation change carried in, as manifest
+    /// entries: what it is, where it lives, and how to load it.
+    ///
+    /// Entries rather than text, because this is *not* injected into the
+    /// context — that is the whole point. The layer is told the material exists
+    /// and can pay for it with `spot_check`; it is not handed it.
+    pub fn with_carried(mut self, carried: Vec<NotLoadedEntry>) -> Self {
+        self.carried = carried;
+        self
     }
 
     /// Give the layer the prediction sets a policy declared.
@@ -834,7 +856,11 @@ impl DecisionLayer {
         outcomes: &[DelegateOutcome],
         latest: &[DelegateOutcome],
     ) -> View {
-        let (shape, omitted) = carry_for_this_round(outcomes, latest);
+        let (shape, mut omitted) = carry_for_this_round(outcomes, latest);
+        // What a generation change carried in is omitted material like any
+        // other: it exists in the record, it is not in this view, and the
+        // manifest is where that is said.
+        omitted.extend(self.carried.iter().cloned());
         render(RenderInput {
             prompt: DECISION_PROMPT,
             charter: &self.charter,

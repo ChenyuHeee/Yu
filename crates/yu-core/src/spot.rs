@@ -22,7 +22,9 @@
 //!
 //! * `blob:<digest>` — a payload in the record's content-addressed store: a
 //!   spilled tool result, or a recorded reply.
-//! * `journal:seq=<n>` — a tool output kept inline on the log line.
+//! * `journal:seq=<n>` — a position in the log: a tool output kept inline, or
+//!   any other event whose text the record holds there (a decision `Note`, a
+//!   turn's prose, the charter).
 //! * `journal:seq=<n> (dropped by reduction)` — an output a reduction
 //!   discarded. The suffix is written precisely because there is nothing to
 //!   fetch, and the answer for it is a **report, never an error**: a caller
@@ -253,6 +255,15 @@ fn resolve_blob(address: &str, digest: &str, journal: &Journal) -> Result<Spotte
 /// not, the record wins and the disagreement is stated, because a caller that
 /// trusts a stale annotation either misses bytes that exist or waits for bytes
 /// that never will.
+///
+/// **The scheme names a position in the log, not a kind of event.** It was
+/// introduced for a tool result kept inline, because that was the only thing the
+/// manifest addressed; a handover's index then had to point at the decisions and
+/// constraints the record holds — which live in `Note` events — and an index
+/// whose addresses only some events answer is a summary with extra steps. So an
+/// event that carries text answers with its text, named for what it is, and an
+/// event that carries none says exactly that. Neither answer is an error: both
+/// are the record stating what it holds at that position.
 async fn resolve_journal(
     address: &str,
     rest: &str,
@@ -276,15 +287,25 @@ async fn resolve_journal(
         ..
     } = &event.body
     else {
-        return Ok(nothing(
-            address,
-            None,
-            &format!(
-                "seq {seq} holds a `{}` event, not a tool output. `journal:seq=<n>` names a tool \
-                 result kept inline in the log, and there is none behind this address.",
-                event.body.kind()
+        return Ok(match text_at(&event.body, journal) {
+            Some(text) => loaded(
+                address,
+                &text,
+                &[format!(
+                    "seq {seq} holds a `{}` event; the text above is what it recorded",
+                    event.body.kind()
+                )],
             ),
-        ));
+            None => nothing(
+                address,
+                None,
+                &format!(
+                    "seq {seq} holds a `{}` event, and that event carries no text — there is \
+                     nothing behind this address to read.",
+                    event.body.kind()
+                ),
+            ),
+        });
     };
 
     let mismatch = claimed_dropped.then(|| {
@@ -321,6 +342,31 @@ async fn resolve_journal(
             Some(*bytes),
             &dropped_account(name, *bytes, *reproducible, reduction.as_deref()),
         )),
+    }
+}
+
+/// The text an event carries, whichever field holds it.
+///
+/// One function rather than a match at the call site, because the handover's
+/// index and this resolver have to agree about what counts as the record's own
+/// words at a position: a `Note` is a decision, a `ToolCall` is what ran, a
+/// `ModelResponse` keeps its prose in a blob. An event with no text at all —
+/// `ModelRequest`, `Forked`, `Delegated` — answers `None`, and that absence is
+/// reported rather than papered over.
+fn text_at(body: &EventBody, journal: &Journal) -> Option<String> {
+    match body {
+        // An empty charter is not text: answering with `Some("")` would report
+        // an address as resolved while showing nothing, which is the shape this
+        // resolver exists to refuse.
+        EventBody::SessionStarted { charter, .. } if !charter.is_empty() => Some(charter.clone()),
+        EventBody::UserMessage { text } => Some(text.clone()),
+        EventBody::Note { text } => Some(text.clone()),
+        EventBody::ToolCall { name, input, .. } => Some(format!("{name} {input}")),
+        EventBody::ModelResponse { text_blob, .. } => text_blob
+            .as_ref()
+            .and_then(|digest| journal.blobs().get_str(digest).ok()),
+        EventBody::Injected { blob, .. } => journal.blobs().get_str(blob).ok(),
+        _ => None,
     }
 }
 
@@ -866,26 +912,68 @@ mod tests {
         assert_eq!(spotted.address, address);
     }
 
+    /// An address that names an event carrying no text says so, rather than
+    /// pretending to be a payload.
+    ///
+    /// This guard used to be pointed at the first event of the run — a
+    /// `session_started`, whose charter is text — and asserted that the resolver
+    /// refused it. It does not refuse text any more: a handover's index has to
+    /// be able to point at the decisions and constraints the record holds, which
+    /// live in `Note` events, so `journal:seq=<n>` names a position in the log
+    /// and answers with whatever text is at it. The property the old test
+    /// guarded — an address is never shown as a payload that is not there — is
+    /// what is asserted here, on the events that still have no text.
     #[tokio::test]
-    async fn a_seq_that_names_a_non_tool_event_says_what_it_is() {
+    async fn a_seq_that_names_an_event_with_no_text_says_what_it_is() {
         let (_dir, journal, _outcome) = run("spot-non-tool", vec![final_reply("done")], &[]).await;
-        let first = journal
-            .read_range(0, 1)
+        let request = journal
+            .events()
             .await
             .unwrap()
             .into_iter()
-            .next()
-            .expect("the run recorded something");
+            .find(|event| matches!(event.body, EventBody::ModelRequest { .. }))
+            .expect("the run recorded a request");
 
-        let spotted = resolve(&format!("journal:seq={}", first.seq), &journal)
+        let spotted = resolve(&format!("journal:seq={}", request.seq), &journal)
             .await
             .expect("the record answers with what the event is");
         assert_eq!(spotted.bytes, 0);
         assert!(
-            spotted.text.contains(first.body.kind()) && spotted.text.contains("not a tool output"),
+            spotted.text.contains(request.body.kind())
+                && spotted.text.contains("carries no text"),
             "{}",
             spotted.text
         );
+    }
+
+    /// A seq that names a `Note` resolves to what the note says.
+    ///
+    /// Notes are where the decision layer's decisions and retirements are
+    /// recorded, and a handover's index points straight at them. Before this
+    /// answered, an index built over a run's decisions had addresses nothing
+    /// could follow — a summary with extra steps.
+    #[tokio::test]
+    async fn a_seq_that_names_a_note_resolves_to_the_notes_own_words() {
+        let (_dir, journal, _outcome) = run("spot-note", vec![final_reply("done")], &[]).await;
+        let note = journal
+            .append(
+                AgentId::decision(),
+                EventBody::Note {
+                    text: "decide — parse the config with a parser, not a regex".to_owned(),
+                },
+            )
+            .await
+            .expect("a note is appended");
+
+        let spotted = resolve(&format!("journal:seq={}", note.seq), &journal)
+            .await
+            .expect("a note is text the record holds, so the address resolves");
+        assert!(
+            spotted.text.contains("not a regex"),
+            "the text behind the address is the note's own: {}",
+            spotted.text
+        );
+        assert!(spotted.text.contains("note"), "{}", spotted.text);
     }
 
     #[tokio::test]
