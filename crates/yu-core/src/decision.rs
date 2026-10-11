@@ -533,6 +533,17 @@ impl Resumed {
                     .to_owned(),
             );
         }
+        if delegations == 0 && derived > 0 {
+            // A record whose delegations predate call recording: the derived
+            // agents are still there as edges, so no two runs share an address,
+            // but the *count* the delegation notes number by cannot be read back.
+            not_recoverable.push(
+                "how many delegations this session had already made: its `delegated` edges are \
+                 in the record, its calls are not, so the note numbering restarts (the derived \
+                 agents keep distinct addresses either way)"
+                    .to_owned(),
+            );
+        }
 
         Ok(Self {
             charter,
