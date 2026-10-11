@@ -355,6 +355,85 @@ async fn forking_a_point_leaves_the_parent_byte_for_byte_alone() {
     );
 }
 
+/// A branch read back by a **later process** still knows its parent.
+///
+/// The lineage used to live only in the handle that made the fork: `open_fork`
+/// set the parent on the child object, and a `Journal::open` of the same branch
+/// afterwards knew nothing about it. That made a fork a fork for exactly one
+/// process's lifetime — and the record's own marker, the thing that says where it
+/// came from, was read by nobody.
+///
+/// Everything here goes through `journal_in`, which is `Journal::open`: no parent
+/// handle is handed over, and the chain is rebuilt from the markers on disk.
+#[tokio::test]
+async fn a_branch_reopened_from_disk_finds_its_parent_again() {
+    let dir = tempdir();
+    {
+        let first = Arc::new(journal_in(dir.path(), "gen1").await);
+        first
+            .append(
+                agent(),
+                EventBody::Effect {
+                    key: "charged-in-gen1".into(),
+                    description: "the payment".into(),
+                    state: EffectState::Done { result_seq: None },
+                    tool_use_id: None,
+                    idempotent: true,
+                },
+            )
+            .await
+            .unwrap();
+        for i in 0..3 {
+            first
+                .append(agent(), EventBody::Note { text: format!("g1-{i}") })
+                .await
+                .unwrap();
+        }
+        let second = Arc::new(journal_fork(dir.path(), "gen2", first.clone(), 2).await);
+        second
+            .append(agent(), EventBody::Note { text: "g2".into() })
+            .await
+            .unwrap();
+        let _third = journal_fork(dir.path(), "gen3", second.clone(), 4).await;
+        // All three handles drop here: whatever a later reader knows comes off
+        // the disk.
+    }
+
+    let reopened = journal_in(dir.path(), "gen3").await;
+    assert_eq!(
+        reopened.lineage(),
+        vec![
+            (SessionId::new("gen2"), 4),
+            (SessionId::new("gen1"), 2)
+        ],
+        "the branch must name the chain it was read back with"
+    );
+    assert_eq!(
+        reopened.cache_diverges_at(),
+        Some((SessionId::new("gen2"), 4)),
+        "and the point where its bytes stop matching its parent's"
+    );
+    // gen1's two notes (0, 1), gen2's own note (3, because the fork marker took
+    // seq 2), and no marker anywhere: the chain resolves through two generations
+    // of records read off the disk.
+    assert_eq!(
+        reopened
+            .history()
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 3],
+        "the whole chain, resolved through two generations of markers"
+    );
+    assert!(
+        reopened.replay_seed().await.unwrap().is_committed("charged-in-gen1"),
+        "a branch two generations down inherits the effects its ancestors completed \
+         — read back from disk, not from a handle"
+    );
+}
+
 #[tokio::test]
 async fn a_forks_thinking_is_readable_through_the_chain() {
     // Whatever the branch inherited must be usable, not merely counted.

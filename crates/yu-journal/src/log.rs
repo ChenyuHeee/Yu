@@ -148,10 +148,44 @@ impl Journal {
     ///
     /// Reopening an existing file rebuilds the index from it and resumes seq
     /// numbering — the record is the only source of truth about where it ends.
+    ///
+    /// A branch reopened from disk finds its parent again. The record's first
+    /// event says which record it was forked from and where, so the lineage is
+    /// not something a process has to remember: a branch read back by a *later*
+    /// process reads its history through its parent exactly as the process that
+    /// made the fork did. Without this, a fork would only be a fork while the
+    /// handle that made it lived, and "任意历史点可被精确重建并分叉" would hold for
+    /// one process's lifetime only.
     pub async fn open(dir: impl Into<PathBuf>, session: SessionId) -> Result<Self, JournalError> {
-        let dir = dir.into();
+        let mut seen = std::collections::BTreeSet::new();
+        Self::open_inner(dir.into(), session, &mut seen).await
+    }
+
+    /// The recursive half, boxed by hand.
+    ///
+    /// A chain of forks is a chain of awaits, and the compiler cannot size an
+    /// unboxed one. `Pin<Box<..>>` rather than `futures-util`'s `BoxFuture`
+    /// because this crate does not depend on that crate, and two lines are not
+    /// worth acquiring it for. The recursion is bounded by `seen`: a lineage that
+    /// returned to a session it already walked is refused rather than followed.
+    fn open_inner<'a>(
+        dir: PathBuf,
+        session: SessionId,
+        seen: &'a mut std::collections::BTreeSet<String>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self, JournalError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
         if session.as_str().is_empty() {
             return Err(JournalError::EmptySessionId);
+        }
+        if !seen.insert(session.as_str().to_owned()) {
+            // A record cannot be its own ancestor. Reported rather than followed,
+            // because following it would not terminate.
+            return Err(JournalError::Corrupt {
+                offset: 0,
+                reason: format!("the fork lineage returns to `{session}`"),
+            });
         }
         tokio::fs::create_dir_all(&dir).await?;
 
@@ -180,7 +214,7 @@ impl Journal {
         let offset = index.committed_len();
         let next_seq = index.next_seq();
 
-        Ok(Self {
+        let journal = Self {
             dir,
             path,
             session,
@@ -197,6 +231,52 @@ impl Journal {
             timeline: None,
             parent: None,
             fork_at: None,
+        };
+
+        let Some((parent_id, at_seq)) = journal.fork_marker().await? else {
+            return Ok(journal);
+        };
+        let parent_path = journal.dir.join(event_log_file_name(&parent_id));
+        if !tokio::fs::try_exists(&parent_path).await? {
+            // The branch's own file is intact and readable; what is missing is the
+            // record it points at. Opening it would *create* an empty file under
+            // the parent's name — a phantom ancestor whose silence would read as
+            // "that record did no work" — so the attachment is skipped, and said
+            // out loud rather than left to be discovered as a short history.
+            tracing::warn!(
+                parent = %parent_id,
+                "this record says it was forked from a session with no file here; \
+                 its prefix cannot be read through the parent"
+            );
+            return Ok(journal);
+        }
+        let parent = Self::open_boxed(journal.dir.clone(), parent_id, seen).await?;
+        Ok(journal.with_parent(parent, at_seq))
+        })
+    }
+
+    async fn open_boxed(
+        dir: PathBuf,
+        session: SessionId,
+        seen: &mut std::collections::BTreeSet<String>,
+    ) -> Result<std::sync::Arc<Self>, JournalError> {
+        Ok(std::sync::Arc::new(Self::open_inner(dir, session, seen).await?))
+    }
+
+    /// The fork marker, when this record begins with one.
+    ///
+    /// Read from the file rather than remembered, because the question is asked at
+    /// open time and the first line is where the answer is.
+    async fn fork_marker(&self) -> Result<Option<(SessionId, u64)>, JournalError> {
+        let Some(first) = self.events().await?.into_iter().next() else {
+            return Ok(None);
+        };
+        Ok(match first.body {
+            EventBody::Forked {
+                parent,
+                parent_at_seq,
+            } if parent != self.session => Some((parent, parent_at_seq)),
+            _ => None,
         })
     }
 

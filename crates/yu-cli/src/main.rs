@@ -1181,8 +1181,8 @@ async fn cmd_fork(dir: &PathBuf, session: &str, at: u64, into: &str) -> anyhow::
     );
     match child.cache_diverges_at() {
         Some((parent_session, at)) => eprintln!(
-            "--- cache prefix diverges at {parent_session}:{at}; requests on this branch \n\
-             --- from that point onward match nothing cached"
+            "--- cache prefix diverges at {parent_session}:{at}: requests on this branch from \
+             that point onward match nothing cached"
         ),
         None => eprintln!("--- this branch is not a fork and diverges nowhere"),
     }
