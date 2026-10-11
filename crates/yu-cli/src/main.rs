@@ -23,6 +23,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use yu_core::agent::{Agent, AgentConfig};
 use yu_core::decision::{DecisionConfig, DecisionLayer};
 use yu_core::render::Charter;
+use yu_policy::resource::Policy;
 use yu_journal::{EventBody, Journal, SessionId};
 use yu_observe::{AgentId, ContextComposition, SpanKind, Timeline};
 use yu_tools::ToolRegistry;
@@ -132,6 +133,10 @@ enum Command {
         max_rounds: u32,
         #[arg(long, value_enum, default_value_t = ToolSet::ReadOnly)]
         tools: ToolSet,
+        /// The policy resource. A delegation's prediction sets come from here,
+        /// which is what lets one be changed without rebuilding anything.
+        #[arg(long)]
+        policy: Option<PathBuf>,
     },
 
     /// Summarise a recorded session.
@@ -177,7 +182,19 @@ async fn main() -> ExitCode {
             model,
             max_rounds,
             tools,
-        } => cmd_decide(&charter, &dir, cwd, model, max_rounds, tools).await,
+            policy,
+        } => {
+            cmd_decide(
+                &charter,
+                &dir,
+                cwd,
+                model,
+                max_rounds,
+                tools,
+                policy.as_deref(),
+            )
+            .await
+        }
         Command::Metrics { dir } => cmd_metrics(&dir).await,
     };
 
@@ -467,6 +484,46 @@ fn report_ratio(label: &str, composition: &ContextComposition) {
     }
 }
 
+/// Print where each delegation landed, and anything the harness caught.
+///
+/// The landing is the report, so this is the run's actual result rather than a
+/// summary of it: a delegation that landed on `pass` says more in five
+/// characters than its prose does, and the check that follows is the only part
+/// of this output nobody had to be trusted for.
+fn report_landings(outcome: &yu_core::decision::DecisionOutcome) {
+    if outcome.outcomes.iter().all(|d| d.landing.is_none()) {
+        return;
+    }
+    eprintln!("\n--- landings");
+    for (i, delegation) in outcome.outcomes.iter().enumerate() {
+        match &delegation.landing {
+            Some(landing) => {
+                let note = if landing.is_other() {
+                    match &landing.unlisted {
+                        Some(word) => format!(" (the executor called it `{word}`)"),
+                        None => " (unpredicted)".to_owned(),
+                    }
+                } else {
+                    String::new()
+                };
+                eprintln!(
+                    "      #{i} {}/{} — {}{note}",
+                    landing.set, landing.slot, landing.why
+                );
+            }
+            None => eprintln!("      #{i} not classified (no set was pre-registered)"),
+        }
+        if let Some(caught) = &delegation.contradiction {
+            // Marked, not buried. This is the one line in the output that is a
+            // machine's finding rather than anyone's account.
+            eprintln!("      !! {caught}");
+        }
+    }
+    for problem in outcome.landing_problems() {
+        eprintln!("      !! {problem}");
+    }
+}
+
 /// Print L1 as the run left it.
 ///
 /// L1 is what the run *produced* — the decisions and their reasons, what was
@@ -581,6 +638,7 @@ async fn cmd_decide(
     model: Option<String>,
     max_rounds: u32,
     tool_set: ToolSet,
+    policy_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
@@ -607,6 +665,9 @@ async fn cmd_decide(
     let surface = describe_tools(&tools);
     let mut config = DecisionConfig::new(model);
     config.max_rounds = max_rounds;
+    // The prediction sets come from the policy file, so changing one is an edit
+    // to a resource rather than a rebuild — DESIGN's constraint 0, applied to
+    // the one thing the decision layer is forbidden to invent.
     let mut layer = DecisionLayer::new(
         client,
         journal,
@@ -616,6 +677,32 @@ async fn cmd_decide(
         charter,
         cwd,
     );
+    if let Some(path) = policy_path {
+        let policy = Policy::from_path(path)
+            .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+        let ids = policy.outcome_sets.ids();
+        eprintln!(
+            "--- policy {} — {} outcome set(s){}",
+            path.display(),
+            ids.len(),
+            if ids.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", ids.join(", "))
+            }
+        );
+        if ids.is_empty() {
+            // Said out loud rather than passed over: without a set, `delegate`
+            // is offered with no `outcomes` field, and every delegation runs
+            // unchecked. That is a real difference in what the run can prove,
+            // and it should not be discoverable only by reading the tool schema.
+            eprintln!(
+                "--- no prediction sets declared: delegations will not be classified, and \
+                 no landing can be checked"
+            );
+        }
+        layer = layer.with_outcome_sets(policy.outcome_sets);
+    }
 
     eprintln!(
         "session {} — journal in {} — executor tool surface: {}",
@@ -640,6 +727,7 @@ async fn cmd_decide(
         outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.usage.cache_read_input_tokens
     );
 
+    report_landings(&outcome);
     report_ledger(&outcome.ledger);
     // The comparison the whole design rests on, from one run.
     report_ratio("decision layer", &outcome.composition);

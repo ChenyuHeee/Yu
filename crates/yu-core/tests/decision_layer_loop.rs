@@ -762,7 +762,7 @@ async fn every_request_carries_a_freshly_rendered_view_and_its_own_measurement()
             prompt: DECISION_PROMPT,
             charter: &charter,
             ledger: &ledger,
-            tools: &decision_surface(),
+            tools: &decision_surface(&Default::default()),
             report: None,
             evidence: &[],
             shape: &[],
@@ -1012,7 +1012,7 @@ async fn a_loop_that_keeps_asking_is_stopped_at_the_round_ceiling_and_says_so() 
 #[test]
 fn the_prompt_advertises_exactly_the_tools_the_layer_is_offered() {
     let advertised = tools_named_in_the_prompt();
-    let offered: std::collections::BTreeSet<String> = decision_surface()
+    let offered: std::collections::BTreeSet<String> = decision_surface(&Default::default())
         .iter()
         .map(|tool| tool.name().to_owned())
         .collect();

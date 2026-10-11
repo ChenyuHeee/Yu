@@ -68,10 +68,15 @@ pub struct DelegateArgs {
     /// and expensive failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<String>,
-    /// The set of landing slots this call was launched with, when one was
-    /// pre-registered. `None` means the delegation was not asked to classify
-    /// itself, and nothing downstream may pretend it was.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The set of landing slots this call was launched with.
+    ///
+    /// **Not read from the model.** The model names a set *id*; the layer
+    /// resolves it against the policy and fills this in. `skip` is what keeps
+    /// the two apart: without it, a model that could write `slots` could write
+    /// its own set, and the harness would then be checking a landing against a
+    /// claim the executor's caller invented — which is the failure the policy
+    /// exists to prevent.
+    #[serde(skip)]
     pub outcomes: Option<crate::landing::PlannedOutcomes>,
     /// Files the work is expected to touch.
     ///
@@ -571,15 +576,68 @@ fn describe_signal(s: &ShapeSignal) -> String {
 /// model is told about a tool it cannot call, or handed one it was never told
 /// about. `decision_layer_advertises_exactly_the_tools_it_is_offered` compares
 /// this list against the prompt's own.
-pub fn decision_surface() -> Vec<ToolDefinition> {
-    let mut surface = vec![delegate_tool()];
+pub fn decision_surface(sets: &crate::outcomes::OutcomeSets) -> Vec<ToolDefinition> {
+    let mut surface = vec![delegate_tool(sets)];
     // `decide` and `retire` after `delegate`, in that fixed order: the order is
     // part of the cache prefix, so it must not depend on anything.
     surface.extend(crate::decide::decision_tools());
     surface
 }
 
-pub fn delegate_tool() -> ToolDefinition {
+pub fn delegate_tool(sets: &crate::outcomes::OutcomeSets) -> ToolDefinition {
+    let ids = sets.ids();
+    // The prediction sets come from a policy, and the layer **chooses** one
+    // rather than writing one. DESIGN: *"预测集是策略,不是每次现编。决策层按定义不懂
+    // 这个领域,列不出'编译失败 / 测试失败 / 超时'。它只**选**一个集合,**不发明**"*
+    // — which is constraint 0 applied to the one field where inventing something
+    // would look helpful.
+    let (outcomes_schema, required) = if ids.is_empty() {
+        (
+            json!({"type": "null", "description": "No outcome sets are declared in the policy."}),
+            // `task` is required either way; only `outcomes` comes and goes.
+            vec!["task"],
+        )
+    } else {
+        (
+            json!({
+                "type": "string",
+                "enum": ids,
+                "description": "Which pre-registered set of outcomes this call should be \
+                                classified into. The executor lands on one slot from it, \
+                                and the harness checks that landing against what your \
+                                commands actually did. Choose the set that fits the work; \
+                                you cannot invent one."
+            }),
+            vec!["task", "outcomes"],
+        )
+    };
+
+    let mut properties = json!({
+        "task": {
+            "type": "string",
+            "description": "What to accomplish. The executor knows only this."
+        },
+        "question": {
+            "type": "string",
+            "description": "What you need to know, if that differs from the task."
+        },
+        "expected_files": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Files you expect this work to touch. Declaring them is what makes scope drift detectable."
+        },
+        "outcomes": outcomes_schema,
+    });
+    if ids.is_empty() {
+        // With no policy there is nothing to choose, and offering a free-text
+        // field would invite the layer to invent a set — the one thing DESIGN
+        // says it must not do.
+        properties
+            .as_object_mut()
+            .expect("an object schema")
+            .remove("outcomes");
+    }
+
     ToolDefinition::Custom(CustomTool::new(
         "delegate",
         "Send a fresh executor to do work, or to answer a question about work already \
@@ -604,7 +662,7 @@ pub fn delegate_tool() -> ToolDefinition {
                     "description": "Files you expect this work to touch. Declaring them is what makes scope drift detectable."
                 }
             },
-            "required": ["task"],
+            "required": required,
             "additionalProperties": false
         }),
     ))
@@ -731,7 +789,7 @@ mod tests {
         // The description is prompt surface. If it stops promising a summary,
         // the decision layer will start expecting raw output and will be
         // surprised every time — which shows up as it asking for spot checks.
-        let ToolDefinition::Custom(tool) = delegate_tool() else {
+        let ToolDefinition::Custom(tool) = delegate_tool(&Default::default()) else {
             panic!("delegate must be a client-defined tool");
         };
         assert_eq!(tool.name, "delegate");
@@ -743,7 +801,7 @@ mod tests {
 
     #[test]
     fn expected_files_is_optional_but_documented_as_the_source_of_drift_detection() {
-        let ToolDefinition::Custom(tool) = delegate_tool() else {
+        let ToolDefinition::Custom(tool) = delegate_tool(&Default::default()) else {
             panic!()
         };
         let props = &tool.input_schema["properties"];

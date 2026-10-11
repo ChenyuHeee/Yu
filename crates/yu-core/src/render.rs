@@ -940,7 +940,7 @@ mod tests {
     }
 
     fn delegate_tool() -> ToolDefinition {
-        crate::delegate::delegate_tool()
+        crate::delegate::delegate_tool(&Default::default())
     }
 
     fn render_with<'a>(

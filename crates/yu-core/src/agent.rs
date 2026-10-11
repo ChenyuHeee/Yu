@@ -1285,7 +1285,7 @@ mod tests {
             "adding a system prompt must change the digest"
         );
 
-        let with_tools = base.clone().tools(vec![crate::delegate::delegate_tool()]);
+        let with_tools = base.clone().tools(vec![crate::delegate::delegate_tool(&Default::default())]);
         assert_ne!(
             request_digest(&base),
             request_digest(&with_tools),

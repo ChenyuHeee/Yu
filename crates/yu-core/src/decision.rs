@@ -236,6 +236,13 @@ pub struct DecisionLayer {
     charter: Charter,
     ledger: Ledger,
     cwd: PathBuf,
+    /// The prediction sets a policy declared, if one was loaded.
+    ///
+    /// Held by the layer because the layer is what *chooses* — the executor is
+    /// told a set, it does not pick one, and the model names an id rather than
+    /// writing slots. Empty means none were declared, and then `delegate` is
+    /// offered without the field at all rather than with a blank one.
+    outcome_sets: crate::outcomes::OutcomeSets,
 }
 
 impl DecisionLayer {
@@ -257,7 +264,18 @@ impl DecisionLayer {
             charter,
             ledger: Ledger::default(),
             cwd,
+            outcome_sets: crate::outcomes::OutcomeSets::default(),
         }
+    }
+
+    /// Give the layer the prediction sets a policy declared.
+    ///
+    /// DESIGN: *"预测集是策略,不是每次现编"* — so this is the only way a set reaches
+    /// a delegation, and a layer without one offers `delegate` with no `outcomes`
+    /// field rather than a free-text one.
+    pub fn with_outcome_sets(mut self, sets: crate::outcomes::OutcomeSets) -> Self {
+        self.outcome_sets = sets;
+        self
     }
 
     pub fn ledger(&self) -> &Ledger {
@@ -282,10 +300,10 @@ impl DecisionLayer {
         // out again here: a copy of the name is a second source of truth, and
         // the failure it produces — advertising one tool and accepting another —
         // is silent.
-        let only_tool = delegate::delegate_tool().name().to_owned();
+        let only_tool = delegate::delegate_tool(&self.outcome_sets).name().to_owned();
         // Every name the layer was offered, for the message that tells it a name
         // it used is not one of them.
-        let surface = delegate::decision_surface()
+        let surface = delegate::decision_surface(&self.outcome_sets)
             .iter()
             .map(|tool| format!("`{}`", tool.name()))
             .collect::<Vec<_>>()
@@ -521,7 +539,7 @@ impl DecisionLayer {
                     round_delegations += 1;
                     delegations += 1;
 
-                    let args: DelegateArgs = match serde_json::from_value(tu.input.clone()) {
+                    let mut args: DelegateArgs = match serde_json::from_value(tu.input.clone()) {
                         Ok(a) => a,
                         Err(e) => {
                             result_blocks.push(ContentBlock::ToolResult(ToolResultBlock::error(
@@ -531,6 +549,43 @@ impl DecisionLayer {
                             continue;
                         }
                     };
+                    // The model named an id; the policy says what it means. An id
+                    // that is not in the policy is answered rather than defaulted:
+                    // running the delegation without a set would silently drop
+                    // the contract, and inventing one would be the layer writing
+                    // a prediction set — the one thing DESIGN says it must not do.
+                    match tu.input.get("outcomes").and_then(serde_json::Value::as_str) {
+                        Some(id) => match self.outcome_sets.get(id) {
+                            Some(set) => {
+                                args.outcomes = Some(crate::landing::PlannedOutcomes {
+                                    id: set.id.clone(),
+                                    description: set.description.clone(),
+                                    slots: set.slots.clone(),
+                                });
+                            }
+                            None => {
+                                result_blocks.push(ContentBlock::ToolResult(
+                                    ToolResultBlock::error(
+                                        &tu.id,
+                                        format!(
+                                            "there is no outcome set named `{id}`. The policy \
+                                             declares: {}. Pick one of those; you cannot \
+                                             invent a set, and a delegation with no set \
+                                             cannot be checked against anything.",
+                                            self.outcome_sets
+                                                .ids()
+                                                .iter()
+                                                .map(|id| format!("`{id}`"))
+                                                .collect::<Vec<_>>()
+                                                .join(", ")
+                                        ),
+                                    ),
+                                ));
+                                continue;
+                            }
+                        },
+                        None => {}
+                    }
 
                     let outcome = delegate::run_delegation(
                         &args,
@@ -657,7 +712,7 @@ impl DecisionLayer {
             prompt: DECISION_PROMPT,
             charter: &self.charter,
             ledger: &self.ledger,
-            tools: &delegate::decision_surface(),
+            tools: &delegate::decision_surface(&self.outcome_sets),
             report,
             evidence: &evidence,
             shape: &shape,
@@ -960,7 +1015,7 @@ mod tests {
         // DESIGN: "工具面:`delegate` / `ask_human` / `retire` / `decide` /
         // `spot_check` —— **不是** Read/Write/Bash". The thinnest slice builds
         // one of the five; the important half of the claim is what is absent.
-        let tool = delegate::delegate_tool();
+        let tool = delegate::delegate_tool(&Default::default());
         assert_eq!(tool.name(), "delegate");
         assert!(!tool.is_server_defined());
         assert!(matches!(tool, yu_wire::types::ToolDefinition::Custom(_)));
