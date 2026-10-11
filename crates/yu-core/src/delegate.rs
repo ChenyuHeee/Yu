@@ -100,6 +100,15 @@ pub struct DelegateOutcome {
     pub report: String,
     /// Commands that ran, with their exit codes where the run captured one.
     pub evidence: Vec<Evidence>,
+    /// A landing the record contradicts, in the harness's own words.
+    ///
+    /// DESIGN: *"执行者误报本身是决策相关的事实"* — so this is carried to the
+    /// decision layer as well as recorded. It is not an accusation of the
+    /// executor and it is not a judgement: it is the one thing the harness knows
+    /// that neither the executor's account nor the decision layer's reading
+    /// would have surfaced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contradiction: Option<String>,
     /// Where the executor classified this result, when it was asked to.
     ///
     /// `None` means no set was pre-registered, which is different from a landing
@@ -404,25 +413,90 @@ pub async fn outcome_from_run(
     let landing = match (planned, landing_input) {
         (Some(planned), Some(input)) => Some(crate::landing::read_landing(
             &input,
-            &planned.slots,
+            &planned.names(),
             &planned.id,
         )),
-        // Asked, and did not answer. That is itself a finding, and it is
-        // reported as an unpredicted result rather than as an absent one: the
-        // report may still be prose, but nothing in it was classified, so
-        // nothing in it has been checked.
-        (Some(planned), None) => Some(crate::landing::Landing {
-            set: planned.id.clone(),
-            slot: crate::landing::OTHER.to_owned(),
-            why: "the executor did not classify its result".to_owned(),
-            unlisted: None,
+        // Asked, and did not answer. For a run that was cut off this is the one
+        // landing the harness makes rather than checks: the executor is gone and
+        // cannot speak for itself, and a set that correctly predicted a timeout
+        // would read as a set that was wrong if nothing could land it. For a run
+        // that completed, the absence is the finding, and it lands in `other`,
+        // where it rings.
+        (Some(planned), None) => Some(match stopped_early
+            .and_then(|_| crate::contradiction::harness_landing_for(true, &planned.slots))
+        {
+            Some(slot) => crate::landing::Landing {
+                set: planned.id.clone(),
+                slot,
+                why: "the harness landed this: the run was stopped before it could report"
+                    .to_owned(),
+                unlisted: None,
+            },
+            None => crate::landing::Landing {
+                set: planned.id.clone(),
+                slot: crate::landing::OTHER.to_owned(),
+                why: "the executor did not classify its result".to_owned(),
+                unlisted: None,
+            },
         }),
         (None, _) => None,
     };
 
+    // ---- the check. Deterministic, free, and not the decision layer's job.
+    //
+    // DESIGN: *"落位是断言,工具结果是证明 —— 而证明由 **harness** 核对"*. A landing
+    // whose slot makes no checkable claim — `other`, or an `unchecked` slot —
+    // passes through with nothing to report, because there is nothing asserted
+    // to contradict.
+    let facts = crate::contradiction::Facts {
+        completed: stopped_early.is_none(),
+        commands: evidence
+            .iter()
+            .map(|e| (e.label.clone(), e.exit_code))
+            .collect(),
+    };
+    let contradiction = match (&landing, planned) {
+        (Some(landing), Some(planned)) => planned
+            .slots
+            .iter()
+            .find(|slot| slot.name == landing.slot)
+            .and_then(|slot| {
+                let verdict = crate::contradiction::check(slot.expects, &facts);
+                // Only a refutation is a contradiction. `Undecided` is reported
+                // too — it is a real finding about the record — but it is not an
+                // accusation, and flattening the two would either manufacture
+                // assurance or manufacture blame.
+                match verdict {
+                    crate::contradiction::Verdict::Refuted(why) => Some(format!(
+                        "the executor landed on `{}`, but {why}",
+                        landing.slot
+                    )),
+                    crate::contradiction::Verdict::Undecided(why) => {
+                        Some(format!("landing `{}` is unchecked: {why}", landing.slot))
+                    }
+                    crate::contradiction::Verdict::Confirmed => None,
+                }
+            }),
+        _ => None,
+    };
+    if let Some(detail) = &contradiction {
+        // An event, because a misreport is a fact about the run rather than a
+        // message to anyone: whoever reads the record later has to be able to
+        // find it without having been in the room.
+        journal
+            .append(
+                yu_observe::AgentId::new("harness"),
+                yu_journal::EventBody::Note {
+                    text: format!("landing check: {detail}"),
+                },
+            )
+            .await?;
+    }
+
     Ok(DelegateOutcome {
         report: run.text.clone(),
         landing,
+        contradiction,
         evidence,
         shape,
         omitted,
@@ -575,7 +649,7 @@ pub async fn run_delegation(
             planned
                 .slots
                 .iter()
-                .map(|s| format!("`{s}`"))
+                .map(|s| format!("`{}`", s.name))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -593,7 +667,7 @@ pub async fn run_delegation(
             .max_steps(16);
     if let Some(planned) = &args.outcomes {
         config = config.extra_tool(crate::landing::land_tool(
-            &planned.slots,
+            &planned.names(),
             planned.description.as_deref(),
         ));
     }
@@ -631,6 +705,7 @@ pub(crate) mod tests_support {
     pub fn outcome_for(task: &str) -> DelegateOutcome {
         DelegateOutcome {
             landing: None,
+            contradiction: None,
             report: format!("did: {task}"),
             evidence: Vec::new(),
             shape: Vec::new(),
@@ -720,6 +795,7 @@ mod tests {
     fn a_report_with_no_evidence_says_so_explicitly() {
         let outcome = DelegateOutcome {
             landing: None,
+            contradiction: None,
             report: "I refactored the parser and it is much cleaner now.".into(),
             evidence: vec![],
             shape: vec![],
@@ -744,6 +820,7 @@ mod tests {
     fn an_incomplete_run_is_not_reported_as_complete() {
         let outcome = DelegateOutcome {
             landing: None,
+            contradiction: None,
             report: "gave up".into(),
             evidence: vec![],
             shape: vec![],
@@ -765,6 +842,7 @@ mod tests {
     fn evidence_shows_the_command_and_its_exit_code() {
         let outcome = DelegateOutcome {
             landing: None,
+            contradiction: None,
             report: "tests pass".into(),
             evidence: vec![Evidence::command("cargo test", "running 12 tests\nok", 0)],
             shape: vec![],
@@ -785,6 +863,7 @@ mod tests {
     fn outcome_with_report(report: String, address: Option<&str>) -> DelegateOutcome {
         DelegateOutcome {
             landing: None,
+            contradiction: None,
             report,
             evidence: vec![],
             shape: vec![],
@@ -882,6 +961,7 @@ mod tests {
             .join("\n");
         let outcome = DelegateOutcome {
             landing: None,
+            contradiction: None,
             report: "done".into(),
             evidence: vec![Evidence::command("cargo test", long, 0)],
             shape: vec![],
@@ -1069,7 +1149,20 @@ mod tests {
         crate::landing::PlannedOutcomes {
             id: "build".to_owned(),
             description: Some("A build was attempted.".to_owned()),
-            slots: slots.iter().map(|s| (*s).to_owned()).collect(),
+            slots: slots
+                .iter()
+                .map(|s| crate::outcomes::Slot {
+                    name: (*s).to_owned(),
+                    // The fixture's claims: `pass` asserts every command
+                    // succeeded, anything else asserts a failure. Enough for the
+                    // round-trip tests, which are about the plumbing.
+                    expects: if *s == "pass" {
+                        crate::outcomes::Expects::Succeeded
+                    } else {
+                        crate::outcomes::Expects::Failed
+                    },
+                })
+                .collect(),
         }
     }
 
@@ -1088,6 +1181,152 @@ mod tests {
             .expect("the scripted executor finishes");
         let _ = std::fs::remove_dir_all(&dir);
         outcome
+    }
+
+    /// **M3: "自洽检查真的会触发 —— 构造一次执行者误报(落位说 `pass`,工具结果 exit 非零)."**
+    ///
+    /// The executor runs a command that fails and then lands on `pass`, whose
+    /// claim is that everything succeeded. The harness holds both facts — the
+    /// exit status and the landing — and reports the contradiction as an event
+    /// in the record, where whoever reads it later can find it without having
+    /// been in the room.
+    ///
+    /// This is the check DESIGN says is *stronger* than putting evidence in
+    /// front of the decision layer: *"机器判,不靠人看;而且它第一次让误报**可被抓**,而
+    /// 不只是可见."*
+    #[tokio::test]
+    async fn a_misreported_landing_is_caught_and_recorded_as_an_event() {
+        use crate::agent::test_support::{FakeEndpoint, endless_tool_use, final_reply};
+        use yu_journal::SessionId;
+
+        // The command fails; the executor says it passed.
+        let fake = FakeEndpoint::scripted(vec![
+            endless_tool_use("printf 'three bytes'; exit 3"),
+            land_reply("pass", "it all went fine"),
+            final_reply("done"),
+        ]);
+        let dir = scratch_dir("delegate-contradiction");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let tools = Arc::new(yu_tools::ToolRegistry::native(&dir));
+        let mut args = DelegateArgs::new("build the thing");
+        args.outcomes = Some(planned(&["pass", "compile_error"]));
+        let outcome = run_delegation(
+            &args,
+            fake.client(),
+            journal.clone(),
+            tools,
+            Timeline::new(),
+            dir.clone(),
+        )
+        .await
+        .expect("the scripted executor finishes");
+
+        assert_eq!(
+            outcome.landing.as_ref().map(|l| l.slot.as_str()),
+            Some("pass"),
+            "the misreport has to survive to here, or there is nothing to catch"
+        );
+        let contradiction = outcome
+            .contradiction
+            .as_deref()
+            .expect("a `pass` over a failing command is a contradiction");
+        assert!(
+            contradiction.contains("pass") && contradiction.contains("exit 3"),
+            "the finding has to name the landing and the fact that refutes it: {contradiction}"
+        );
+
+        // An event, because a misreport is a fact about the run rather than a
+        // message to anyone.
+        let notes: Vec<String> = journal
+            .events()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.body {
+                EventBody::Note { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notes.iter().any(|text| text.contains("landing check") && text.contains("exit 3")),
+            "the contradiction has to reach the record as an event: {notes:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// And the check does not fire on a landing the record supports.
+    #[tokio::test]
+    async fn an_honest_landing_is_not_reported_as_a_contradiction() {
+        use crate::agent::test_support::{FakeEndpoint, endless_tool_use, final_reply};
+        use yu_journal::SessionId;
+
+        let fake = FakeEndpoint::scripted(vec![
+            endless_tool_use("exit 0"),
+            land_reply("pass", "it all went fine"),
+            final_reply("done"),
+        ]);
+        let dir = scratch_dir("delegate-no-contradiction");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let tools = Arc::new(yu_tools::ToolRegistry::native(&dir));
+        let mut args = DelegateArgs::new("build the thing");
+        args.outcomes = Some(planned(&["pass", "compile_error"]));
+        let outcome = run_delegation(
+            &args,
+            fake.client(),
+            journal,
+            tools,
+            Timeline::new(),
+            dir.clone(),
+        )
+        .await
+        .expect("the scripted executor finishes");
+
+        assert_eq!(
+            outcome.contradiction, None,
+            "a check that fires on an honest run is a check nobody will believe"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **M3: "`other` 存在,且落进去会响."**
+    ///
+    /// A landing the set did not predict makes no claim, so there is nothing to
+    /// refute — and the harness must not invent one. It is still carried, where
+    /// the decision layer sees it.
+    #[tokio::test]
+    async fn landing_in_other_makes_no_claim_and_so_raises_no_contradiction() {
+        use crate::agent::test_support::{FakeEndpoint, endless_tool_use, final_reply};
+        use yu_journal::SessionId;
+
+        let fake = FakeEndpoint::scripted(vec![
+            endless_tool_use("exit 3"),
+            land_reply("disk_full", "no space left"),
+            final_reply("done"),
+        ]);
+        let dir = scratch_dir("delegate-other-check");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let tools = Arc::new(yu_tools::ToolRegistry::native(&dir));
+        let mut args = DelegateArgs::new("build the thing");
+        args.outcomes = Some(planned(&["pass"]));
+        let outcome = run_delegation(
+            &args,
+            fake.client(),
+            journal,
+            tools,
+            Timeline::new(),
+            dir.clone(),
+        )
+        .await
+        .expect("the scripted executor finishes");
+
+        assert!(outcome.landing.as_ref().unwrap().is_other());
+        assert_eq!(
+            outcome.contradiction, None,
+            "`other` asserts nothing, so nothing can contradict it — inventing a \
+             contradiction here would punish the executor for the caller's set \
+             being too small"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **M3's round trip: the executor classifies, and the classification comes back.**

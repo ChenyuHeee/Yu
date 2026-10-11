@@ -51,7 +51,20 @@ pub struct PlannedOutcomes {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    pub slots: Vec<String>,
+    /// The slots, **with what each one asserts**.
+    ///
+    /// The whole slot rather than its name, because the harness checks a landing
+    /// against what its slot claimed — and if the plan carried only names while
+    /// the check read a set from somewhere else, the two could describe
+    /// different sets and the check would be verifying a claim nobody made.
+    pub slots: Vec<crate::outcomes::Slot>,
+}
+
+impl PlannedOutcomes {
+    /// The slot names, for the tool the executor is offered.
+    pub fn names(&self) -> Vec<String> {
+        self.slots.iter().map(|slot| slot.name.clone()).collect()
+    }
 }
 
 /// What the executor said about its own result.
@@ -203,6 +216,18 @@ mod tests {
         ]
     }
 
+    fn planned() -> PlannedOutcomes {
+        use crate::outcomes::{Expects, Slot};
+        PlannedOutcomes {
+            id: "build".to_owned(),
+            description: Some("A build was attempted.".to_owned()),
+            slots: vec![
+                Slot { name: "pass".to_owned(), expects: Expects::Succeeded },
+                Slot { name: "compile_error".to_owned(), expects: Expects::Failed },
+            ],
+        }
+    }
+
     fn tool_names(tool: &ToolDefinition) -> Vec<String> {
         let ToolDefinition::Custom(c) = tool else {
             panic!("`land` is a custom tool");
@@ -290,6 +315,21 @@ mod tests {
                 "a malformed slot is still an unpredicted result: {bad}"
             );
         }
+    }
+
+    /// The plan carries what each slot *asserts*, not just its name.
+    ///
+    /// A plan of names checked against a set read from elsewhere would let the
+    /// two describe different sets, and the check would then be verifying a
+    /// claim nobody made.
+    #[test]
+    fn a_plan_carries_the_claims_its_slots_make_and_can_name_them() {
+        let planned = planned();
+        assert_eq!(planned.names(), vec!["pass", "compile_error"]);
+        assert_eq!(
+            planned.slots[0].expects,
+            crate::outcomes::Expects::Succeeded
+        );
     }
 
     #[test]
