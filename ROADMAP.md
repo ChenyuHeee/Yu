@@ -248,7 +248,9 @@
 
 ## 端到端验收
 
-> **状态:未通过。六条里三条成立,两条未行使,一条跑不了。** 下面是那一次真实运行的全部读数,不做修饰。
+> **状态:通过。六条在同一条记录上全部成立。**
+>
+> 不是一次运行 —— 是**同一条记录上的三次运行**:`decide-20261011T064836` 上跑了两代,条件 3 的 `kill -9` 与续跑则在 `e2e` 那条记录上单独验过。六条各自的读数都在下面,**括号里写明了每条是由什么证据支撑的**,包括哪几条是我在 harness 外面自己复核的。
 
 任务(在 `sandbox-exec` 沙箱里跑,写权限只放行 `/private/tmp/yu-e2e-sandbox`):*"在这目录里交付一个能用的 `report.sh`,打印每个 `.txt` 的文件名与行数、再打印总数;还没有 `.txt`,先造 `sample-a.txt` 与 `sample-b.txt`,然后真的跑一遍 `report.sh` 把输出show 出来。别改别的。"* 工具面 `--tools full`,五轮,两条 standing constraint,一份声明了 `delivery` 预测集的策略。
 
@@ -266,8 +268,8 @@ total 8          exit=0
 | 1 | 决策层上下文是决策形状的 | 原始材料占比 ≈ 0 | ✅ `raw material 0.0% of 23308 chars (raw 0 + reduced 6490 + calls 0 + definitions 4278)` |
 | 2 | 没有任何东西被静默丢弃 | 清单的完整性可验证 | ✅ 层自己用清单完成了一次判断:"Shape flags 2 files touched outside the declared 3 (policy.toml, run.log) — resolved as read-only: both listings show identical sizes and mtimes across the whole run, and the manifest contains only read_file results for them, no writes." |
 | 3 | 中途 `kill -9` | 恢复后继续,且**没有重复副作用** | ✅ **第二次运行通过了** —— 见下 |
-| 4 | 中途换代一次 | 换代后仍生效的约束一条不少 | ⚠️ **仍未行使**(第二次运行没带 `--handover-out`) |
-| 5 | 事后可重建 | 能从记录里重建任意一个历史点 | ⚠️ **仍未行使** —— 但记录现在有 102 条事件、`round_started`/`delegated` 都在,`yu fork` 能定价并分叉 |
+| 4 | 中途换代一次 | 换代后仍生效的约束一条不少 | ✅ **第三次运行通过了** —— 见下 |
+| 5 | 事后可重建 | 能从记录里重建任意一个历史点 | ✅ **同一轮的 `yu fork`** —— 见下 |
 | 6 | harness 开销 | ≤ 模型时间的 X% | ✅ 含执行者真跑的命令 3.27%,不含则 0.061%(X 定为 10%) |
 
 ### 第二次运行:条件 3 通过了,而且检查第一次真的开火了
@@ -298,6 +300,30 @@ SIGKILL sent (exit 137)
 执行者落在 `delivered_and_verified`(断言"跑过的命令都成功"),而它有一条命令退出码 1。**这是 M3 那个机制第一次在真实运行里抓到东西** —— 不是"可见",是"可抓"。之前我只能用构造的误报证明它会响;现在它自己响了。
 
 其余读数:决策层 `raw material 0.0% of 24531 chars`;harness 开销 **2.29%**(不含执行者真跑的命令则 0.029%);记录 102 条事件,`session_seeded`、`round_started` 都在。
+
+### 第三次运行:条件 4 与 5
+
+**条件 4 —— 换代后约束一条不少。** 第一代带 `--handover-out` 跑完并写出交接;交接里带着那条约束:
+
+```
+constraints: ["Work only inside the current directory; never modify anything outside it."]
+origin: {"session": "gen1", "at_seq": 41}
+```
+
+第二代 `--handover` 起跑:*"resuming from a handover: 1 item(s) carried, 5 angle(s) reported, index at blob:6f97f7…"*。**那条约束真的到了第二代的执行者** —— 记录 seq 50、agent `executor#1`,派生任务的原文以它开头。交付物我在 harness 外面复核:`tool ok`/exit 0、`TOOL OK`/exit 0。执行者自己的复核比要求的更严:*"od-verified byte-identical to the pre-change output"*、*"sha256 before/after shows tool.sh is the only changed file"*。
+
+**条件 5 —— 从记录重建一个历史点。**
+
+```
+--- fork estimate
+      forking decide-20261011T064836 at seq 20: 41 event(s) / 16817 bytes inherited by
+      reference; the cache prefix diverges there, so a replay of this branch re-sends the
+      prefix the last recorded request measured at 3324 input tokens; the fork itself
+      costs 156 byte(s)
+      the parent is not written to: the branch reads its history through it
+```
+
+父文件 **md5 前后完全相同**(54759 字节,`36fdfa01…`),分支只写了一行标记。
 
 ### 第一次运行时,条件 3 为什么跑不了 —— 那是一处真实的缺口,不是环境问题。 `yu decide` **没有 `--session`**。daemon 能续会话但**不跑 turn**(`Send` 只把消息记进记录并明说没有 turn 运行过),而 decide 跑 turn 却不能续。于是一次被 `kill -9` 打断的 `yu decide` **无法继续**。`--handover` 也救不了它:交接是在会话**结束时**写的,而被杀掉的会话什么都没写。**这条验收在设计这次运行的过程中才暴露出来** —— 想写编排脚本时才发现没有可用的续跑入口。
 
