@@ -17,6 +17,7 @@ pub mod contradiction;
 pub mod decide;
 pub mod decision;
 pub mod delegate;
+pub mod effects;
 pub mod gate;
 pub mod landing;
 pub mod outcomes;
@@ -27,5 +28,6 @@ pub mod traits;
 
 pub use decision::{DecisionConfig, DecisionLayer, DecisionOutcome};
 pub use delegate::{DelegateArgs, DelegateOutcome};
+pub use effects::{Decision, Plan, Replay};
 pub use render::{render, Charter, Ledger, NotLoaded, RenderInput, View};
 pub use topology::{Derivation, TopologyKind, TopologySpec};

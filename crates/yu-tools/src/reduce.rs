@@ -138,6 +138,16 @@ pub enum Reduction {
         subagent: String,
     },
     SandboxReduce,
+    /// No reduction was chosen, because no payload was produced: the call's
+    /// effect was already recorded as completed, so the loop read the record
+    /// instead of running the tool a second time.
+    ///
+    /// A reduction of its own rather than a pass-through, because the two say
+    /// opposite things about where the bytes came from: a pass-through is a
+    /// payload the tool just produced, this is a payload that was produced once
+    /// and is being re-read. Reporting it as a pass-through would put a call that
+    /// never ran into a run's reduction count.
+    Replayed { seq: u64 },
 }
 
 /// Which of DESIGN's five paths applies.
@@ -409,6 +419,13 @@ impl Reducer {
     ) -> ToolResult {
         match reduction {
             Reduction::PassThrough => result,
+
+            // `apply` is never the road to a replayed call — the loop answers it
+            // from the record, without a payload to reduce — but an unreachable
+            // arm here would be a panic waiting for the first caller that
+            // disagrees. Returning the result untouched is the only answer that
+            // claims nothing.
+            Reduction::Replayed { .. } => result,
 
             Reduction::DropWithManifest { rerun } => {
                 let note = drop_note(&result, rerun.as_deref());

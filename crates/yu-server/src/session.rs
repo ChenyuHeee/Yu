@@ -86,6 +86,15 @@ pub struct SessionInfo {
     /// this, so it is part of the session's public description, not an internal
     /// detail.
     pub journal_dir: PathBuf,
+    /// The last seq in the session's record, when the host has one to read.
+    ///
+    /// This is what "resume from the last good record" is *about*: a caller that
+    /// wants to continue a session has to know where the record got to, and the
+    /// record is the only thing that knows. `None` means the host keeps no record
+    /// — [`DirectoryHost`] is metadata only — which is not the same as a record
+    /// that is empty.
+    #[serde(default)]
+    pub last_seq: Option<u64>,
 }
 
 /// Handle to a session a host has launched.
@@ -116,6 +125,12 @@ pub enum ServerError {
     /// is worse than one that says it cannot.
     #[error("this host does not support: {0}")]
     Unsupported(&'static str),
+    /// The session's record failed. A host that owns journals can fail at the
+    /// journal, and the reason has to survive the trip: "the file is not there"
+    /// and "the record does not decode" are different facts, and a caller that
+    /// cannot tell them apart cannot decide whether to retry or to stop.
+    #[error("journal: {0}")]
+    Journal(#[from] yu_journal::JournalError),
 }
 
 /// The socket protocol, request half. One JSON object per line.
@@ -164,33 +179,55 @@ pub enum Response {
 /// lifecycle work that M3 adds once there is a binary to install and update, and
 /// naming them now would be a signature with no caller.
 ///
-/// The methods are deliberately synchronous. An `async fn` in a trait is not
-/// dyn-compatible without boxing, and `async-trait` is not a dependency of this
-/// crate — a skeleton should not add one to express a boundary it has not
-/// implemented. M3 can make these `async fn` (stable since Rust 1.75) once there
-/// is a runtime that needs driving.
+/// The methods are `async` because a session's record is now the host's to keep:
+/// [`Daemon`] owns a `Journal` per session, and appending to one is async. The
+/// earlier version of this trait was synchronous and said a later milestone would
+/// make it async "once there is a runtime that needs driving" — there is one now,
+/// and a synchronous method that had to touch a file from the runtime's thread
+/// would have been the same decision written down twice. The trait is used
+/// generically rather than as a trait object, so `impl Future` costs nothing: no
+/// boxing, no `async-trait`. The futures are spelled out with `+ Send` rather
+/// than as `async fn`, which is the one thing `async fn` in a trait cannot say.
 ///
-// TODO(M3): implement over `tokio::net::UnixListener` for `LocalDaemon`, and
-// in-process for `Embedded`. Every implementation must make `Stop` idempotent and
-// make a `Send` that races a crash land in the journal rather than vanish.
+/// Every implementation must make `Stop` idempotent and make a `Send` that races
+/// a crash land in the journal rather than vanish.
 pub trait SessionHost {
     /// Start a session for `charter` and return a handle to it. DESIGN: cheap
     /// enough that topology can be chosen at run time.
-    fn launch(&self, config: &ServerConfig, charter: &str) -> Result<LaunchedSession, ServerError>;
+    fn launch(
+        &self,
+        config: &ServerConfig,
+        charter: &str,
+    ) -> impl std::future::Future<Output = Result<LaunchedSession, ServerError>> + Send;
 
     /// DESIGN's `thread_recovery`: reattach to a session that outlived the
     /// process which was talking to it, and report what state it came back in.
     /// Crash recovery is first-class, so this is a protocol operation and not an
     /// operator procedure.
-    fn thread_recovery(&self, config: &ServerConfig, session: &str) -> Result<SessionInfo, ServerError>;
+    ///
+    /// What comes back is the record's own answer about where the session got
+    /// to, not a status file's: a session that was killed mid-append has a torn
+    /// last record, and recovery is the act of reading the last whole one.
+    fn thread_recovery(
+        &self,
+        config: &ServerConfig,
+        session: &str,
+    ) -> impl std::future::Future<Output = Result<SessionInfo, ServerError>> + Send;
 
     /// Every session this host holds. The daemon's `Status` with no session.
-    fn sessions(&self) -> Result<Vec<SessionInfo>, ServerError> {
-        Err(ServerError::Unsupported("this host keeps no session list"))
+    fn sessions(&self) -> impl std::future::Future<Output = Result<Vec<SessionInfo>, ServerError>> + Send {
+        async { Err(ServerError::Unsupported("this host keeps no session list")) }
     }
 
     /// Look one session up, for the operations that only need to know it exists.
-    fn status_lookup(&self, config: &ServerConfig, session: &str) -> Result<SessionInfo, ServerError> {
+    fn status_lookup(
+        &self,
+        config: &ServerConfig,
+        session: &str,
+    ) -> impl std::future::Future<Output = Result<SessionInfo, ServerError>> + Send
+    where
+        Self: Sync,
+    {
         self.thread_recovery(config, session)
     }
 
@@ -201,8 +238,27 @@ pub trait SessionHost {
         _config: &ServerConfig,
         _session: &str,
         _status: SessionStatus,
-    ) -> Result<SessionInfo, ServerError> {
-        Err(ServerError::Unsupported("this host does not record session status"))
+    ) -> impl std::future::Future<Output = Result<SessionInfo, ServerError>> + Send {
+        async { Err(ServerError::Unsupported("this host does not record session status")) }
+    }
+
+    /// Record one message from the human into the session's own journal.
+    ///
+    /// This is what `Send` means for a host that owns the record: the human's
+    /// words are in the journal before any turn is attempted, so a crash between
+    /// the two loses neither. DESIGN: "人类原话原样存活". A host that cannot do it
+    /// says so rather than accepting the message and dropping it.
+    fn deliver(
+        &self,
+        _config: &ServerConfig,
+        _session: &str,
+        _text: &str,
+    ) -> impl std::future::Future<Output = Result<u64, ServerError>> + Send {
+        async {
+            Err(ServerError::Unsupported(
+                "this host holds no session record to append to",
+            ))
+        }
     }
 }
 
@@ -328,6 +384,7 @@ mod tests {
             created_ms: 1_725_000_000_000,
             last_active_ms: 1_725_999_000_000,
             journal_dir: PathBuf::from("/var/yu/s-1"),
+            last_seq: Some(41),
         };
 
         let responses = [
@@ -426,7 +483,7 @@ mod tests {
 /// of what a session is. The alternative — a filter on the entry's *name* — is a
 /// second definition that no writer is obliged to agree with, and it would rot
 /// the moment ids change shape.
-const SESSION_RECORD: &str = "info.json";
+pub(crate) const SESSION_RECORD: &str = "info.json";
 
 /// Sessions backed by a directory: one subdirectory each, holding the session's
 /// own record.
@@ -467,7 +524,7 @@ impl DirectoryHost {
 
     fn mark(&self, session: &str, status: SessionStatus) -> Result<SessionInfo, ServerError> {
         let mut info = self
-            .sessions()?
+            .read_sessions()?
             .into_iter()
             .find(|s| s.id == session)
             .ok_or_else(|| ServerError::UnknownSession {
@@ -549,11 +606,12 @@ fn unreadable_session(id: String, dir: &Path) -> SessionInfo {
         created_ms: 0,
         last_active_ms: 0,
         journal_dir: dir.to_path_buf(),
+        last_seq: None,
     }
 }
 
 impl SessionHost for DirectoryHost {
-    fn launch(&self, _config: &ServerConfig, _charter: &str) -> Result<LaunchedSession, ServerError> {
+    async fn launch(&self, _config: &ServerConfig, _charter: &str) -> Result<LaunchedSession, ServerError> {
         // A counter plus the wall clock: unique within a process, and ordered
         // across processes for anyone reading the directory back.
         let n = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -566,6 +624,10 @@ impl SessionHost for DirectoryHost {
             created_ms: yu_observe::now_ms(),
             last_active_ms: yu_observe::now_ms(),
             journal_dir: dir,
+            // This host keeps no record of its own: it is the directory half, and
+            // a session it launches has no journal until something else opens
+            // one. Zero is that fact, not a count.
+            last_seq: None,
         };
         self.write_info(&info)?;
         Ok(LaunchedSession {
@@ -574,7 +636,7 @@ impl SessionHost for DirectoryHost {
         })
     }
 
-    fn thread_recovery(&self, _config: &ServerConfig, session: &str) -> Result<SessionInfo, ServerError> {
+    async fn thread_recovery(&self, _config: &ServerConfig, session: &str) -> Result<SessionInfo, ServerError> {
         // The recorded status is the truth about what it was doing; a session
         // recorded as `Busy` was interrupted mid-turn, which is the one case a
         // caller must not treat as ready. Reporting the record unchanged is the
@@ -588,11 +650,11 @@ impl SessionHost for DirectoryHost {
             })
     }
 
-    fn sessions(&self) -> Result<Vec<SessionInfo>, ServerError> {
+    async fn sessions(&self) -> Result<Vec<SessionInfo>, ServerError> {
         self.read_sessions()
     }
 
-    fn set_status(
+    async fn set_status(
         &self,
         _config: &ServerConfig,
         session: &str,
@@ -691,7 +753,7 @@ async fn serve_frames<S: SessionHost>(
             continue;
         }
         let responses = match decode_line::<Request>(&line) {
-            Ok(request) => handle(host, config, request),
+            Ok(request) => handle(host, config, request).await,
             Err(e) => vec![Response::Error {
                 message: format!("could not read the request: {e}"),
             }],
@@ -707,19 +769,19 @@ async fn serve_frames<S: SessionHost>(
 }
 
 /// `handle`, exposed for tests. The socket loop is the only production caller.
-pub fn handle_for_test<S: SessionHost>(
+pub async fn handle_for_test<S: SessionHost>(
     host: &S,
     config: &ServerConfig,
     request: Request,
 ) -> Vec<Response> {
-    handle(host, config, request)
+    handle(host, config, request).await
 }
 
 /// Turn one request into the frames it produces.
-fn handle<S: SessionHost>(host: &S, config: &ServerConfig, request: Request) -> Vec<Response> {
+async fn handle<S: SessionHost>(host: &S, config: &ServerConfig, request: Request) -> Vec<Response> {
     match request {
         Request::Status { session } => match session {
-            Some(session) => match host.thread_recovery(config, &session) {
+            Some(session) => match host.thread_recovery(config, &session).await {
                 Ok(info) => vec![Response::Status {
                     sessions: vec![info],
                 }],
@@ -727,14 +789,14 @@ fn handle<S: SessionHost>(host: &S, config: &ServerConfig, request: Request) -> 
                     message: e.to_string(),
                 }],
             },
-            None => match host.sessions() {
+            None => match host.sessions().await {
                 Ok(sessions) => vec![Response::Status { sessions }],
                 Err(e) => vec![Response::Error {
                     message: e.to_string(),
                 }],
             },
         },
-        Request::Start { charter } => match host.launch(config, &charter) {
+        Request::Start { charter } => match host.launch(config, &charter).await {
             Ok(launched) => vec![Response::Started {
                 session: launched.id,
             }],
@@ -742,7 +804,7 @@ fn handle<S: SessionHost>(host: &S, config: &ServerConfig, request: Request) -> 
                 message: e.to_string(),
             }],
         },
-        Request::Resume { session } => match host.thread_recovery(config, &session) {
+        Request::Resume { session } => match host.thread_recovery(config, &session).await {
             Ok(info) => vec![Response::Status {
                 sessions: vec![info],
             }],
@@ -754,7 +816,7 @@ fn handle<S: SessionHost>(host: &S, config: &ServerConfig, request: Request) -> 
             // Sessions are owned by the daemon, so stopping one is a state
             // change it must record — a stop that only lived in memory would
             // come back to life on the next restart.
-            match host.set_status(config, &session, SessionStatus::Stopped) {
+            match host.set_status(config, &session, SessionStatus::Stopped).await {
                 Ok(_) => vec![Response::Done {
                     session,
                     stop_reason: "stopped".to_owned(),
@@ -764,12 +826,26 @@ fn handle<S: SessionHost>(host: &S, config: &ServerConfig, request: Request) -> 
                 }],
             }
         }
-        Request::Send { session, text: _ } => vec![Response::Error {
-            message: format!(
-                "session `{session}` cannot be driven from this host: running a turn needs a \
-                 model client, which `yu-server` deliberately does not construct. Wire a \
-                 `SessionRunner` in and this becomes the frame that streams its output."
-            ),
-        }],
+        Request::Send { session, text } => match host.deliver(config, &session, &text).await {
+            // The message is in the record before this frame is written, which is
+            // the whole of what a `Send` can promise here: the human's words
+            // survive a crash that lands between the two.
+            Ok(seq) => vec![
+                Response::Chunk {
+                    session: session.clone(),
+                    text: format!(
+                        "recorded at seq {seq}; running the turn needs a model client, which \
+                         `yu-server` deliberately does not construct"
+                    ),
+                },
+                Response::Done {
+                    session,
+                    stop_reason: "recorded".to_owned(),
+                },
+            ],
+            Err(e) => vec![Response::Error {
+                message: e.to_string(),
+            }],
+        },
     }
 }

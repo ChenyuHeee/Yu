@@ -24,6 +24,16 @@ impl TokenUsage {
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
     }
 
+    /// Everything the endpoint counted as input for one request: the context it
+    /// was given, whether that arrived fresh or off the cache.
+    ///
+    /// This is one request's context in the unit that costs money, which is what
+    /// a fork's re-send estimate needs: from the fork point onward the prefix no
+    /// longer matches anything cached, so this is what has to be sent again.
+    pub fn context_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
+
     /// Cache hit rate over the cacheable prefix.
     ///
     /// Returns `None` rather than 0.0 when nothing was cacheable — a run that

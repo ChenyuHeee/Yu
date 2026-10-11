@@ -331,6 +331,71 @@ impl Journal {
         Ok(crate::EffectLog::from_events(&self.history().await?))
     }
 
+    /// The effects the record says were attempted and never finished.
+    ///
+    /// The companion of [`Journal::replay_seed`], over the same history: the seed
+    /// says what must not be performed again, this says what cannot be decided
+    /// from the record at all. A caller that reads only the seed sees an
+    /// interrupted effect as one that never happened, which is the reading
+    /// [`crate::UnresolvedEffect`] exists to prevent.
+    pub async fn unresolved_effects(&self) -> Result<Vec<crate::UnresolvedEffect>, JournalError> {
+        Ok(crate::EffectLog::unresolved(&self.history().await?))
+    }
+
+    /// What forking at `at_seq` will cost, measured before the fork happens.
+    ///
+    /// DESIGN is explicit that this must be visible rather than discovered:
+    /// "**fork 的代价必须显式**:从分叉点起缓存前缀不再匹配。**fork 是带成本提示的
+    /// 操作,不是免费调试按钮**". Two numbers, because a fork has two costs and
+    /// they point in opposite directions:
+    ///
+    /// * **storage** — one marker line. "fork 用引用而非拷贝 —— 成本从 O(记录) 降到
+    ///   O(1)": nothing is copied, so this is the same for a ten-event parent and a
+    ///   million-event one.
+    /// * **the prefix** — everything before the fork point, which a replay of the
+    ///   branch has to re-establish from scratch, because from `at_seq` onward the
+    ///   rendered bytes no longer match anything cached. `est_input_tokens` is
+    ///   taken from the last `ModelRequest` at or before the point, which is a
+    ///   measurement the record already holds rather than an estimate invented
+    ///   here.
+    pub async fn estimate_fork(&self, at_seq: u64) -> Result<ForkEstimate, JournalError> {
+        let events = self.history_prefix(at_seq).await?;
+        let mut bytes: u64 = 0;
+        let mut est_input_tokens = None;
+        for event in &events {
+            bytes += serde_json::to_vec(event)?.len() as u64;
+            if let EventBody::ModelRequest {
+                est_input_tokens: Some(tokens),
+                ..
+            } = &event.body
+            {
+                est_input_tokens = Some(*tokens);
+            }
+        }
+        // The marker as it will actually be written, so the storage half of the
+        // estimate is a measurement and not a guess. `ts_ms` is filled by the
+        // journal at append time; a 13-digit millisecond timestamp is what it
+        // will be, which is what this models.
+        let marker = Event {
+            seq: at_seq,
+            ts_ms: 1_700_000_000_000,
+            session: SessionId::new("<the new branch>"),
+            agent: AgentId::new("fork"),
+            body: EventBody::Forked {
+                parent: self.session().clone(),
+                parent_at_seq: at_seq,
+            },
+        };
+        Ok(ForkEstimate {
+            parent: self.session().clone(),
+            at_seq,
+            events: events.len(),
+            bytes,
+            est_input_tokens,
+            marker_bytes: serde_json::to_vec(&marker)?.len() as u64 + 1,
+        })
+    }
+
     /// Append one event. Returns it with its assigned `seq` and timestamp.
     ///
     /// An append commits the whole line or leaves the file as it was: a write
@@ -527,6 +592,50 @@ impl Journal {
 
     fn index_write(&self) -> RwLockWriteGuard<'_, JournalIndex> {
         self.index.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// What forking at a point costs, before the fork is made.
+///
+/// See [`Journal::estimate_fork`]. Held as a value so a front end prints it
+/// without re-deriving it, and so a test can assert the two halves separately:
+/// the storage cost that does not grow with the parent, and the prefix that does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkEstimate {
+    pub parent: SessionId,
+    pub at_seq: u64,
+    /// Events the branch inherits and reads through its parent.
+    pub events: usize,
+    /// Bytes those events occupy in the record.
+    pub bytes: u64,
+    /// The size of the context the last recorded request at or before the fork
+    /// point was carrying, when the record holds one.
+    pub est_input_tokens: Option<u64>,
+    /// Bytes of the one line the fork itself writes.
+    pub marker_bytes: u64,
+}
+
+impl std::fmt::Display for ForkEstimate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "forking {} at seq {}: {} event(s) / {} bytes inherited by reference; \
+             the cache prefix diverges there, so {}; the fork itself costs {} byte(s)",
+            self.parent,
+            self.at_seq,
+            self.events,
+            self.bytes,
+            match self.est_input_tokens {
+                Some(tokens) => format!(
+                    "a replay of this branch re-sends the prefix the last recorded request \
+                     measured at {tokens} input tokens"
+                ),
+                None => "no request was recorded at or before the point, so the re-send \
+                         cost of the prefix is not known from the record"
+                    .to_owned(),
+            },
+            self.marker_bytes,
+        )
     }
 }
 

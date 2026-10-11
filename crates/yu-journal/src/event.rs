@@ -39,6 +39,17 @@ impl EffectState {
     pub fn may_skip(&self) -> bool {
         matches!(self, EffectState::Done { .. })
     }
+
+    /// Whether the record leaves it open whether this effect happened.
+    ///
+    /// `Intended` is the whole of the crash window: the intent is written before
+    /// the act, so a record that ends on one is a record that was interrupted
+    /// between the two. The answer is *unknown*, and every caller has to say so
+    /// rather than pick a side — see `EffectIntent::idempotent` for why neither
+    /// "assume it happened" nor "assume it did not" is safe on its own.
+    pub fn is_ambiguous(&self) -> bool {
+        matches!(self, EffectState::Intended)
+    }
 }
 
 /// One thinking block, its text and its signature held apart.
@@ -120,6 +131,19 @@ pub enum EventBody {
         model: String,
         messages: usize,
         digest: String,
+        /// How big the context was around this point, in the unit that costs
+        /// money — the endpoint's own measurement of the request before this one,
+        /// which is the closest thing to a free measurement of this prefix.
+        ///
+        /// `None` on a run's first request, because nothing has been measured
+        /// yet, and absent is the honest spelling of that. The two alternatives
+        /// were rejected: `count_tokens` is an extra request per step, and a local
+        /// estimator is exactly the kind of number that looks precise and quietly
+        /// misleads (`yu-wire::count_tokens`).
+        ///
+        /// Something reads this: a fork's cost estimate, which has to say what a
+        /// branch will have to re-send when the cache stops matching at the fork
+        /// point (DESIGN: "从分叉点起缓存前缀不再匹配").
         est_input_tokens: Option<u64>,
     },
     /// Constraint 4: the thinking text and its signature are held separately,
@@ -247,6 +271,22 @@ pub enum EventBody {
         /// the intent and its result can be tied together.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_use_id: Option<String>,
+        /// Whether re-performing this effect is safe, as the tool declares it.
+        ///
+        /// This is what a replay needs in order to act on an `Intended` record,
+        /// and it must be in the *record* rather than looked up from the tool at
+        /// replay time: a replay of a recorded branch is answered by the record,
+        /// and the tool that performed the effect a month ago is not consulted.
+        ///
+        /// Defaults to `false`, which is the safe direction and the only honest
+        /// default: a record written before this field existed, or by a tool that
+        /// did not claim idempotency, says nothing about whether the effect can
+        /// be performed twice. An unresolved effect whose key does not certify
+        /// idempotency may be neither skipped (that loses work that may never
+        /// have happened) nor re-performed (that duplicates work that may have),
+        /// so it is surfaced instead.
+        #[serde(default)]
+        idempotent: bool,
     },
 }
 
@@ -449,6 +489,7 @@ impl PartialEq for EventBody {
                 description: d1,
                 state: s1,
                 tool_use_id: t1,
+                idempotent: i1,
             } => matches!(
                 other,
                 EventBody::Effect {
@@ -456,7 +497,8 @@ impl PartialEq for EventBody {
                     description: d2,
                     state: s2,
                     tool_use_id: t2,
-                } if k1 == k2 && d1 == d2 && s1 == s2 && t1 == t2
+                    idempotent: i2,
+                } if k1 == k2 && d1 == d2 && s1 == s2 && t1 == t2 && i1 == i2
             ),
             EventBody::Delegated {
                 child: c1,
@@ -558,6 +600,12 @@ mod tests {
                 description: "d".into(),
                 state: EffectState::Intended,
                 tool_use_id: None,
+                idempotent: false,
+            },
+            EventBody::Delegated {
+                child: yu_observe::AgentId::new("child"),
+                depth: 1,
+                task: "t".into(),
             },
         ]
     }

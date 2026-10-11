@@ -1192,6 +1192,11 @@ mod reduction_table_tests {
                 Reduction::SpillWithPointer { .. } => ReductionPath::SpillWithPointer,
                 Reduction::DelegateReader { .. } => ReductionPath::DispatchReader,
                 Reduction::SandboxReduce => ReductionPath::SandboxReduce,
+                // A replay is not a path the built-in table can choose: it is
+                // what happens when the table is never consulted, because no
+                // payload was produced. The mirror is asserted for the paths the
+                // table *can* choose.
+                Reduction::Replayed { .. } => ReductionPath::PassThrough,
             }
         }
 

@@ -9,7 +9,9 @@
 mod common;
 
 use common::{agent, journal_in, tempdir};
-use yu_journal::{EffectGuard, EffectLog, EventBody, Journal, EffectState};
+use yu_journal::{
+    EffectGuard, EffectLog, EffectState, EventBody, Journal, ReplayOfUnresolved,
+};
 use yu_observe::AgentId;
 
 /// One attempt at an effect-bearing tool call, the way a live loop makes it:
@@ -36,6 +38,7 @@ async fn attempt(
                 description: "charge the customer".into(),
                 state: EffectState::Done { result_seq: None },
                 tool_use_id: None,
+                idempotent: false,
             },
         )
         .await
@@ -122,6 +125,7 @@ async fn a_second_begin_on_a_committed_key_returns_none() {
                 description: "send the message".into(),
                 state: EffectState::Done { result_seq: None },
                 tool_use_id: None,
+                idempotent: false,
             },
         )
         .await
@@ -183,6 +187,7 @@ async fn an_interrupted_effect_is_not_treated_as_done() {
                 description: "take payment".into(),
                 state: EffectState::Intended,
                 tool_use_id: None,
+                idempotent: false,
             },
         )
         .await
@@ -195,6 +200,7 @@ async fn an_interrupted_effect_is_not_treated_as_done() {
                 description: "take payment".into(),
                 state: EffectState::Done { result_seq: None },
                 tool_use_id: None,
+                idempotent: false,
             },
         )
         .await
@@ -209,6 +215,7 @@ async fn an_interrupted_effect_is_not_treated_as_done() {
                 description: "notify the customer".into(),
                 state: EffectState::Intended,
                 tool_use_id: None,
+                idempotent: false,
             },
         )
         .await
@@ -240,6 +247,7 @@ async fn an_abandoned_effect_is_retryable() {
                 description: "deliberately not performed".into(),
                 state: EffectState::Abandoned,
                 tool_use_id: None,
+                idempotent: false,
             },
         )
         .await
@@ -256,4 +264,127 @@ fn only_done_may_be_skipped() {
     assert!(EffectState::Done { result_seq: None }.may_skip());
     assert!(!EffectState::Intended.may_skip());
     assert!(!EffectState::Abandoned.may_skip());
+}
+
+/// An intent the record never finishes is *named*, with an address.
+///
+/// **M6 (b): "做了没记完 → 能检出".** The failure this guards against is not a
+/// crash — the crash happened. It is the reader: a scan that only asks "is there a
+/// `Done`" answers "no", and a caller that hears only that concludes the effect
+/// never happened and performs it again. The record holds everything needed to say
+/// otherwise: what the effect was, which call it belonged to, and whether its key
+/// certifies that performing it twice is the same as once.
+#[tokio::test]
+async fn an_intent_the_record_never_finishes_is_reported_with_its_address() {
+    let dir = tempdir();
+    let journal = journal_in(dir.path(), "window").await;
+
+    journal
+        .append(
+            agent(),
+            EventBody::Effect {
+                key: "write:/tmp/out.txt#sha256:abc".into(),
+                description: "write 12 bytes to /tmp/out.txt".into(),
+                state: EffectState::Intended,
+                tool_use_id: Some("call-1".into()),
+                idempotent: true,
+            },
+        )
+        .await
+        .unwrap();
+    journal
+        .append(
+            agent(),
+            EventBody::Effect {
+                key: "exec:call-2".into(),
+                description: "run `sh -c rm -rf build`".into(),
+                state: EffectState::Intended,
+                tool_use_id: Some("call-2".into()),
+                idempotent: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    let seed = journal.replay_seed().await.unwrap();
+    let unresolved = journal.unresolved_effects().await.unwrap();
+
+    assert_eq!(
+        unresolved
+            .iter()
+            .map(|u| (u.key.as_str(), u.at_seq))
+            .collect::<Vec<_>>(),
+        vec![("exec:call-2", 1), ("write:/tmp/out.txt#sha256:abc", 0)],
+        "every unfinished effect must be named, with the seq that recorded it"
+    );
+    assert_eq!(
+        unresolved[0].replay(),
+        ReplayOfUnresolved::Surface,
+        "a command that cannot certify itself must not be re-run on a record \
+         that does not say whether it ran"
+    );
+    assert_eq!(
+        unresolved[1].replay(),
+        ReplayOfUnresolved::Reattempt,
+        "a key that certifies idempotency may be performed again"
+    );
+    assert_eq!(
+        unresolved[1].tool_use_id.as_deref(),
+        Some("call-1"),
+        "the finding is tied to the call it belonged to, or it cannot be checked"
+    );
+
+    // And the seed agrees with it: neither key may be skipped.
+    assert!(!seed.is_committed("write:/tmp/out.txt#sha256:abc"));
+    assert!(!seed.is_committed("exec:call-2"));
+}
+
+/// The last state per key is what counts, in both directions.
+///
+/// A key that finished and was later re-attempted without finishing is in the
+/// window again — a scan that stopped at the first `Done` would call it settled
+/// and skip work that may be outstanding.
+#[tokio::test]
+async fn resolution_is_the_last_state_and_not_the_first() {
+    let dir = tempdir();
+    let journal = journal_in(dir.path(), "settling").await;
+    let effect = |state| EventBody::Effect {
+        key: "rotate".into(),
+        description: "rotate the key".into(),
+        state,
+        tool_use_id: None,
+        idempotent: true,
+    };
+
+    journal.append(agent(), effect(EffectState::Intended)).await.unwrap();
+    journal
+        .append(agent(), effect(EffectState::Done { result_seq: None }))
+        .await
+        .unwrap();
+    assert!(
+        journal.unresolved_effects().await.unwrap().is_empty(),
+        "a later completion settles an earlier intent"
+    );
+
+    journal.append(agent(), effect(EffectState::Intended)).await.unwrap();
+    assert_eq!(
+        journal.unresolved_effects().await.unwrap().len(),
+        1,
+        "a re-attempt that never finished is in the window again"
+    );
+    journal
+        .append(agent(), effect(EffectState::Abandoned))
+        .await
+        .unwrap();
+    assert!(
+        journal.unresolved_effects().await.unwrap().is_empty(),
+        "and a deliberate abandonment settles it too: the effect did not happen"
+    );
+    // The two readings are separate answers to separate questions, and this is
+    // where they can disagree: the key *has* been completed once (so a replay may
+    // read the record instead of doing the work), and the last attempt was
+    // abandoned (so nothing is left in the window). The window is what a replay
+    // must not skip through; `committed` is what it may skip *with*.
+    let seed = journal.replay_seed().await.unwrap();
+    assert!(seed.is_committed("rotate"));
 }
