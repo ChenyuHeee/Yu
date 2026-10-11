@@ -922,9 +922,9 @@ async fn run_one(
                             .map_err(|e| yu_wire::WireError::transport(format!("journaling: {e}")))?;
                         let text = format!(
                             "nothing was performed: `{name}` was already completed when this replay \
-                             reached it. The record of that call was interrupted at seq {at_seq} \
-                             before its completion was written; the result it produced is in the \
-                             world, and it is not reproduced here."
+                             reached it (key `{key}`, interrupted at seq {at_seq} before its \
+                             completion was written). The result it produced is in the world, and it \
+                             is not reproduced here."
                         );
                         return Ok((
                             ContentBlock::ToolResult(yu_wire::types::ToolResultBlock::text(
@@ -969,9 +969,10 @@ async fn run_one(
                             .map_err(|e| yu_wire::WireError::transport(format!("journaling: {e}")))?;
                         let text = format!(
                             "refused, and nothing was performed: an earlier attempt at this effect \
-                             (`{}`, recorded at seq {at_seq}) never completed. The record does not \
-                             say whether it happened, and re-running it may do the work twice. \
-                             Resolve it against the world before this call can run.",
+                             (`{}`, key `{key}`, recorded at seq {at_seq}) never completed. The \
+                             record does not say whether it happened, and re-running it may do the \
+                             work twice. Resolve it against the world — the address above is where \
+                             to look — before this call can run.",
                             intent.description
                         );
                         return Ok((
