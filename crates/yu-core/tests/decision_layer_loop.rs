@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 
 use yu_core::agent::{Agent, AgentConfig};
 use yu_core::decision::{DecisionConfig, DecisionLayer, DecisionOutcome, DECISION_PROMPT};
-use yu_core::delegate::delegate_tool;
+use yu_core::delegate::{decision_surface, delegate_tool};
 use yu_core::render::{render, Charter, Ledger, RenderInput};
 use yu_journal::{EventBody, Journal, SessionId};
 use yu_observe::{AgentId, SpanKind, Timeline};
@@ -986,4 +986,80 @@ async fn a_loop_that_keeps_asking_is_stopped_at_the_round_ceiling_and_says_so() 
         "a run that ends at the ceiling still has a context worth reporting"
     );
     assert_eq!(run.outcome.contexts.len(), 4);
+}
+
+// ---------------------------------------------------------------------------
+// The advertised surface is the offered surface
+// ---------------------------------------------------------------------------
+
+/// **M2: "prompt 广告的工具面 == 实际发出的工具面,且有测试断言这件事".**
+///
+/// A prompt that names a tool the layer does not have costs a turn every time
+/// the model believes it — and the belief is reasonable, because the prompt is
+/// the only description of itself the layer gets. The other direction is worse
+/// and quieter: a tool sent in the request that the prompt never mentions is one
+/// the model has to discover by accident.
+///
+/// Read out of the prompt rather than restated here, because a copy of the list
+/// in the test would drift from the copy in the prompt exactly as the prompt
+/// drifted from the request.
+#[test]
+fn the_prompt_advertises_exactly_the_tools_the_layer_is_offered() {
+    let advertised = tools_named_in_the_prompt();
+    let offered: std::collections::BTreeSet<String> = decision_surface()
+        .iter()
+        .map(|tool| tool.name().to_owned())
+        .collect();
+
+    let advertised_set: std::collections::BTreeSet<String> = advertised.iter().cloned().collect();
+    assert_eq!(
+        advertised_set, offered,
+        "the prompt and the request disagree about the tool surface.\n\
+         advertised and not offered: {:?}\n\
+         offered and not advertised: {:?}",
+        advertised_set.difference(&offered).collect::<Vec<_>>(),
+        offered.difference(&advertised_set).collect::<Vec<_>>(),
+    );
+    assert!(
+        !offered.is_empty(),
+        "a layer offered nothing cannot do anything"
+    );
+}
+
+/// The tool names the prompt's own tool section lists.
+///
+/// Only the bulleted entries are read. The prompt also names tools it does *not*
+/// offer — in the paragraph that says which specified tools are not built yet —
+/// and treating those as advertised would make the check assert the opposite of
+/// what it is for.
+fn tools_named_in_the_prompt() -> Vec<String> {
+    let section = DECISION_PROMPT
+        .split("# Your tools")
+        .nth(1)
+        .expect("the prompt must have a `# Your tools` section, or nothing describes the surface");
+    let mut names = Vec::new();
+    for line in section.lines() {
+        // The section ends at the next heading.
+        if line.starts_with('#') {
+            break;
+        }
+        if let Some(rest) = line.trim().strip_prefix("- `")
+            && let Some((name, _)) = rest.split_once('`')
+        {
+            names.push(name.to_owned());
+        }
+    }
+    names
+}
+
+#[test]
+fn the_prompts_tool_section_is_readable_in_the_shape_this_guard_expects() {
+    // The guard above parses prose. If the section is reformatted, this says so
+    // instead of the guard silently finding nothing and passing on an empty set.
+    let named = tools_named_in_the_prompt();
+    assert!(
+        named.contains(&"delegate".to_owned()),
+        "the parser found {named:?} in the prompt's tool section — it says the \
+         section is no longer shaped the way the guard reads it"
+    );
 }
