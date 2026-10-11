@@ -38,8 +38,10 @@
 //! (an [`Anchor`]), and the new session can follow an address back to the bytes.
 //!
 //! Where it fires is [`trigger_for`]: completion first, because completion is the
-//! legitimate contraction; the growth threshold as the backstop; and the agent's
-//! own request as the third case `Trigger` names (nothing produces it yet — see
+//! legitimate contraction; the round ceiling, because a session that ran out of
+//! rounds is over and its unfinished work is what the next session is for; the
+//! growth threshold as the backstop for a stop that is neither; and the agent's
+//! own request as the case `Trigger` names last (nothing produces it yet — see
 //! [`Trigger::AgentRequested`]).
 
 use std::collections::BTreeSet;
@@ -49,7 +51,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use yu_observe::AgentId;
 
-use yu_core::decision::DecisionOutcome;
+use yu_core::decision::{DecisionOutcome, StoppedEarly};
 use yu_core::render::{Charter, Decision, HumanUtterance, Ledger, NotLoadedEntry, Rejected};
 use yu_journal::{Event, EventBody, Journal, JournalError, SessionId};
 use yu_wire::client::{StreamSink, WireClient};
@@ -218,6 +220,15 @@ fn item_of(event: &Event, journal: &Journal) -> Option<RecordItem> {
         }
         EventBody::Note { text } if !text.trim().is_empty() => {
             (format!("journal:seq={}", event.seq), text.clone())
+        }
+        // The decision layer's ledger tools are not items: the call and the
+        // note it leaves (`decide — decided: …`) are *one* fact in two
+        // spellings, and listing both would make the verifier report whichever
+        // spelling the handover did not happen to carry as a gap — noise on
+        // every real run. The note is the readable spelling, so it is the item;
+        // the call's exact JSON is in the record for whoever needs it.
+        EventBody::ToolCall { name, .. } if yu_core::decide::is_decision_tool(name) => {
+            return None;
         }
         EventBody::ToolCall { name, input, .. } => (
             format!("journal:seq={}", event.seq),
@@ -769,10 +780,22 @@ pub enum Trigger {
     /// Work finished. Preferred, because completion *knows* what no longer
     /// matters while a threshold can only guess ("完成才是合法的收缩").
     NaturalCompletion,
-    /// Backstop. `growth_since_last` is measured from the last compaction, never
-    /// from the start of the run: a freshly compacted window is large by
-    /// construction, since the prefix re-seeds it, so a total-context trigger
-    /// fires again the moment it finishes, forever.
+    /// The session ran out of rounds without reaching a final answer.
+    ///
+    /// The other way a long task ends, and the one the round ceiling produces:
+    /// the session is **over** — its loop has no round left to run — and the
+    /// work it left either stops there or is carried by a new session. This is
+    /// not a threshold dressed up: nothing about the window decides it, because
+    /// a window belongs to a session and this session has ended. (Measured, in
+    /// the end-to-end acceptance: the ceiling was reached, the growth backstop
+    /// was not, and no handover was written — on the exact run a generation
+    /// change was most wanted.)
+    CeilingReached { ceiling: u32 },
+    /// Backstop, for a stop that is not the ceiling. `growth_since_last` is
+    /// measured from the last compaction, never from the start of the run: a
+    /// freshly compacted window is large by construction, since the prefix
+    /// re-seeds it, so a total-context trigger fires again the moment it
+    /// finishes, forever.
     Threshold { growth_since_last: u64, threshold: u64 },
     /// The agent asked for a new window (DESIGN's `new_context`, isomorphic to
     /// `retire`): a request, not a threshold.
@@ -790,7 +813,9 @@ pub enum Trigger {
 impl Trigger {
     pub fn should_fire(&self) -> bool {
         match *self {
-            Trigger::NaturalCompletion | Trigger::AgentRequested => true,
+            Trigger::NaturalCompletion | Trigger::AgentRequested | Trigger::CeilingReached { .. } => {
+                true
+            }
             Trigger::Threshold {
                 growth_since_last,
                 threshold,
@@ -807,6 +832,10 @@ impl Trigger {
     pub fn describe(&self) -> String {
         match self {
             Trigger::NaturalCompletion => "the session reached a decision".to_owned(),
+            Trigger::CeilingReached { ceiling } => format!(
+                "the session reached its round ceiling of {ceiling} without a final answer: the \
+                 work is unfinished and this boundary is where it continues"
+            ),
             Trigger::Threshold {
                 growth_since_last,
                 threshold,
@@ -825,22 +854,35 @@ impl Trigger {
 /// a contestable decision about a context can be made — mid-run there is no unit
 /// of work to have finished, and the flow needs the whole record, which the
 /// session is still writing. `growth_threshold` is the declared backstop, in
-/// characters; `None` means no threshold was declared and only completion fires.
+/// characters, for a stop that is not the ceiling; `None` means no threshold was
+/// declared.
 ///
-/// The two cases that can fire, and the one that cannot:
+/// The cases that fire, and the one that cannot:
 ///
 /// * a session that reached a decision finished a unit of work, and DESIGN puts
 ///   completion first: *"工作自然完成时优先(完成才是合法的收缩)"* — the session
 ///   knows what no longer matters, while a threshold can only guess;
-/// * a session that stopped without deciding hands over only when its window has
-///   grown past the declared threshold, **counted from where this session
-///   started** — never from the size of the window itself, which would fire again
-///   the moment a contraction re-seeded it (DESIGN's 压缩后立刻重新触发 trap, and
-///   the reason [`yu_core::traits::GrowthBudget`] has no total-context field);
+/// * a session that **ran out its rounds** is over without having finished
+///   anything: there is no round left to run, so the work either stops here or a
+///   new session carries it. Nothing else conditions this — the round ceiling is
+///   not a pressure reading, it is the session's own ending — and the end-to-end
+///   acceptance is what showed the difference: the ceiling was reached, no
+///   threshold was crossed, and no handover was written on a run whose work was
+///   unfinished and worth continuing;
+/// * a session that stopped for **any other reason** (a stop this harness does
+///   not produce yet — see [`yu_core::decision::StoppedEarly`]) hands over only
+///   when its window has grown past the declared threshold, **counted from where
+///   this session started** — never from the size of the window itself, which
+///   would fire again the moment a contraction re-seeded it (DESIGN's 压缩后立刻重新
+///   触发 trap, and the reason [`yu_core::traits::GrowthBudget`] has no
+///   total-context field);
 /// * [`Trigger::AgentRequested`] has no producer yet — see its own doc.
 pub fn trigger_for(outcome: &DecisionOutcome, growth_threshold: Option<u64>) -> Option<Trigger> {
     if outcome.stopped_early.is_none() {
         return Some(Trigger::NaturalCompletion);
+    }
+    if let Some(StoppedEarly::RoundCeiling { ceiling }) = &outcome.stopped_early {
+        return Some(Trigger::CeilingReached { ceiling: *ceiling });
     }
     let threshold = growth_threshold?;
     // Armed at the session's own first view, because that is the last
@@ -1521,6 +1563,19 @@ pub async fn change_generation<M: ReaderModel>(
     handover.origin = Some(record.origin());
     merge_loose_ends(&mut handover.loose_ends, loose);
 
+    // **And the constraints the session is still under.** The readers extract
+    // constraints from the *record*, and a constraint that was only ever
+    // injected into L0 — passed on the command line, never written into a note —
+    // is one no reader can read. The dying session is holding it, and this is
+    // the last moment it can be handed on: the alternative is a constraint that
+    // silently stops being in force at a generation boundary, which is exactly
+    // what "换代后仍生效的约束一条不少" rules out.
+    for constraint in &charter.constraints {
+        if !handover.constraints.iter().any(|held| held == constraint) {
+            handover.constraints.push(constraint.clone());
+        }
+    }
+
     // Step 4 — back to the record, not to the reports.
     let gaps = Verifier::find_gaps_in(&record, &handover);
 
@@ -2044,7 +2099,7 @@ mod dispatch_tests {
     // ---- when a change happens ---------------------------------------------
 
     /// A finished session, as the layer reports it.
-    fn outcome(stopped_early: Option<&str>, contexts: &[u64]) -> DecisionOutcome {
+    fn outcome(stopped_early: Option<StoppedEarly>, contexts: &[u64]) -> DecisionOutcome {
         DecisionOutcome {
             rounds: 1,
             delegations: 0,
@@ -2059,13 +2114,31 @@ mod dispatch_tests {
                 })
                 .collect(),
             ledger: Ledger::default(),
-            stopped_early: stopped_early.map(str::to_owned),
+            stopped_early,
             outcomes: Vec::new(),
         }
     }
 
+    /// **The end-to-end acceptance, as a test.**
+    ///
+    /// A run that reached its round ceiling hands over — whether or not its
+    /// window grew and whether or not any threshold was declared. This is the
+    /// case the acceptance failed on: the session stopped at the ceiling, the
+    /// growth backstop was not crossed, and nothing was written at a boundary
+    /// where the work was unfinished and a continuation was wanted. The test
+    /// fails if the ceiling arm is reverted to the threshold-only rule, and the
+    /// `None` threshold case fails if the ceiling is made conditional on a
+    /// declared threshold.
+    ///
+    /// The case this replaced asserted the opposite for a stopped session — a
+    /// large window that had not grown was "not pressure", so no handover. That
+    /// was true of the threshold rule and is not true of the session being over:
+    /// the window belongs to a session that has ended. The growth rule itself is
+    /// not gone — it is the backstop for a stop this harness does not produce
+    /// yet, and its subtraction is still guarded by
+    /// [`the_growth_rule_has_one_implementation`].
     #[test]
-    fn a_session_that_decided_hands_over_and_a_quiet_one_does_not() {
+    fn a_session_that_decided_hands_over_and_so_does_one_that_ran_out_of_rounds() {
         let decided = trigger_for(&outcome(None, &[10_000, 12_000]), Some(5_000));
         assert_eq!(
             decided,
@@ -2073,27 +2146,35 @@ mod dispatch_tests {
             "completion is the legitimate contraction, whatever the window did"
         );
 
-        // A run that never decided hands over only past the declared threshold,
-        // and the count is growth since the session started — not the size of
-        // the window, which is large by construction after any contraction.
-        let quiet = trigger_for(&outcome(Some("round ceiling"), &[9_000_000, 9_001_000]), Some(5_000));
-        assert_eq!(quiet, None, "a large window that has not grown is not pressure");
-
-        let grown = trigger_for(&outcome(Some("round ceiling"), &[10_000, 16_000]), Some(5_000));
+        // The ceiling, with a window that never grew and a threshold that was
+        // never approached: still fires, because the session is over.
+        let ceiling = StoppedEarly::RoundCeiling { ceiling: 5 };
+        let quiet = trigger_for(
+            &outcome(Some(ceiling.clone()), &[9_000_000, 9_001_000]),
+            Some(5_000),
+        );
         assert_eq!(
-            grown,
-            Some(Trigger::Threshold {
-                growth_since_last: 6_000,
-                threshold: 5_000,
-            }),
-            "6 000 characters of growth over a 5 000 threshold has to fire"
+            quiet,
+            Some(Trigger::CeilingReached { ceiling: 5 }),
+            "a session that ran out of rounds is over; its work either stops here or is \
+             carried, and nothing about the window changes that"
         );
 
-        // No threshold declared: a session that stopped without deciding has no
-        // trigger, and the caller is told so rather than handed a default.
+        // And with no threshold declared at all — the shape the acceptance ran
+        // in — the ceiling still hands over.
         assert_eq!(
-            trigger_for(&outcome(Some("round ceiling"), &[10_000, 90_000]), None),
-            None
+            trigger_for(
+                &outcome(Some(ceiling.clone()), &[10_000, 90_000]),
+                None
+            ),
+            Some(Trigger::CeilingReached { ceiling: 5 })
+        );
+
+        // Growing past a declared threshold does not change which trigger it is:
+        // the stop is what fired, not the growth.
+        assert_eq!(
+            trigger_for(&outcome(Some(ceiling), &[10_000, 16_000]), Some(5_000)),
+            Some(Trigger::CeilingReached { ceiling: 5 })
         );
     }
 }
@@ -2631,6 +2712,72 @@ mod change_tests {
         .await
         .expect_err("a session cannot be its own ancestor");
         assert!(matches!(err, HandoverError::SameSession { .. }), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A constraint that only ever lived in L0 still crosses the boundary.**
+    ///
+    /// The readers read the record; a constraint that was passed on the command
+    /// line and injected into L0 every round was never *written* anywhere they
+    /// can see. The dying session is the one entity holding it, and this call is
+    /// the last moment it can be handed on — the acceptance's condition 4 is
+    /// "换代后仍生效的约束一条不少", and this is the half of it that the readers
+    /// structurally cannot do.
+    ///
+    /// Revert: drop the union of `charter.constraints` into the handover, and
+    /// the new session's L0 no longer carries it.
+    #[tokio::test]
+    async fn a_constraint_that_only_ever_lived_in_l0_still_reaches_the_next_session() {
+        const ONLY_IN_L0: &str = "the release branch is never touched by this work";
+        let (dir, journal, _) = planted_record("l0-constraint").await;
+        // The constraint is in the charter the run is under, and in no event of
+        // the record — which is exactly the case the readers cannot read.
+        let mut charter = charter();
+        charter.constraints = vec![ONLY_IN_L0.to_owned()];
+        let model = AngleScript::new("none").answering(
+            ReaderAngle::DecisionsAndReasons,
+            "- [journal:seq=1] the daemon owns sessions; the CLI only attaches",
+        );
+
+        let change = change_generation(
+            &model,
+            &journal,
+            Trigger::NaturalCompletion,
+            &charter,
+            &Ledger::default(),
+            &ReaderAngle::ALL,
+        )
+        .await
+        .expect("the flow runs over a real record");
+        assert!(
+            change.handover.constraints.iter().any(|held| held == ONLY_IN_L0),
+            "the session's own L0 constraint has to be carried: {:#?}",
+            change.handover.constraints
+        );
+
+        let next = change.handover.new_session(&Charter::from_the_humans_own_words(
+            "continue the daemon work",
+            1,
+            "cli",
+        ));
+        assert!(
+            next.charter.constraints.iter().any(|held| held == ONLY_IN_L0),
+            "and it has to be in force in the new session's L0: {:#?}",
+            next.charter.constraints
+        );
+        // Carrying it twice is the other failure: the handover is read on every
+        // new session, and a constraint listed twice reads as two constraints.
+        assert_eq!(
+            change
+                .handover
+                .constraints
+                .iter()
+                .filter(|held| *held == ONLY_IN_L0)
+                .count(),
+            1,
+            "one constraint, one entry: {:#?}",
+            change.handover.constraints
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

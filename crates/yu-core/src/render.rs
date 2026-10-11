@@ -206,6 +206,22 @@ impl Ledger {
     /// Returns how many active entries were removed, so a caller can tell
     /// "retired" from "retired something".
     pub fn retire(&mut self, item: impl Into<String>, reason: impl Into<String>) -> usize {
+        self.retire_at(item, reason, yu_observe::now_ms())
+    }
+
+    /// The same retirement, at a time the caller states.
+    ///
+    /// Split out for one caller: a resumed session rebuilds L1 by replaying the
+    /// calls the record holds, and the entry a retirement leaves has to carry
+    /// the time the retirement *happened* — the record's own `ts_ms` — rather
+    /// than the time it was reread. `retire` is the live half and passes the
+    /// clock, so both spellings go through one implementation.
+    pub fn retire_at(
+        &mut self,
+        item: impl Into<String>,
+        reason: impl Into<String>,
+        at_ms: i64,
+    ) -> usize {
         let item = item.into();
         let before = self.active_len();
 
@@ -218,7 +234,7 @@ impl Ledger {
         self.retired.push(Retired {
             item,
             reason: reason.into(),
-            at_ms: yu_observe::now_ms(),
+            at_ms,
             removed,
         });
         removed

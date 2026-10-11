@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 
 use yu_core::agent::{Agent, AgentConfig};
-use yu_core::decision::{DecisionConfig, DecisionLayer, DecisionOutcome, DECISION_PROMPT};
+use yu_core::decision::{
+    DECISION_PROMPT, DecisionConfig, DecisionLayer, DecisionOutcome, Resumed, StoppedEarly,
+};
 use yu_core::delegate::{decision_surface, spawn_edges, SpawnEdge};
 use yu_core::render::{render, Charter, Ledger, RenderInput};
 use yu_core::topology::{TopologyKind, TopologySpec};
@@ -994,11 +996,19 @@ async fn a_loop_that_keeps_asking_is_stopped_at_the_round_ceiling_and_says_so() 
     let stopped = run
         .outcome
         .stopped_early
-        .as_deref()
+        .as_ref()
         .expect("a run that never decided must say so rather than return an error");
+    // Typed, so a caller can act on the reason rather than read it; `describe`
+    // is the sentence the same fact renders as for a human.
+    assert_eq!(
+        stopped,
+        &StoppedEarly::RoundCeiling { ceiling: 1 },
+        "the reason has to name what ran out"
+    );
     assert!(
-        stopped.contains("round ceiling of 1"),
-        "the reason has to name what ran out: {stopped}"
+        stopped.describe().contains("round ceiling of 1"),
+        "the sentence has to name it too: {}",
+        stopped.describe()
     );
     assert_eq!(run.outcome.rounds, 1);
     assert_eq!(
@@ -1839,4 +1849,241 @@ fn depth_from(tree: &BTreeMap<String, Vec<String>>, node: &str) -> usize {
             .max()
             .unwrap_or(0),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Continuing a session
+// ---------------------------------------------------------------------------
+
+/// The events of one kind in a record, in order.
+fn events_of(record: &str, kind: &str) -> Vec<Value> {
+    record
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["body"]["event"] == kind)
+        .collect()
+}
+
+/// **What it takes to continue a session, from the record.**
+///
+/// Run one delegates, decides two things — one of them a rejection — and then
+/// runs out of rounds. Run two reopens the same record and continues it: the
+/// ledger comes back (including the rejection, which is what stops a settled
+/// question from being re-opened), the round numbering continues instead of
+/// restarting, and the derivation numbering continues too, so no two runs in one
+/// record share an address.
+///
+/// What each assertion fails on if the mechanism is reverted:
+///
+/// * the ledger assertions fail if `Resumed::read` skips the recorded calls;
+/// * `rounds == 2` fails if the continuation starts its rounds at one again —
+///   which is also the revert that would spend the session's budget twice;
+/// * the child naming fails if the continuation's derivation counter restarts;
+/// * the single `session_started` fails if the layer starts the session again.
+#[tokio::test]
+async fn a_continued_session_picks_up_its_ledger_rounds_and_numbering_from_the_record() {
+    let name = "continued";
+    let dir = scratch(name);
+
+    // ---- run one: a delegation, two ledger writes, then the round ceiling
+    let first = FakeEndpoint::start(vec![
+        Reply::Json(tool_use_reply(
+            "msg-d1",
+            "the probe is what should run",
+            "call-d1",
+            "delegate",
+            json!({"task": "run the probe and report what it says"}),
+        )),
+        Reply::Json(tool_use_reply(
+            "msg-x1",
+            "run it once",
+            "call-x1",
+            "probe",
+            json!({"what": "once"}),
+        )),
+        Reply::Json(text_reply("msg-x2", "REPORT: probe: ok")),
+        // Two ledger writes in one turn: one decision and one rejection, which
+        // is what the next run has to find in front of it.
+        Reply::Json(json!({
+            "id": "msg-d2",
+            "type": "message",
+            "role": "assistant",
+            "model": TEST_MODEL,
+            "content": [
+                {"type": "thinking", "thinking": "record what this run settled",
+                 "signature": "sig-msg-d2"},
+                {"type": "tool_use", "id": "call-a1", "name": "decide",
+                 "input": {"what": "keep the probe's output",
+                           "why": "it answered with evidence",
+                           "verdict": "accepted"}},
+                {"type": "tool_use", "id": "call-a2", "name": "decide",
+                 "input": {"what": "inline the raw probe output",
+                           "why": "it is the raw material this view exists to exclude",
+                           "verdict": "rejected"}}
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": usage(120, 30),
+        })),
+    ]);
+    let outcome_one = {
+        let timeline = Timeline::new();
+        let journal = Arc::new(
+            Journal::open(&dir, SessionId::new(name))
+                .await
+                .expect("opening the record")
+                .with_timeline(timeline.clone()),
+        );
+        let mut config = DecisionConfig::new(TEST_MODEL);
+        config.max_rounds = 1;
+        // A constraint, so the run has L0 beyond its intent: the only thing
+        // that can carry it across the restart is the recorded seed, and a
+        // continuation that lost it would work without it.
+        let mut charter = charter();
+        charter.constraints = vec!["never touch the release branch".to_owned()];
+        let mut layer = DecisionLayer::new(
+            client(&first, &timeline),
+            journal.clone(),
+            registry(),
+            timeline.clone(),
+            config,
+            charter,
+            dir.clone(),
+        );
+        layer.run().await.expect("the first run completes")
+    };
+    assert_eq!(
+        outcome_one.stopped_early,
+        Some(StoppedEarly::RoundCeiling { ceiling: 1 }),
+        "run one has to end at its ceiling for this test to be about a continuation"
+    );
+    assert_eq!(outcome_one.rounds, 1);
+    assert_eq!(outcome_one.delegations, 1);
+    assert_eq!(first.beyond_the_script(), 0);
+
+    // ---- run two: the record reopened, read back, and continued
+    let second = FakeEndpoint::start(vec![
+        Reply::Json(tool_use_reply(
+            "msg-r1",
+            "one more delegation",
+            "call-d2",
+            "delegate",
+            json!({"task": "run the probe again"}),
+        )),
+        Reply::Json(text_reply("msg-r2", "REPORT: probe: ok")),
+        Reply::Json(text_reply("msg-r3", "decided: the probe stands")),
+    ]);
+    let timeline = Timeline::new();
+    let journal = Arc::new(
+        Journal::open(&dir, SessionId::new(name))
+            .await
+            .expect("reopening the record")
+            .with_timeline(timeline.clone()),
+    );
+    let resumed = Resumed::read(&journal, &AgentId::decision())
+        .await
+        .expect("reading the record back");
+    assert_eq!(resumed.rounds_spent, Some(1));
+    assert_eq!(resumed.ceiling, Some(1));
+    assert_eq!(resumed.delegations, 1);
+    assert_eq!(resumed.derived, 1);
+    assert_eq!(resumed.ledger_calls, 2);
+
+    let mut config = DecisionConfig::new(TEST_MODEL);
+    // The CLI gives a continuation what is left of the session's ceiling; the
+    // layer simply runs the rounds it is given.
+    config.max_rounds = 2;
+    let mut layer = DecisionLayer::new(
+        client(&second, &timeline),
+        journal.clone(),
+        registry(),
+        timeline.clone(),
+        config,
+        resumed.charter.clone(),
+        dir.clone(),
+    )
+    .resume(resumed);
+    let outcome_two = layer.run().await.expect("the continuation completes");
+
+    // The session's totals, not the invocation's.
+    assert_eq!(
+        outcome_two.rounds, 2,
+        "the continuation runs the session's second round, not its first"
+    );
+    assert_eq!(outcome_two.delegations, 2);
+    assert_eq!(second.beyond_the_script(), 0);
+
+    // **The state, in front of it.** The decision and the rejection the first
+    // run recorded are in the view the continuation sent — the rejection under
+    // the heading that rules it out.
+    let request = second
+        .to_the_decision_layer()
+        .into_iter()
+        .next()
+        .expect("the continuation asked the layer something");
+    let system = system_text(&request);
+    assert!(
+        system.contains("keep the probe's output"),
+        "the recorded decision has to come back into L1: {system}"
+    );
+    // **L0 as well.** The constraint was never written into the record as
+    // prose: it lived in the charter the first run was handed, and the seed
+    // event is the only place a continuation can read it. Lose the seed and the
+    // continuation silently works without the standing condition.
+    assert!(
+        system.contains("## Constraints") && system.contains("never touch the release branch"),
+        "the constraints the session ran under have to come back with it: {system}"
+    );
+    assert!(
+        system.contains("do not re-propose"),
+        "the recorded rejection has to come back under its heading: {system}"
+    );
+    assert!(
+        system.contains("inline the raw probe output"),
+        "and it has to be the rejection's own words: {system}"
+    );
+
+    // **The record.** One session beginning, one round per round the session
+    // actually ran, and the continuation's own work numbered after the work
+    // that already happened.
+    let record = std::fs::read_to_string(journal.path()).expect("the record is a file");
+    assert_eq!(
+        events_of(&record, "session_started").len(),
+        1,
+        "a continuation must not start the session a second time"
+    );
+    assert_eq!(events_of(&record, "session_seeded").len(), 1);
+    let rounds: Vec<(u64, u64)> = events_of(&record, "round_started")
+        .iter()
+        .map(|event| {
+            (
+                event["body"]["round"].as_u64().unwrap(),
+                event["body"]["ceiling"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rounds,
+        vec![(1, 1), (2, 2)],
+        "the continuation has to continue the session's round numbering"
+    );
+    let children: Vec<String> = events_of(&record, "delegated")
+        .iter()
+        .map(|event| event["body"]["child"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        children,
+        vec!["executor#1".to_owned(), "executor#2".to_owned()],
+        "two runs in one record must not share an address"
+    );
+    assert!(
+        record.contains("resumed at seq"),
+        "the boundary has to be an event in the record, not a silent append: {record}"
+    );
+    assert!(
+        record.contains("delegation 2:"),
+        "the delegation numbering has to continue: {record}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

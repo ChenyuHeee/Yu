@@ -725,7 +725,11 @@ impl std::fmt::Display for ForkEstimate {
 /// write into another directory. Unsafe characters become `_`, and an id that had
 /// to be rewritten carries a digest suffix — two distinct ids must never be able
 /// to land on the same file, because that is silent mixing of two records.
-fn event_log_file_name(session: &SessionId) -> String {
+///
+/// Public because a caller that has to ask "does this session exist yet" has to
+/// ask it about the same file the journal will write, and a second spelling of
+/// the rule is how the two answers drift apart.
+pub fn event_log_file_name(session: &SessionId) -> String {
     let name = session.as_str();
     let safe: String = name
         .chars()

@@ -138,9 +138,22 @@ pub fn is_decision_tool(name: &str) -> bool {
 /// Total by construction: every path either writes a well-formed entry or
 /// returns a report of why it did not.
 pub fn apply(name: &str, input: &Value, ledger: &mut Ledger) -> Applied {
+    apply_at(name, input, ledger, yu_observe::now_ms())
+}
+
+/// The same call, at a time the caller states.
+///
+/// This is what makes L1 rebuildable. `apply` is pure and total, so a resumed
+/// session replays the tool calls the record holds and gets exactly the ledger
+/// the killed one left — including reversals, the retired audit trail, and the
+/// repeats that wrote nothing. The one thing the record holds that `apply`'s
+/// live spelling cannot know is *when* each call happened; the replayed entry
+/// has to carry the event's own `ts_ms`, or a rebuilt ledger would claim every
+/// decision was taken at resume time.
+pub fn apply_at(name: &str, input: &Value, ledger: &mut Ledger, at_ms: i64) -> Applied {
     match name {
-        DECIDE => decide(input, ledger),
-        RETIRE => retire(input, ledger),
+        DECIDE => decide(input, ledger, at_ms),
+        RETIRE => retire(input, ledger, at_ms),
         other => refuse(
             other,
             format!(
@@ -318,7 +331,7 @@ fn verdict_field(args: &serde_json::Map<String, Value>) -> Result<Verdict, Appli
     }
 }
 
-fn decide(input: &Value, ledger: &mut Ledger) -> Applied {
+fn decide(input: &Value, ledger: &mut Ledger, at_ms: i64) -> Applied {
     let args = match object(DECIDE, input) {
         Ok(args) => args,
         Err(refused) => return refused,
@@ -350,7 +363,7 @@ fn decide(input: &Value, ledger: &mut Ledger) -> Applied {
                 ledger.decisions.push(Decision {
                     what,
                     why,
-                    at_ms: yu_observe::now_ms(),
+                    at_ms,
                 });
                 return record;
             }
@@ -358,7 +371,7 @@ fn decide(input: &Value, ledger: &mut Ledger) -> Applied {
             ledger.decisions.push(Decision {
                 what,
                 why,
-                at_ms: yu_observe::now_ms(),
+                at_ms,
             });
             record
         }
@@ -382,7 +395,7 @@ fn decide(input: &Value, ledger: &mut Ledger) -> Applied {
     }
 }
 
-fn retire(input: &Value, ledger: &mut Ledger) -> Applied {
+fn retire(input: &Value, ledger: &mut Ledger, at_ms: i64) -> Applied {
     let args = match object(RETIRE, input) {
         Ok(args) => args,
         Err(refused) => return refused,
@@ -402,7 +415,7 @@ fn retire(input: &Value, ledger: &mut Ledger) -> Applied {
     // which, because "retired" and "removed something" are different claims,
     // and the `removed` field is where the difference is recorded.
     let already_retired = ledger.retired.iter().filter(|r| r.item == item).count();
-    let removed = ledger.retire(item, reason);
+    let removed = ledger.retire_at(item, reason, at_ms);
     let entries = if removed == 1 { "entry" } else { "entries" };
 
     let text = match (removed, already_retired) {

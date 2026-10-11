@@ -230,6 +230,43 @@ pub enum EventBody {
         parent_at_seq: u64,
     },
 
+    /// The state a session was handed when it began, as a blob reference.
+    ///
+    /// L0 and L1 can arrive from outside the record — a charter from a command
+    /// line, a ledger from a handover — and a state that lives only in the
+    /// process that built it dies with that process. This is the one event that
+    /// makes it rebuildable: whatever a later run needs to continue this session
+    /// is either here or in the calls the session recorded after it.
+    ///
+    /// A reference rather than inline, for the reason every payload in this
+    /// record is one: the state is a few kilobytes of JSON that is read once,
+    /// and a line is read once per traversal (constraint 2).
+    ///
+    /// Not a record item for the generation-change readers
+    /// (`yu_workflow::handover`): it is the state a handover *replaces*, so
+    /// treating it as work the handover must carry would fire the verifier's
+    /// gap check on every run.
+    SessionSeeded { blob: String },
+
+    /// A round of the decision layer began.
+    ///
+    /// Typed rather than a `Note`, because a continuation has to *read* it.
+    /// "How many rounds has this session spent" decides how much budget a
+    /// resumed run still has: a run that counted from one again would spend the
+    /// ceiling twice and report a round count that describes neither run. The
+    /// record's own previous answer to this question — the note a session writes
+    /// when it decides — only exists when the session decided, and the sessions
+    /// that need resuming are exactly the ones that did not.
+    RoundStarted {
+        /// One-based, and counted across the session's whole life: a resumed
+        /// run continues the numbering rather than restarting it.
+        round: u32,
+        /// The round ceiling in force when this round began. Recorded so a
+        /// continuation can say what the session was run under, and so a caller
+        /// that wants a different one has to choose it rather than inherit it.
+        ceiling: u32,
+    },
+
     /// One agent derived another, and this is the edge.
     ///
     /// The **parent is the recording agent** — the event's own envelope `agent`
@@ -306,6 +343,8 @@ impl EventBody {
             EventBody::Effect { .. } => "effect",
             EventBody::Forked { .. } => "forked",
             EventBody::Delegated { .. } => "delegated",
+            EventBody::SessionSeeded { .. } => "session_seeded",
+            EventBody::RoundStarted { .. } => "round_started",
         }
     }
 
@@ -512,6 +551,19 @@ impl PartialEq for EventBody {
                     task: t2,
                 } if c1 == c2 && p1 == p2 && t1 == t2
             ),
+            EventBody::SessionSeeded { blob: b1 } => {
+                matches!(other, EventBody::SessionSeeded { blob: b2 } if b1 == b2)
+            }
+            EventBody::RoundStarted {
+                round: r1,
+                ceiling: c1,
+            } => matches!(
+                other,
+                EventBody::RoundStarted {
+                    round: r2,
+                    ceiling: c2,
+                } if r1 == r2 && c1 == c2
+            ),
         }
     }
 }
@@ -606,6 +658,13 @@ mod tests {
                 child: yu_observe::AgentId::new("child"),
                 depth: 1,
                 task: "t".into(),
+            },
+            EventBody::SessionSeeded {
+                blob: "f".repeat(64),
+            },
+            EventBody::RoundStarted {
+                round: 2,
+                ceiling: 4,
             },
         ]
     }

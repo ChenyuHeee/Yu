@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use yu_core::decision::{DecisionConfig, DecisionLayer};
+use yu_core::decision::{DecisionConfig, DecisionLayer, StoppedEarly};
 use yu_core::render::Charter;
 use yu_journal::{Journal, SessionId};
 use yu_observe::Timeline;
@@ -498,17 +498,22 @@ async fn a_constraint_only_the_dying_session_wrote_down_reaches_the_new_sessions
     );
 }
 
-/// The other half of the trigger, on a real run: a session whose window grew
-/// hands over even though it never decided, and one that stayed quiet does not.
+/// **The end-to-end acceptance's Gap 2, on a real run.**
 ///
-/// This is the backstop DESIGN describes, and the count is what makes it a
-/// backstop rather than a trap: growth is measured from where the session
-/// started, so a window that is merely large — the shape of a freshly seeded
-/// one — does not fire. The test sets a threshold of one character, because
-/// every rendered view is larger than the one before it, and checks the other
-/// direction by giving the same run no threshold at all.
+/// A session that runs out of rounds hands over — with no threshold declared and
+/// whatever its window did. The previous version of this test asserted the
+/// opposite: without a declared threshold, a session that never decided was not
+/// handed over. That was the rule the acceptance disproved — the run reached its
+/// ceiling at five rounds, the growth backstop was never crossed, and no
+/// handover was written at the one boundary where the unfinished work was the
+/// whole reason to continue it.
+///
+/// The growth rule itself is not gone: it is the backstop for a stop that is not
+/// the ceiling, and its arithmetic — growth measured from where the session
+/// started, never the size of the window — is still guarded by
+/// `the_growth_rule_has_one_implementation` in the crate's own tests.
 #[tokio::test]
-async fn a_session_that_never_decided_hands_over_only_when_its_view_grew() {
+async fn a_session_that_ran_out_of_rounds_hands_over_without_a_declared_threshold() {
     // Every turn names a tool this layer does not have: nothing moves, and the
     // run reaches its ceiling without a decision.
     let spin: Vec<Value> = (0..12)
@@ -522,28 +527,41 @@ async fn a_session_that_never_decided_hands_over_only_when_its_view_grew() {
         })
         .collect();
     let endpoint = FakeEndpoint::start(spin);
-    let (_, _, _, outcome) = run_session("never-decided", &endpoint, charter_for("churn")).await;
-    assert!(
-        outcome.stopped_early.is_some(),
-        "the session has to actually stop without deciding for this to test anything"
-    );
+    let (_, journal, _, outcome) =
+        run_session("never-decided", &endpoint, charter_for("churn")).await;
+    let stop = outcome
+        .stopped_early
+        .as_ref()
+        .expect("the session has to actually stop without deciding for this to test anything");
+    // Written as an irrefutable destructuring rather than a match arm on
+    // purpose: when a second stop reason exists, this line stops compiling and
+    // asks whoever added it what the ceiling is supposed to mean here.
+    let StoppedEarly::RoundCeiling { ceiling } = stop;
 
-    assert_eq!(
-        trigger_for(&outcome, Some(1)),
-        Some(Trigger::Threshold {
-            growth_since_last: outcome
-                .peak()
-                .expect("a run measured its contexts")
-                .total_chars
-                - outcome.contexts[0].total_chars,
-            threshold: 1,
-        }),
-        "a session that grew past a one-character threshold has to fire"
-    );
+    // No threshold, and a window that never grew past its first frame: the
+    // ceiling is the session's own ending, and that is what the boundary
+    // decides on.
     assert_eq!(
         trigger_for(&outcome, None),
-        None,
-        "without a declared threshold a session that did not decide is not handed over, \
-         and the caller is told so rather than given a default"
+        Some(Trigger::CeilingReached { ceiling: *ceiling }),
+        "a session that ran out of rounds has to hand over its unfinished work"
+    );
+
+    // And the change it produces says so in the record's own words: the reason
+    // recorded is the ceiling, not a window that grew.
+    let change = change_generation(
+        &MarkerReader,
+        &journal,
+        Trigger::CeilingReached { ceiling: *ceiling },
+        &charter_for("churn"),
+        &outcome.ledger,
+        &ReaderAngle::ALL,
+    )
+    .await
+    .expect("the generation change runs");
+    assert!(
+        change.trigger.describe().contains("round ceiling"),
+        "the recorded reason has to name the ceiling: {}",
+        change.trigger.describe()
     );
 }
