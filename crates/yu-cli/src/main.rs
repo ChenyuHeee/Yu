@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use yu_core::agent::{Agent, AgentConfig};
-use yu_core::decision::{DecisionConfig, DecisionLayer};
-use yu_core::render::Charter;
+use yu_core::decision::{DecisionConfig, DecisionLayer, Resumed};
+use yu_core::render::{Charter, HumanUtterance};
 use yu_policy::resource::Policy;
 use yu_journal::{EventBody, Journal, SessionId};
 use yu_workflow::handover::{
@@ -135,16 +135,27 @@ enum Command {
     /// six months from now.
     Decide {
         /// The charter: what is to be achieved, in the human's own words.
+        ///
+        /// Required for a new session. When continuing one (`--session`), the
+        /// recorded intent is restored and this is optional — and when it is
+        /// given it is what it says it is: a further sentence of the human's,
+        /// appended to L0 rather than replacing what was there.
         #[arg(short, long)]
-        charter: String,
+        charter: Option<String>,
         #[arg(long, default_value = ".yu")]
         dir: PathBuf,
         #[arg(long)]
         cwd: Option<PathBuf>,
         #[arg(short, long)]
         model: Option<String>,
-        #[arg(long, default_value_t = 4)]
-        max_rounds: u32,
+        /// The round ceiling.
+        ///
+        /// A new session gets 4 when this is not given. A continuation defaults
+        /// to the ceiling the session was run under, recorded in its round
+        /// markers; the budget belongs to the session, so what the continuation
+        /// runs is what is left of it, not a second helping.
+        #[arg(long)]
+        max_rounds: Option<u32>,
         #[arg(long, value_enum, default_value_t = ToolSet::ReadOnly)]
         tools: ToolSet,
         /// The policy resource. A delegation's prediction sets come from here,
@@ -161,6 +172,25 @@ enum Command {
         /// governs how many executors run, not merely what the view says.
         #[arg(long)]
         topology: Option<String>,
+        /// The session this run belongs to, by name.
+        ///
+        /// A name with a record already under it is **continued**, and the run
+        /// says what it restored: L0 is rebuilt from the state the session was
+        /// handed (its seed event), L1 by replaying the `decide`/`retire` calls
+        /// the record holds, and the rounds already spent are read from the
+        /// round markers — so the continuation runs what is left of the
+        /// session's budget rather than a second full one. Effects the record
+        /// has recorded as completed are read back from it rather than
+        /// performed again. Whatever the record cannot supply is named, out
+        /// loud, rather than guessed at.
+        ///
+        /// A name with no record starts one, which is what makes a killed run
+        /// resumable: the run that is killed has to have been named when it
+        /// started. The two outcomes are printed differently, so a name that was
+        /// not the one meant shows up as "new session" rather than as a
+        /// continuation of nothing.
+        #[arg(long, conflicts_with = "handover")]
+        session: Option<String>,
         /// Start from a handover an earlier session wrote: its intent, its
         /// constraints, its decisions, its loose ends, and an index of where
         /// each came from. The new session's journal branches from the record
@@ -168,14 +198,18 @@ enum Command {
         #[arg(long)]
         handover: Option<PathBuf>,
         /// Write a handover for the next session here, when this run ends. The
-        /// session boundary is where a generation change is decided, and
-        /// completion decides it first.
+        /// session boundary is where a generation change is decided: completion
+        /// decides it first, and so does a session that ran out of rounds
+        /// without reaching a final answer — the work it left is exactly what
+        /// the next session continues.
         #[arg(long)]
         handover_out: Option<PathBuf>,
-        /// Also hand over a session that stopped without deciding, once its view
-        /// has grown this many characters past where it started. Growth, never
-        /// window size: a freshly seeded window is large by construction, so
-        /// billing that would fire forever.
+        /// A second way to hand over a session that stopped without a final
+        /// answer: once its view has grown this many characters past where it
+        /// started. A session that reached its round ceiling hands over without
+        /// this; the growth rule covers a session that stopped for anything
+        /// else. Growth, never window size: a freshly seeded window is large by
+        /// construction, so billing that would fire forever.
         #[arg(long, requires = "handover_out")]
         handover_at_growth: Option<u64>,
     },
@@ -276,12 +310,13 @@ async fn main() -> ExitCode {
             policy,
             constraints,
             topology,
+            session,
             handover,
             handover_out,
             handover_at_growth,
         } => {
             cmd_decide(
-                &charter,
+                charter.as_deref(),
                 &dir,
                 cwd,
                 model,
@@ -290,6 +325,7 @@ async fn main() -> ExitCode {
                 policy.as_deref(),
                 &constraints,
                 topology.as_deref(),
+                session.as_deref(),
                 handover.as_deref(),
                 handover_out.as_deref(),
                 handover_at_growth,
@@ -872,6 +908,7 @@ async fn boot_decision(
     tool_set: ToolSet,
     policy: Option<&Policy>,
     resume: Option<&Handover>,
+    session_name: Option<&str>,
 ) -> anyhow::Result<DecisionBoot> {
     let timeline = Timeline::new();
     timeline.enter(AgentId::decision());
@@ -879,10 +916,12 @@ async fn boot_decision(
 
     let client = Arc::new(WireClient::from_env()?.with_timeline(timeline.clone()));
     let model = model.unwrap_or_else(|| client.default_model().to_owned());
-    let session = SessionId::new(format!(
-        "decide-{}",
-        chrono::Utc::now().format("%Y%m%dT%H%M%S")
-    ));
+    // A named session is a session the caller wants to find again — for a
+    // continuation it is the record being reopened, and the name is the address.
+    let session = SessionId::new(match session_name {
+        Some(name) => name.to_owned(),
+        None => format!("decide-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S")),
+    });
     // A continuation branches from the record its handover indexes rather than
     // starting a log of its own. `journal:seq=<n>` names a position in one
     // lineage, so a session that restarted the numbering would make every
@@ -905,22 +944,99 @@ async fn boot_decision(
     })
 }
 
+/// The round ceiling a new session gets when none is given.
+const DEFAULT_DECIDE_ROUNDS: u32 = 4;
+
+/// Parse a `--topology` argument, naming the shapes when it is not one.
+fn topology_named(name: &str) -> anyhow::Result<yu_core::topology::TopologySpec> {
+    let kind = yu_core::topology::TopologyKind::from_str(name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "`{name}` is not a topology this harness knows; the shapes are single, chain, \
+             fan_out, tree, reflection, peer, verification_partition"
+        )
+    })?;
+    Ok(yu_core::topology::TopologySpec::new(kind))
+}
+
+/// State what a continuation rebuilt from the record, and what it could not.
+///
+/// Printed rather than left implicit, because the failure mode here is silent in
+/// both directions: a run that believed it was round 1 of a session that is
+/// really round 4 would spend the budget twice, and a run that lost the
+/// constraints the session was under would work without them — neither of which
+/// shows up in anything but this report.
+fn report_resume(resumed: &Resumed, rounds: u32) {
+    eprintln!(
+        "--- continuing a session whose record already existed: seq continues at {}; L0 = {} \
+         constraint(s){}; L1 = {} decision(s), {} rejected, {} open question(s), rebuilt from \
+         {} recorded call(s)",
+        resumed.at_seq,
+        resumed.charter.constraints.len(),
+        match &resumed.charter.topology {
+            Some(topology) => format!(", topology {}", topology.kind.as_str()),
+            None => String::new(),
+        },
+        resumed.ledger.decisions.len(),
+        resumed.ledger.rejected.len(),
+        resumed.ledger.open_questions.len(),
+        resumed.ledger_calls,
+    );
+    match resumed.rounds_spent {
+        Some(spent) => eprintln!(
+            "--- rounds already spent: {spent}; this continuation runs rounds {}..={rounds}",
+            spent + 1
+        ),
+        None => eprintln!(
+            "--- rounds already spent: unknown — the record holds no round marker, so this \
+             continuation runs the whole budget it was given"
+        ),
+    }
+    for problem in &resumed.not_recoverable {
+        eprintln!("--- NOT restored from the record: {problem}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_decide(
-    charter_text: &str,
+    charter_text: Option<&str>,
     dir: &PathBuf,
     cwd: Option<PathBuf>,
     model: Option<String>,
-    max_rounds: u32,
+    max_rounds: Option<u32>,
     tool_set: ToolSet,
     policy_path: Option<&Path>,
     constraints: &[String],
     topology: Option<&str>,
+    session_name: Option<&str>,
     handover_path: Option<&Path>,
     handover_out: Option<&Path>,
     handover_at_growth: Option<u64>,
 ) -> anyhow::Result<()> {
     let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    // A new session has to be told what to do; a continuation already carries
+    // its intent in the record, and asking for it again would invite the
+    // operator to rewrite the charter of a session the human already stated.
+    if charter_text.is_none() && session_name.is_none() {
+        anyhow::bail!("`--charter` is required unless `--session` continues an existing record");
+    }
+    // Whether this run continues a record or starts one. Asked before anything
+    // is written, and about the same file the journal will write — a name with a
+    // record is a session to continue, and a name without one is a session to
+    // start (which is what makes a killed run resumable: the run that gets
+    // killed has to have been named when it started).
+    let named_record_exists = session_name.is_some_and(|name| {
+        dir.join(yu_journal::event_log_file_name(&SessionId::new(name)))
+            .exists()
+    });
+    if session_name.is_some() && !named_record_exists && charter_text.is_none() {
+        anyhow::bail!(
+            "there is no record of a session named `{}` in {}, so this would be a new session — \
+             and a new session has to be given a `--charter`",
+            session_name.expect("just checked"),
+            dir.display()
+        );
+    }
 
     // A handover from a previous session, if this one is a continuation. Read as
     // text and kept as text: its blob's address is the digest of the bytes that
@@ -959,28 +1075,139 @@ async fn cmd_decide(
         tool_set,
         policy.as_ref(),
         resumed.as_ref().map(|(h, _)| h),
+        session_name,
     )
     .await?;
+
+    // ---- read the record back, when this run continues one
+    //
+    // Before a single request is sent, because everything the continuation does
+    // is conditioned on it: L0 and L1 come from here, the round budget comes
+    // from here, and what the record could *not* supply is said out loud below
+    // rather than filled in by a guess.
+    let mut continued: Option<Resumed> = None;
+    if let Some(name) = session_name {
+        if journal.is_empty() {
+            // No record, or an empty file: either way there is nothing to
+            // continue. Said out loud, because the two outcomes of `--session` —
+            // started here, continued here — must not look alike.
+            eprintln!(
+                "--- session {name}: no events recorded yet — this run starts it, and a later \
+                 run with the same name can continue it"
+            );
+        } else {
+            continued = Some(Resumed::read(&journal, &AgentId::decision()).await?);
+        }
+    }
+
+    // ---- the round budget
+    //
+    // It belongs to the session, not to the invocation: a continuation spends
+    // what is left of the ceiling the session was run under (recorded in its
+    // round markers) unless the operator explicitly gives it another. Running
+    // the whole budget again would spend it twice, and the round count the run
+    // reports would describe neither run.
+    let rounds = max_rounds
+        .or_else(|| continued.as_ref().and_then(|resumed| resumed.ceiling))
+        .unwrap_or(DEFAULT_DECIDE_ROUNDS);
+    // Kept for the run's summary, which reports the session's totals: the
+    // difference between "5 rounds" and "5 rounds, 3 of them before this
+    // continuation" is the difference between two readings of one number.
+    let resumed_rounds_before = continued
+        .as_ref()
+        .and_then(|resumed| resumed.rounds_spent)
+        .unwrap_or(0);
+    if let Some(resumed) = &continued {
+        let name = session_name.expect("a continuation has a session name");
+        let spent = resumed.rounds_spent.unwrap_or(0);
+        if spent >= rounds {
+            anyhow::bail!(
+                "session `{name}` has already spent {spent} of its {rounds} round(s): this \
+                 continuation would have no round to run. Pass a higher `--max-rounds` to give \
+                 it room, or leave the session where it is"
+            );
+        }
+        if resumed.forked_from.is_some() && resumed.tool_surface.is_none() {
+            // A branch's L0 and L1 were handed to it from a handover, and this
+            // record — written before sessions recorded the state they start
+            // from — does not hold them. Continuing it would run a session whose
+            // constraints and whose settled questions are both unknown, which is
+            // the one thing a resume must not do silently.
+            let (parent, at) = resumed.forked_from.as_ref().expect("just checked");
+            anyhow::bail!(
+                "the record of `{name}` is a branch of `{parent}` at seq {at}, and holds no seed \
+                 event: the state it inherited from that branch's handover cannot be rebuilt \
+                 from this record, so continuing it would run without the constraints and \
+                 decisions the session was under. Start a new session from the handover instead"
+            );
+        }
+    }
 
     // DESIGN: "人类原话原样存活". The charter arrives as the human typed it and is
     // kept that way; there is no summarising step between them and the decision
     // layer. The constructor exists so the sentence lands in exactly one field —
     // setting both `text` and `human_words` renders L0 with the intent twice on
     // every round, which is the layer least able to afford it.
-    let mut charter = Charter::from_the_humans_own_words(
-        charter_text,
-        chrono::Utc::now().timestamp_millis(),
-        "cli",
-    );
-    charter.constraints = constraints.to_vec();
-    if let Some(name) = topology {
-        let kind = yu_core::topology::TopologyKind::from_str(name).ok_or_else(|| {
-            anyhow::anyhow!(
-                "`{name}` is not a topology this harness knows; the shapes are single, chain, \
-                 fan_out, tree, reflection, peer, verification_partition"
-            )
-        })?;
-        charter.topology = Some(yu_core::topology::TopologySpec::new(kind));
+    let mut charter = match &continued {
+        // **L0, rebuilt from the record**, not from these flags. What the
+        // session was handed — its constraints, its acceptance, its declared
+        // topology, the human's own words — is what it is still under, and none
+        // of it is re-invented here. A flag adds to it; a flag never quietly
+        // replaces a state the record holds.
+        Some(resumed) => {
+            if resumed.charter.is_empty() && charter_text.is_none() {
+                anyhow::bail!(
+                    "the record of `{}` holds no charter, and none was passed: a continuation \
+                     with no L0 would be a session with no intent",
+                    session_name.expect("a continuation has a session name"),
+                );
+            }
+            let mut charter = resumed.charter.clone();
+            if let Some(text) = charter_text {
+                charter.human_words.push(HumanUtterance {
+                    at_ms: chrono::Utc::now().timestamp_millis(),
+                    text: text.to_owned(),
+                    // Stated, because a later reader has to be able to tell the
+                    // session's original words from one added mid-continuation.
+                    source: "cli, on continuing this session".to_owned(),
+                });
+            }
+            for constraint in constraints {
+                if !charter.constraints.iter().any(|held| held == constraint) {
+                    charter.constraints.push(constraint.clone());
+                }
+            }
+            if let Some(name) = topology {
+                let declared = topology_named(name)?;
+                if let Some(held) = &charter.topology
+                    && held != &declared
+                {
+                    eprintln!(
+                        "--- the declared topology is being replaced: the record holds `{}`, \
+                         this invocation declares `{name}`",
+                        held.kind.as_str()
+                    );
+                }
+                charter.topology = Some(declared);
+            }
+            charter
+        }
+        None => {
+            let mut charter = Charter::from_the_humans_own_words(
+                charter_text.expect("checked: a new session is given a charter"),
+                chrono::Utc::now().timestamp_millis(),
+                "cli",
+            );
+            charter.constraints = constraints.to_vec();
+            if let Some(name) = topology {
+                charter.topology = Some(topology_named(name)?);
+            }
+            charter
+        }
+    };
+
+    if let Some(resumed) = &continued {
+        report_resume(resumed, rounds);
     }
 
     // **The state half of the handover, into L0 and L1.** The human's sentence
@@ -1001,8 +1228,29 @@ async fn cmd_decide(
     }
 
     let surface = describe_tools(&tools);
+    // What the record says the session's executor surface was, against what this
+    // invocation built. They can legitimately differ — the operator chooses —
+    // but they must not differ *silently*: an executor that lost `exec` or
+    // `write_file` because of a default is a continuation that cannot do what
+    // the session was doing.
+    if let Some(recorded) = continued
+        .as_ref()
+        .and_then(|resumed| resumed.tool_surface.as_ref())
+    {
+        let mut now: Vec<String> = tools.names();
+        now.sort();
+        if recorded != &now {
+            eprintln!(
+                "--- the executor tool surface has changed since this session started: the \
+                 record holds [{}], this invocation built [{}] — the continuation runs with \
+                 what was just built",
+                recorded.join(", "),
+                now.join(", ")
+            );
+        }
+    }
     let mut config = DecisionConfig::new(model);
-    config.max_rounds = max_rounds;
+    config.max_rounds = rounds;
     // The prediction sets come from the policy file, so changing one is an edit
     // to a resource rather than a rebuild — DESIGN's constraint 0, applied to
     // the one thing the decision layer is forbidden to invent.
@@ -1027,6 +1275,34 @@ async fn cmd_decide(
             raw.len() as u64,
         )]);
         *layer.ledger_mut() = seed.ledger.clone();
+    }
+    // The prediction sets, against the ones the session was run under: a
+    // continuation whose policy no longer declares a set the record holds would
+    // refuse the same delegations the session was making, and that is a
+    // difference the operator has to see rather than discover from a refusal.
+    if let Some(recorded) = continued
+        .as_ref()
+        .and_then(|resumed| resumed.outcome_sets.as_ref())
+    {
+        let now: Vec<String> = policy
+            .as_ref()
+            .map(|policy| policy.outcome_sets.ids().into_iter().map(str::to_owned).collect())
+            .unwrap_or_default();
+        if recorded != &now {
+            eprintln!(
+                "--- the policy's outcome sets have changed since this session started: the \
+                 record holds [{}], this invocation loaded [{}]",
+                recorded.join(", "),
+                now.join(", ")
+            );
+        }
+    }
+    // **The record, as this run's L0/L1.** The layer is handed the state the
+    // record rebuilt — L0 and L1, its counters, and the index of what the
+    // session did before this continuation — so the run does not begin as if
+    // nothing had happened.
+    if let Some(resumed) = continued.take() {
+        layer = layer.resume(resumed);
     }
     if let Some(policy) = &policy {
         let path = policy_path.expect("a policy came from somewhere");
@@ -1071,16 +1347,29 @@ async fn cmd_decide(
 
     println!("{}", outcome.final_text);
 
+    // The counts are the session's, not this invocation's: a continuation
+    // inherits the numbers and continues them, so "round 5, delegation 3" means
+    // one thing in the record rather than one thing per process.
     eprintln!(
-        "\n--- {} round(s), {} delegation(s) in {:.1}s",
+        "\n--- {} round(s), {} delegation(s){} in {:.1}s",
         outcome.rounds,
         outcome.delegations,
+        match resumed_rounds_before {
+            0 => String::new(),
+            before => format!(" ({before} before this continuation)"),
+        },
         elapsed.as_secs_f64()
     );
     eprintln!(
         "--- tokens in={} out={} cache_read={}",
         outcome.usage.input_tokens, outcome.usage.output_tokens, outcome.usage.cache_read_input_tokens
     );
+    if let Some(stopped) = &outcome.stopped_early {
+        // Never inferred from the absence of an answer: a run that stopped has
+        // to say why, in words, next to the numbers it would otherwise look
+        // complete without.
+        eprintln!("--- stopped: {}", stopped.describe());
+    }
 
     report_landings(&outcome);
     report_agents(&journal).await;
@@ -1141,10 +1430,22 @@ async fn cmd_decide(
                     );
                 }
             }
-            None => eprintln!(
-                "--- no handover: the session stopped without deciding, and its view did not \
-                 grow past the declared threshold"
-            ),
+            None => {
+                // Worded for what actually happened. The previous line said "the
+                // session stopped without deciding", while L1 held a decision,
+                // and its first real reader concluded the layer had decided
+                // nothing. The stop is about the *final answer*; the ledger is
+                // reported above this line, separately.
+                let why = outcome
+                    .stopped_early
+                    .as_ref()
+                    .map(|stopped| stopped.describe())
+                    .unwrap_or_else(|| "the session reached no final answer".to_owned());
+                eprintln!(
+                    "--- no handover: {why}, and its view did not grow past the declared growth \
+                     threshold either — this boundary did not warrant the change"
+                );
+            }
         }
     }
     Ok(())
@@ -1388,7 +1689,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yu-cli-init-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let boot = boot_decision(&dir, dir.clone(), None, ToolSet::ReadOnly, None, None)
+        let boot = boot_decision(&dir, dir.clone(), None, ToolSet::ReadOnly, None, None, None)
             .await
             .expect("the boot sequence");
 

@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use yu_journal::{EventBody, Journal};
+use yu_journal::{EventBody, Journal, SessionId};
 use yu_observe::{AgentId, ContextComposition, ShapeSignal, SpanKind, Timeline, TokenUsage};
 use yu_tools::ToolRegistry;
 use yu_wire::client::{StreamSink, WireClient};
@@ -126,13 +126,20 @@ pub struct DecisionOutcome {
     /// process exits.
     #[serde(default)]
     pub ledger: Ledger,
-    /// Why the run ended without the layer deciding, when it did.
+    /// Why the run ended without the layer reaching a final answer, when it did.
     ///
     /// `None` means the layer reached a decision. `Some` means it did not — and
     /// the caller has to be able to tell, because `final_text` for a stopped run
     /// is the layer's last narration rather than its answer.
+    ///
+    /// Typed rather than a sentence, because one caller has to *act* on it: the
+    /// session boundary decides whether to hand over from this value
+    /// (`yu_workflow::handover::trigger_for`), and a caller that matched on prose
+    /// would be reading a message that is free to change. The sentence is still
+    /// available — [`StoppedEarly::describe`] — for whoever is reading rather
+    /// than deciding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stopped_early: Option<String>,
+    pub stopped_early: Option<StoppedEarly>,
     /// Every delegation's reduced outcome, for the caller's own audit.
     pub outcomes: Vec<DelegateOutcome>,
 }
@@ -217,6 +224,336 @@ impl DecisionOutcome {
     }
 }
 
+/// Why a run stopped without the layer reaching a final answer.
+///
+/// The reason is a value rather than a sentence because the session boundary
+/// acts on it: whether a stopped session hands over is decided from which stop
+/// this was (`yu_workflow::handover::trigger_for`), and a reason that could only
+/// be read as text would make that decision a string match on a message either
+/// side is free to reword.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "stop", rename_all = "snake_case")]
+pub enum StoppedEarly {
+    /// The round budget ran out while the layer was still working.
+    ///
+    /// The one producer today, and one of the two ways a long task ends: the
+    /// layer did not stop working, it stopped *moving*, and what it left is
+    /// exactly what a generation change exists to carry.
+    RoundCeiling {
+        /// The ceiling that ran out.
+        ceiling: u32,
+    },
+}
+
+impl StoppedEarly {
+    /// The account to give whoever reads the outcome.
+    ///
+    /// Written out rather than derived from the Debug form, and worded
+    /// carefully: the first real reader was told "the session stopped without
+    /// deciding" while L1 held a decision, and read it as "the layer decided
+    /// nothing". What has to survive the sentence is the distance between
+    /// *reaching a final answer* and *writing things down* — this stop means the
+    /// first did not happen, not that the second did not.
+    pub fn describe(&self) -> String {
+        match self {
+            StoppedEarly::RoundCeiling { ceiling } => format!(
+                "the round ceiling of {ceiling} was reached: the layer stopped moving, it did \
+                 not stop working, and it never reached a final answer"
+            ),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Continuing a session
+// ---------------------------------------------------------------------------
+
+/// The state a session began with, as the record holds it.
+///
+/// Written once, by the run that starts a session, because everything in it can
+/// come from outside the record — the charter from a command line, the ledger
+/// from a handover — and a state that lives only in the process that built it is
+/// a state a resumed run cannot rebuild. It is a recorded *fact* ("this is what
+/// the session was handed at seq 0"), not a summary of the session: what the
+/// session itself decided is in the calls the session recorded.
+///
+/// Deliberately not a record item for the generation-change readers
+/// (`yu_workflow::handover`): the seed is the state a handover *replaces*, so
+/// treating it as work that must be carried would fire the verifier's gap check
+/// on every run.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SessionSeed {
+    charter: Charter,
+    ledger: Ledger,
+    /// The executor tool surface in force, by tool name.
+    #[serde(default)]
+    tool_surface: Vec<String>,
+    /// The prediction sets the loaded policy declared, by id.
+    #[serde(default)]
+    outcome_sets: Vec<String>,
+}
+
+/// What a continuation rebuilt from the record, and what the record could not
+/// give it.
+///
+/// Read before the continuation's first request, and every field is read *from
+/// the record*: state that cannot be obtained from the record is state that only
+/// lasts as long as the process that holds it. The `Option`s are the honest
+/// half — a fact the record does not hold is named in
+/// [`Self::not_recoverable`] rather than defaulted, because a resumed run that
+/// silently believed it was round 1 of a session that is really round 4 would
+/// spend the budget twice and report a round count that describes neither run.
+#[derive(Debug, Clone)]
+pub struct Resumed {
+    /// L0. The charter the session was handed when it started.
+    ///
+    /// From the session's own seed event; on a record written before that event
+    /// existed, rebuilt from the intent in `session_started` — which is exactly
+    /// why [`Self::not_recoverable`] names what such a record cannot supply.
+    pub charter: Charter,
+    /// L1. The state the session started from, with every recorded ledger call
+    /// replayed on top of it.
+    pub ledger: Ledger,
+    /// How many recorded `decide`/`retire` calls rebuilt it.
+    pub ledger_calls: u32,
+    /// Rounds this session had already begun, from its last round marker.
+    ///
+    /// `None` for a record that holds no marker, and that is said rather than
+    /// converted into a number: counting from one would spend the session's
+    /// budget a second time.
+    pub rounds_spent: Option<u32>,
+    /// The round ceiling the session was running under, as its last marker
+    /// recorded it.
+    pub ceiling: Option<u32>,
+    /// Delegations this session has already made. Its numbering continues
+    /// rather than restarting, so two delegations never share one address.
+    pub delegations: u32,
+    /// Agents this session has already derived, for the same reason.
+    pub derived: u32,
+    /// The executor tool surface the session ran under, when the record holds it.
+    pub tool_surface: Option<Vec<String>>,
+    /// The prediction sets the session's policy declared, when the record holds
+    /// them.
+    pub outcome_sets: Option<Vec<String>>,
+    /// Material from before this continuation, addressed for the manifest.
+    ///
+    /// Not loaded into the view — that is the manifest's whole rule — but not
+    /// silently dropped either: each entry is a recorded event the layer can
+    /// follow with `spot_check` if the bytes are worth their cost.
+    pub carried: Vec<NotLoadedEntry>,
+    /// The facts the record does not hold, in words a caller can print.
+    ///
+    /// DESIGN: "任何遗忘都是一个显式事件" — so a continuation that could not
+    /// rebuild something says so, in the record and to the operator, instead of
+    /// running on a guess.
+    pub not_recoverable: Vec<String>,
+    /// The seq this continuation's first event will get, for the record to cite.
+    pub at_seq: u64,
+    /// The record this session was branched from, when it was.
+    pub forked_from: Option<(SessionId, u64)>,
+}
+
+impl Resumed {
+    /// Read a session's own record and rebuild what a continuation needs.
+    ///
+    /// The session's *own* events (`journal.events()`), not the lineage: a
+    /// forked session's state at its birth is sealed into the seed this reads,
+    /// and replaying a parent's calls onto the child would graft work the child
+    /// never did onto its ledger.
+    pub async fn read(journal: &Journal, layer: &AgentId) -> Result<Self, yu_journal::JournalError> {
+        let events = journal.events().await?;
+        let at_seq = events.last().map(|event| event.seq + 1).unwrap_or(0);
+        let forked_from = match events.first().map(|event| &event.body) {
+            Some(EventBody::Forked {
+                parent,
+                parent_at_seq,
+            }) => Some((parent.clone(), *parent_at_seq)),
+            _ => None,
+        };
+
+        let mut seed: Option<(u64, SessionSeed)> = None;
+        let mut seed_unreadable = false;
+        let mut intent: Option<(String, u64, i64)> = None;
+        let mut rounds_spent = None;
+        let mut ceiling = None;
+        let mut delegations = 0u32;
+        let mut derived = 0u32;
+        let mut calls: Vec<(u64, String, serde_json::Value, i64)> = Vec::new();
+        let mut prose_ledger_writes: Vec<u64> = Vec::new();
+        let mut carried = Vec::new();
+
+        for event in &events {
+            if event.agent != *layer {
+                // The session's own events include every derived agent's: the
+                // layer's state is only ever written by the layer.
+                continue;
+            }
+            match &event.body {
+                EventBody::SessionSeeded { blob } => {
+                    match journal
+                        .blobs()
+                        .get_str(blob)
+                        .ok()
+                        .and_then(|text| serde_json::from_str::<SessionSeed>(&text).ok())
+                    {
+                        Some(parsed) => seed = Some((event.seq, parsed)),
+                        // The reference is in the record and the bytes are not
+                        // readable. Said rather than passed over: a state the
+                        // caller believes was restored but was not is worse
+                        // than one it knows is missing.
+                        None => seed_unreadable = true,
+                    }
+                }
+                EventBody::SessionStarted { charter, .. } => {
+                    intent = Some((charter.clone(), event.seq, event.ts_ms));
+                }
+                EventBody::RoundStarted { round, ceiling: of } => {
+                    // The last marker wins: rounds are counted across the
+                    // session, and the latest one says how far it got.
+                    rounds_spent = Some(*round);
+                    ceiling = Some(*of);
+                }
+                EventBody::Delegated { depth, .. } if *depth == 1 => {
+                    derived += 1;
+                }
+                EventBody::ToolCall { name, input, .. } => {
+                    if name == delegate::DELEGATE {
+                        delegations += 1;
+                        carried.push(NotLoadedEntry {
+                            what: format!(
+                                "a delegation from before this continuation: `{}`",
+                                one_line(input.get("task").and_then(|t| t.as_str()).unwrap_or(""))
+                            ),
+                            address: format!("journal:seq={}", event.seq),
+                            bytes: input.to_string().len() as u64,
+                            why: "it ran before this continuation; a delegate call's report is \
+                                  not carried back into the decision layer's view"
+                                .to_owned(),
+                            how_to_load: "spot_check it, then read the record of the agents it \
+                                          derived"
+                                .to_owned(),
+                        });
+                    } else if decide::is_decision_tool(name) {
+                        calls.push((event.seq, name.clone(), input.clone(), event.ts_ms));
+                    }
+                }
+                // Records written before the layer recorded its calls hold
+                // ledger writes as prose notes (`decide — decided: …`). They
+                // cannot be replayed: the entry and its reason are not
+                // separable from a sentence a model wrote, and inventing a
+                // reading of them is the one thing a rebuild may not do. They
+                // are still named, with addresses, so the manifest is complete.
+                EventBody::Note { text }
+                    if text.starts_with("decide — ") || text.starts_with("retire — ") =>
+                {
+                    prose_ledger_writes.push(event.seq);
+                    carried.push(NotLoadedEntry {
+                        what: format!("a ledger write recorded as prose: `{}`", one_line(text)),
+                        address: format!("journal:seq={}", event.seq),
+                        bytes: text.len() as u64,
+                        why: "it was written before this build recorded ledger calls \
+                              structurally, so it could not be replayed into L1"
+                            .to_owned(),
+                        how_to_load: "spot_check it".to_owned(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        // ---- L0 and L1
+        let mut not_recoverable = Vec::new();
+        let (charter, seed_ledger, tool_surface, outcome_sets) = match seed {
+            Some((_, seed)) => (
+                seed.charter,
+                seed.ledger,
+                Some(seed.tool_surface),
+                Some(seed.outcome_sets),
+            ),
+            None => {
+                if seed_unreadable {
+                    not_recoverable.push(
+                        "the state this session began with: its seed event's bytes could not \
+                         be read back from the record's store"
+                            .to_owned(),
+                    );
+                }
+                let charter = match &intent {
+                    Some((text, seq, ts)) => Charter::from_the_humans_own_words(
+                        text.clone(),
+                        *ts,
+                        format!("the record of this session at seq {seq}"),
+                    ),
+                    None => Charter::default(),
+                };
+                if seed_unreadable || !charter.is_empty() {
+                    not_recoverable.push(
+                        "the L0 constraints and topology this session ran under: the record \
+                         holds only the intent, and a record without the session's seed event \
+                         cannot say what else it was given"
+                            .to_owned(),
+                    );
+                }
+                (charter, Ledger::default(), None, None)
+            }
+        };
+
+        let mut ledger = seed_ledger;
+        let mut ledger_calls = 0u32;
+        for (_, name, input, ts) in &calls {
+            decide::apply_at(name, input, &mut ledger, *ts);
+            ledger_calls += 1;
+        }
+        if !prose_ledger_writes.is_empty() {
+            not_recoverable.push(format!(
+                "{} ledger write(s) this record holds only as prose (seq {}): L1 was rebuilt \
+                 from recorded calls only, and the prose entries are addressed in the manifest \
+                 rather than decoded",
+                prose_ledger_writes.len(),
+                prose_ledger_writes
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if rounds_spent.is_none() {
+            not_recoverable.push(
+                "how many rounds this session had already spent: the record holds no round \
+                 marker, so this continuation runs with the whole budget it is given rather \
+                 than with what is left of the session's"
+                    .to_owned(),
+            );
+        }
+
+        Ok(Self {
+            charter,
+            ledger,
+            ledger_calls,
+            rounds_spent,
+            ceiling,
+            delegations,
+            derived,
+            tool_surface,
+            outcome_sets,
+            carried,
+            not_recoverable,
+            at_seq,
+            forked_from,
+        })
+    }
+}
+
+/// One line of arbitrary text, cut so a manifest entry stays one line.
+fn one_line(text: &str) -> String {
+    let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut cut: String = flat.chars().take(80).collect();
+    if cut.chars().count() < flat.chars().count() {
+        cut.push('…');
+    }
+    cut
+}
+
 #[derive(Default)]
 struct SilentSink {
     text: String,
@@ -260,6 +597,15 @@ pub struct DecisionLayer {
     /// (`yu_workflow::handover`), which is the failure the whole flow exists to
     /// prevent.
     carried: Vec<NotLoadedEntry>,
+    /// What this layer rebuilt from a record that already existed, when it is a
+    /// continuation rather than a beginning.
+    ///
+    /// `Some` changes three things in [`Self::run`]: the session is not started
+    /// again (its `session_started` and its seed are already in the record), the
+    /// rounds continue where the record left off, and the delegation and
+    /// derivation counters continue so that no two runs in one record share an
+    /// address.
+    resumed: Option<Resumed>,
 }
 
 impl DecisionLayer {
@@ -284,7 +630,27 @@ impl DecisionLayer {
             outcome_sets: crate::outcomes::OutcomeSets::default(),
             derived: 0,
             carried: Vec::new(),
+            resumed: None,
         }
+    }
+
+    /// Continue a session whose record already exists.
+    ///
+    /// The state is applied rather than re-derived: L1 becomes the ledger the
+    /// record rebuilt, the derivation counter picks up where the record stopped,
+    /// and what the record holds from before this continuation joins the
+    /// manifest — addressed, not loaded.
+    ///
+    /// The caller decides the round ceiling ([`DecisionConfig::max_rounds`]) and
+    /// is expected to compute what is left of the session's from
+    /// [`Resumed::rounds_spent`]; a layer here simply runs the rounds it is
+    /// given.
+    pub fn resume(mut self, resumed: Resumed) -> Self {
+        self.ledger = resumed.ledger.clone();
+        self.derived = resumed.derived;
+        self.carried.extend(resumed.carried.iter().cloned());
+        self.resumed = Some(resumed);
+        self
     }
 
     /// Give the layer the state a generation change carried in, as manifest
@@ -332,7 +698,14 @@ impl DecisionLayer {
         // not about one of its children.
         let mut latest: Vec<DelegateOutcome> = Vec::new();
         let mut last_report: Option<String> = None;
-        let mut delegations = 0u32;
+        // Continued from the record when this is a continuation, so the note
+        // that numbers each delegation keeps counting rather than numbering two
+        // different delegations the same.
+        let mut delegations = self
+            .resumed
+            .as_ref()
+            .map(|resumed| resumed.delegations)
+            .unwrap_or(0);
         // The last thing the layer said. A run that exhausts its rounds still
         // produced one, and discarding it would leave the caller an error with
         // nothing in it — the shape this replaced, one layer down.
@@ -350,22 +723,109 @@ impl DecisionLayer {
             .collect::<Vec<_>>()
             .join(", ");
 
-        self.journal
-            .append(
-                self.config.id.clone(),
-                EventBody::SessionStarted {
-                    // The intent, not the `text` field: a charter that arrived
-                    // as the human's own sentence has an empty `text`, and
-                    // recording that verbatim field would write an empty charter
-                    // into L2.
-                    charter: self.charter.intent().to_owned(),
-                    model: self.config.model.clone(),
-                    quirks: self.client.quirks().name.clone(),
-                },
-            )
-            .await?;
+        // ---- the session's opening, once
+        //
+        // A continuation does not start the session: its `session_started` and
+        // its seed are already in the record — the state was read back out of
+        // them before this layer existed — and writing them again would say the
+        // session began twice, leaving every later reader to guess which
+        // beginning was the beginning. What it records instead is the
+        // continuation itself, so the boundary is an event like any other.
+        let first_round = self
+            .resumed
+            .as_ref()
+            .and_then(|resumed| resumed.rounds_spent)
+            .unwrap_or(0)
+            + 1;
+        match &self.resumed {
+            None => {
+                self.journal
+                    .append(
+                        self.config.id.clone(),
+                        EventBody::SessionStarted {
+                            // The intent, not the `text` field: a charter that arrived
+                            // as the human's own sentence has an empty `text`, and
+                            // recording that verbatim field would write an empty charter
+                            // into L2.
+                            charter: self.charter.intent().to_owned(),
+                            model: self.config.model.clone(),
+                            quirks: self.client.quirks().name.clone(),
+                        },
+                    )
+                    .await?;
+                // **The state this session starts from, recorded**, and not only
+                // the intent above. Everything in a charter except the intent —
+                // constraints, acceptance, topology — can come from a command
+                // line or a handover, and a ledger can come from a handover too;
+                // a state that lives only in this process dies with it, and the
+                // run that continues the session can rebuild neither by guessing.
+                let seed = SessionSeed {
+                    charter: self.charter.clone(),
+                    ledger: self.ledger.clone(),
+                    tool_surface: {
+                        let mut names = self.tools.names();
+                        names.sort();
+                        names
+                    },
+                    outcome_sets: self
+                        .outcome_sets
+                        .ids()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
+                };
+                let json = serde_json::to_string(&seed)
+                    .map_err(yu_journal::JournalError::Serde)?;
+                let blob = self.journal.blobs().put_str(&json)?;
+                self.journal
+                    .append(
+                        self.config.id.clone(),
+                        EventBody::SessionSeeded { blob },
+                    )
+                    .await?;
+            }
+            Some(resumed) => {
+                let spent = match resumed.rounds_spent {
+                    Some(rounds) => format!("{rounds}"),
+                    None => "an unknown number of".to_owned(),
+                };
+                let mut text = format!(
+                    "resumed at seq {}: this run continues a session whose record already \
+                     existed. L1 was rebuilt from {} recorded call(s); {} round(s) were already \
+                     spent, so this continuation runs rounds {}..={}. Effects the record has \
+                     recorded as completed are read back from it rather than performed again.",
+                    resumed.at_seq,
+                    resumed.ledger_calls,
+                    spent,
+                    first_round,
+                    self.config.max_rounds,
+                );
+                if !resumed.not_recoverable.is_empty() {
+                    text.push_str(&format!(
+                        " Not recoverable from this record: {}.",
+                        resumed.not_recoverable.join("; ")
+                    ));
+                }
+                self.journal
+                    .append(self.config.id.clone(), EventBody::Note { text })
+                    .await?;
+            }
+        }
 
-        for round in 1..=self.config.max_rounds {
+        for round in first_round..=self.config.max_rounds {
+            // The round boundary, as a typed event: "how many rounds has this
+            // session spent" is what a continuation reads to know what is left
+            // of the session's budget, and a fact a decision acts on is recorded
+            // as a value rather than as prose about one.
+            self.journal
+                .append(
+                    self.config.id.clone(),
+                    EventBody::RoundStarted {
+                        round,
+                        ceiling: self.config.max_rounds,
+                    },
+                )
+                .await?;
             self.timeline.enter(self.config.id.clone());
 
             // ---- render, fresh. This is the whole point: the view is built from
@@ -508,6 +968,32 @@ impl DecisionLayer {
                 // spends without moving.
                 let mut executed = 0u32;
                 for tu in &uses {
+                    // **The call itself, recorded**, before anything is done
+                    // about it. The record's typed events are what a later run
+                    // reads state from — `decide` and `retire` calls are
+                    // replayed into L1 by `Resumed::read`, and the delegation
+                    // count is read back from the `delegate` calls — and a call
+                    // that only ever existed as a `tool_result` in a transcript
+                    // nobody kept is a call no continuation can act on.
+                    //
+                    // `delegate` is recorded below, at dispatch, rather than
+                    // here: a call refused before it ran (the per-round ceiling,
+                    // an unnamed outcome set) executed nothing, and counting it
+                    // would make the record's count of delegations disagree with
+                    // the notes that number them.
+                    if tu.name == crate::spot::SPOT_CHECK || decide::is_decision_tool(&tu.name) {
+                        self.journal
+                            .append(
+                                self.config.id.clone(),
+                                EventBody::ToolCall {
+                                    tool_use_id: tu.id.clone(),
+                                    name: tu.name.clone(),
+                                    input: tu.input.clone(),
+                                },
+                            )
+                            .await?;
+                    }
+
                     // `spot_check`: the one door raw material may come through,
                     // and it is billed to this layer's own context — DESIGN:
                     // *"`spot_check` 的代价记在决策层自己的上下文账上,所以是稀缺动作"*.
@@ -701,6 +1187,20 @@ impl DecisionLayer {
 
                     round_delegations += 1;
                     delegations += 1;
+                    // The call, recorded where it is dispatched rather than where
+                    // it arrives: this one ran. Its record is also what a
+                    // continuation counts its delegations from, and what the
+                    // manifest addresses the work behind.
+                    self.journal
+                        .append(
+                            self.config.id.clone(),
+                            EventBody::ToolCall {
+                                tool_use_id: tu.id.clone(),
+                                name: tu.name.clone(),
+                                input: tu.input.clone(),
+                            },
+                        )
+                        .await?;
 
                     // **The conditions, injected here.** The layer was given them
                     // in L0 this round; the executor is given them because they
@@ -833,10 +1333,12 @@ impl DecisionLayer {
         // number — and this is one of the two ways a long task ends, so the
         // headline metric was missing from exactly the runs it exists to judge.
         //
-        // `stopped_early` is a description rather than a flag because the reason
-        // is what makes the outcome usable, and it mirrors
-        // `DelegateOutcome::stopped_early` so a caller reads both layers the same
-        // way.
+        // `stopped_early` is a value rather than a flag because the reason is
+        // what makes the outcome usable — the session boundary decides a
+        // generation change from it — and it mirrors `DelegateOutcome`'s own
+        // stop so a caller reads both layers the same way. `rounds` is the
+        // round the session ended on, counted across its whole life: a
+        // continuation's rounds pick up where the record left off.
         Ok(DecisionOutcome {
             rounds: self.config.max_rounds,
             delegations,
@@ -845,11 +1347,9 @@ impl DecisionLayer {
             composition: contexts.last().copied().unwrap_or_default(),
             contexts,
             ledger: self.ledger.clone(),
-            stopped_early: Some(format!(
-                "the round ceiling of {} was reached: the layer stopped moving, it did \
-                 not stop working",
-                self.config.max_rounds
-            )),
+            stopped_early: Some(StoppedEarly::RoundCeiling {
+                ceiling: self.config.max_rounds,
+            }),
             outcomes: all_outcomes,
         })
     }
@@ -1471,5 +1971,242 @@ mod landing_distribution_tests {
             "an unasked delegation must not be counted as landing anywhere — \
              `we did not ask` is not a slot"
         );
+    }
+}
+
+/// **The record, read back as a continuation.**
+///
+/// `Resumed::read` is the whole of "what does it take to continue a session",
+/// and these tests are what makes its answers falsifiable: which facts it
+/// rebuilds, and — the half that matters more — which it declares it cannot.
+#[cfg(test)]
+mod resume_tests {
+    use super::*;
+    use crate::render::Rejected;
+
+    /// A scratch directory this test owns, with the record reopened from it.
+    async fn record(name: &str) -> (PathBuf, Arc<Journal>) {
+        let dir = std::env::temp_dir().join(format!("yu-core-resume-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let journal = Arc::new(
+            Journal::open(&dir, SessionId::new(name))
+                .await
+                .expect("opening the record"),
+        );
+        (dir, journal)
+    }
+
+    /// The seed event, written the way the layer writes it.
+    async fn seed(journal: &Journal, seed: &SessionSeed, agent: AgentId) {
+        let blob = journal
+            .blobs()
+            .put_str(&serde_json::to_string(seed).expect("encoding the seed"))
+            .expect("storing the seed");
+        journal
+            .append(agent, EventBody::SessionSeeded { blob })
+            .await
+            .expect("recording the seed");
+    }
+
+    /// **Every fact a continuation needs, from one record.**
+    ///
+    /// The seeded half (L0 and the state a handover gave the session) and the
+    /// recorded half (what the session itself did) meet here: the ledger read
+    /// back is the seed with the session's calls replayed on top, and the
+    /// counters say how far the session got. Reverse any of the four reads —
+    /// skip the seed, skip the replay, restart the rounds, restart the
+    /// derivations — and the assertion it serves fails.
+    #[tokio::test]
+    async fn a_continuation_is_rebuilt_from_the_seed_and_the_calls_the_record_holds() {
+        let (dir, journal) = record("rebuild").await;
+        let layer = AgentId::decision();
+
+        let mut charter =
+            Charter::from_the_humans_own_words("deliver the parser", 1_700_000_000_000, "cli");
+        charter.constraints = vec!["never touch the release branch".to_owned()];
+        let mut seeded_ledger = Ledger::default();
+        seeded_ledger.rejected.push(Rejected {
+            what: "carry the state in a summary".to_owned(),
+            why: "a summary of state is a lie".to_owned(),
+        });
+        seed(
+            &journal,
+            &SessionSeed {
+                charter: charter.clone(),
+                ledger: seeded_ledger.clone(),
+                tool_surface: vec!["exec".to_owned(), "read_file".to_owned()],
+                outcome_sets: vec!["delivery".to_owned()],
+            },
+            layer.clone(),
+        )
+        .await;
+
+        for body in [
+            EventBody::SessionStarted {
+                charter: charter.intent().to_owned(),
+                model: "m".to_owned(),
+                quirks: "q".to_owned(),
+            },
+            EventBody::RoundStarted {
+                round: 1,
+                ceiling: 4,
+            },
+            EventBody::RoundStarted {
+                round: 2,
+                ceiling: 4,
+            },
+            EventBody::Delegated {
+                child: AgentId::new("executor#1"),
+                depth: 1,
+                task: "read the parser".to_owned(),
+            },
+            EventBody::Delegated {
+                child: AgentId::new("executor#2"),
+                depth: 1,
+                task: "read the parser again".to_owned(),
+            },
+            EventBody::ToolCall {
+                tool_use_id: "call-d1".to_owned(),
+                name: crate::delegate::DELEGATE.to_owned(),
+                input: serde_json::json!({"task": "read the parser"}),
+            },
+            EventBody::ToolCall {
+                tool_use_id: "call-x1".to_owned(),
+                name: crate::decide::DECIDE.to_owned(),
+                input: serde_json::json!({
+                    "what": "keep L1 complete",
+                    "why": "state is summarised only by lying",
+                    "verdict": "accepted",
+                }),
+            },
+            EventBody::ToolCall {
+                tool_use_id: "call-x2".to_owned(),
+                name: crate::decide::RETIRE.to_owned(),
+                input: serde_json::json!({"item": "keep L1 complete", "reason": "merged"}),
+            },
+        ] {
+            journal.append(layer.clone(), body).await.expect("appending");
+        }
+        // An executor's own events are in the same record and must not be read
+        // as the layer's state.
+        journal
+            .append(
+                AgentId::new("executor#1"),
+                EventBody::ToolCall {
+                    tool_use_id: "call-w1".to_owned(),
+                    name: "write_file".to_owned(),
+                    input: serde_json::json!({"path": "x", "content": "y"}),
+                },
+            )
+            .await
+            .expect("appending");
+
+        let resumed = Resumed::read(&journal, &layer).await.expect("reading the record");
+
+        // L0, from the seed — not rebuilt from the intent alone, which would
+        // have lost the constraint.
+        assert_eq!(resumed.charter, charter, "L0 has to come back whole");
+        assert_eq!(
+            resumed.tool_surface,
+            Some(vec!["exec".to_owned(), "read_file".to_owned()])
+        );
+        assert_eq!(resumed.outcome_sets, Some(vec!["delivery".to_owned()]));
+
+        // L1: the seeded rejection is still there, and the session's own calls
+        // are on top of it — a decision recorded, then retired by a later call.
+        assert!(
+            resumed
+                .ledger
+                .rejected
+                .iter()
+                .any(|rejected| rejected.what == "carry the state in a summary"),
+            "the state a handover seeded must survive the replay: {:#?}",
+            resumed.ledger
+        );
+        assert!(resumed.ledger.decisions.is_empty(), "the decision was retired by the last call");
+        assert_eq!(resumed.ledger.retired.len(), 1);
+        assert_eq!(resumed.ledger_calls, 2, "both calls were replayed");
+
+        // The counters, so the continuation numbers its work after the work that
+        // already happened rather than on top of it.
+        assert_eq!(resumed.rounds_spent, Some(2));
+        assert_eq!(resumed.ceiling, Some(4));
+        assert_eq!(resumed.delegations, 1);
+        assert_eq!(resumed.derived, 2);
+        assert_eq!(resumed.forked_from, None);
+        assert!(
+            resumed.not_recoverable.is_empty(),
+            "a record that holds its seed and its calls leaves nothing to declare: {:#?}",
+            resumed.not_recoverable
+        );
+        // The prior delegation is addressed rather than loaded.
+        assert_eq!(resumed.carried.len(), 1, "{:#?}", resumed.carried);
+        assert_eq!(resumed.carried[0].address, "journal:seq=6");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The honest half.**
+    ///
+    /// A record written before the session recorded the state it started from —
+    /// and before round markers existed — cannot supply L0 beyond the intent,
+    /// the ledger it started from, or how many rounds were spent. Each of those
+    /// is *named*, with the consequence spelled out, rather than defaulted: a
+    /// continuation that believed it was round 1 of a session that is really
+    /// round 4 would spend the budget twice, and nothing in the run would say so.
+    #[tokio::test]
+    async fn a_record_that_cannot_supply_a_fact_says_so_instead_of_inventing_it() {
+        let (dir, journal) = record("honest").await;
+        let layer = AgentId::decision();
+        for body in [
+            EventBody::SessionStarted {
+                charter: "deliver the parser".to_owned(),
+                model: "m".to_owned(),
+                quirks: "q".to_owned(),
+            },
+            // The pre-structural spelling of a ledger write.
+            EventBody::Note {
+                text: "decide — decided: `keep the probe` — because it answered".to_owned(),
+            },
+            EventBody::Note {
+                text: "delegation 1: 1 agent(s), 1 step(s) each, 500 bytes returned".to_owned(),
+            },
+        ] {
+            journal.append(layer.clone(), body).await.expect("appending");
+        }
+
+        let resumed = Resumed::read(&journal, &layer).await.expect("reading the record");
+
+        // The intent survives; nothing else about L0 does.
+        assert_eq!(resumed.charter.intent(), "deliver the parser");
+        assert!(resumed.charter.constraints.is_empty());
+        assert!(
+            resumed.tool_surface.is_none(),
+            "the tool surface is only recoverable from a seed"
+        );
+        assert!(resumed.ledger_calls == 0, "there is no call to replay");
+        assert!(resumed.ledger.decisions.is_empty());
+        assert_eq!(
+            resumed.rounds_spent, None,
+            "no marker means the count is unknown, not one"
+        );
+
+        let said = resumed.not_recoverable.join("\n");
+        for needle in ["constraints", "round marker", "prose"] {
+            assert!(
+                said.contains(needle),
+                "`{needle}` has to be named as not restored: {said}"
+            );
+        }
+        // And the prose write is not decoded into state, but it is not dropped
+        // either: it is addressed for the manifest.
+        let addressed = resumed
+            .carried
+            .iter()
+            .find(|entry| entry.what.contains("prose"))
+            .unwrap_or_else(|| panic!("the prose ledger write is not addressed: {:#?}", resumed.carried));
+        assert_eq!(addressed.address, "journal:seq=1");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
