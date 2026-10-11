@@ -87,11 +87,54 @@ pub struct Charter {
 }
 
 impl Charter {
+    /// A charter that *is* the human's own sentence — the shape `yu decide` gets.
+    ///
+    /// A constructor rather than a struct literal at the call site, because the
+    /// mistake it prevents is invisible in the output: writing the same sentence
+    /// into both `text` and `human_words` renders L0 with the intent under two
+    /// headings, which costs the scarcest context in the system twice on every
+    /// single round and inflates the metric's denominator while doing it.
+    pub fn from_the_humans_own_words(
+        text: impl Into<String>,
+        at_ms: i64,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            // Deliberately left empty. The utterance below is the same sentence,
+            // and L0 renders it under its own heading; filling both would be
+            // saying it twice.
+            text: String::new(),
+            human_words: vec![HumanUtterance {
+                at_ms,
+                text: text.into(),
+                source: source.into(),
+            }],
+            ..Self::default()
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.text.is_empty()
             && self.constraints.is_empty()
             && self.acceptance.is_empty()
             && self.human_words.is_empty()
+    }
+
+    /// The intent as one string, for records that have room for one.
+    ///
+    /// The brief wins when there is one; otherwise the human's first utterance
+    /// stands in, because for a charter that arrived as a single sentence that
+    /// utterance *is* the charter. Recording `text` alone would write an empty
+    /// charter into L2 — losing, in the record that exists to be complete, the
+    /// one thing DESIGN says must survive verbatim.
+    pub fn intent(&self) -> &str {
+        if !self.text.is_empty() {
+            return &self.text;
+        }
+        self.human_words
+            .first()
+            .map(|u| u.text.as_str())
+            .unwrap_or("")
     }
 }
 
@@ -359,8 +402,15 @@ pub struct View {
     pub tools: Vec<ToolDefinition>,
     pub messages: Vec<Message>,
     pub not_loaded: NotLoaded,
-    /// DESIGN's acceptance metric, computed at render time so it is always
-    /// available rather than reconstructed afterwards.
+    /// What *this view* is made of, computed as it is rendered.
+    ///
+    /// It is not DESIGN's acceptance metric and must not be reported as one. The
+    /// criterion is about a layer's context over a run, and a view is one part of
+    /// one request's context — the conversation that answers it does not exist
+    /// yet. What it is good for is the thing it can actually see: whether this
+    /// render put raw material into the prefix, which is a real failure and one
+    /// this number will now show, because the evidence section is charged as raw
+    /// and this round's report is charged as a reduction.
     pub composition: ContextComposition,
     /// SHA-256 over the whole rendered prefix and messages.
     ///
@@ -397,6 +447,16 @@ impl View {
             hasher.update([0]);
         }
         hex::encode(hasher.finalize())
+    }
+
+    /// Raw material as a fraction of this view.
+    ///
+    /// A rendered view should score zero here: everything in it was either
+    /// written by the harness or reduced before it arrived, and the one thing
+    /// that can push it above zero is an evidence block — a tool's output carried
+    /// into the decision layer's prefix verbatim.
+    pub fn raw_material_ratio(&self) -> Option<f64> {
+        self.composition.raw_material_ratio()
     }
 
     pub fn tool_machinery_ratio(&self) -> Option<f64> {
@@ -443,22 +503,26 @@ pub fn tool_definition_chars(tools: &[ToolDefinition]) -> u64 {
 
 /// Accumulates what a context is actually made of, as it is built.
 ///
-/// DESIGN's acceptance criterion names two numbers: the tool-machinery ratio in
+/// DESIGN's acceptance criterion names two numbers: the raw-material ratio in
 /// the **decision** layer's context and in the **executor's**. Both are measured
 /// with this, deliberately. Two implementations would drift, and the drift would
 /// be invisible — each number would look plausible on its own, and the comparison
 /// the whole design rests on would be between two different quantities.
 ///
-/// The earlier version of this measurement lived in `render`, hardcoded
-/// `tool_call_chars` to zero and took `tool_result_chars` from the manifest's own
-/// prose. Applied to a decision-layer view — which by construction holds no tool
-/// output — it could only ever report approximately zero. A metric that cannot
-/// fail detects nothing, which is why the ratio is now computed where the
-/// conversation actually exists.
+/// **Classification is stated by the caller, never inferred.** Whether a piece of
+/// tool output is raw material or a reduction is not a property of its shape —
+/// both arrive as `tool_result` blocks — it is a fact about the path the bytes
+/// travelled, and only the code that built the context knows it. So the methods
+/// name the provenance, and the default is the unflattering one: `add_message`
+/// charges tool results as raw material, and a caller that reduced them has to
+/// say so by calling `add_reduced_message`. A metric whose default flatters the
+/// design is a metric that cannot fail, which is the defect this whole exercise
+/// exists to remove.
 #[derive(Debug, Default, Clone)]
 pub struct CompositionMeter {
+    raw_material_chars: u64,
+    reduced_result_chars: u64,
     tool_call_chars: u64,
-    tool_result_chars: u64,
     tool_definition_chars: u64,
     total_chars: u64,
 }
@@ -479,7 +543,24 @@ impl CompositionMeter {
         self.total_chars += blocks.iter().map(|b| b.text.len() as u64).sum::<u64>();
     }
 
+    /// Charge a message. Any tool results it carries count as **raw material**,
+    /// which is what a tool result is until something reduces it.
     pub fn add_message(&mut self, message: &Message) {
+        self.add_message_as(message, /* reduced = */ false);
+    }
+
+    /// Charge a message whose tool results were reduced before they arrived.
+    ///
+    /// The decision layer's `delegate` returns are this: `DelegateOutcome::render`
+    /// truncates to a budget and gives an address for the rest. Counting those as
+    /// raw material is precisely the mistake this metric exists to stop making —
+    /// under it, "this layer holds one report" and "this layer holds fifty
+    /// thousand lines of grep" produce the same number.
+    pub fn add_reduced_message(&mut self, message: &Message) {
+        self.add_message_as(message, /* reduced = */ true);
+    }
+
+    fn add_message_as(&mut self, message: &Message, reduced: bool) {
         for block in message.blocks() {
             let chars = match &block {
                 ContentBlock::Text(t) => t.text.len() as u64,
@@ -501,17 +582,56 @@ impl CompositionMeter {
             };
             match &block {
                 ContentBlock::ToolUse(_) => self.tool_call_chars += chars,
-                ContentBlock::ToolResult(_) => self.tool_result_chars += chars,
+                ContentBlock::ToolResult(_) if reduced => self.reduced_result_chars += chars,
+                ContentBlock::ToolResult(_) => self.raw_material_chars += chars,
                 _ => {}
             }
             self.total_chars += chars;
         }
     }
 
+    /// Charge material that arrived as it came off a tool.
+    ///
+    /// For text the context assembled itself around a tool's output — an
+    /// evidence block and its heading — where there is no `Message` to hand.
+    pub fn add_raw_material(&mut self, chars: u64) {
+        self.raw_material_chars += chars;
+        self.total_chars += chars;
+    }
+
+    /// Charge material a reduction produced before it arrived.
+    pub fn add_reduced_material(&mut self, chars: u64) {
+        self.reduced_result_chars += chars;
+        self.total_chars += chars;
+    }
+
+    /// Charge context that is neither raw material nor a reduction: intent,
+    /// state, derived counts, addresses.
+    ///
+    /// Counted, rather than left out, because leaving it out shrinks the
+    /// denominator and inflates every ratio computed against it.
+    pub fn add_context(&mut self, chars: u64) {
+        self.total_chars += chars;
+    }
+
+    /// Charge a context measured elsewhere, exactly as it was measured there.
+    ///
+    /// Taken from the recorded composition rather than recomputed: two
+    /// computations of the same quantity drift, and the drift is invisible
+    /// because each result looks plausible on its own.
+    pub fn add_composition(&mut self, other: &ContextComposition) {
+        self.raw_material_chars += other.raw_material_chars;
+        self.reduced_result_chars += other.reduced_result_chars;
+        self.tool_call_chars += other.tool_call_chars;
+        self.tool_definition_chars += other.tool_definition_chars;
+        self.total_chars += other.total_chars;
+    }
+
     pub fn snapshot(&self) -> ContextComposition {
         ContextComposition {
+            raw_material_chars: self.raw_material_chars,
+            reduced_result_chars: self.reduced_result_chars,
             tool_call_chars: self.tool_call_chars,
-            tool_result_chars: self.tool_result_chars,
             tool_definition_chars: self.tool_definition_chars,
             total_chars: self.total_chars,
         }
@@ -554,38 +674,52 @@ pub fn render(input: RenderInput<'_>) -> View {
     // 2. More importantly, a layer handed a view with no report has to be told
     //    *that* — "nothing has been done yet" is information, and its absence
     //    reads as "there is nothing to respond to".
-    let mut volatile = String::from("## This round\n");
+    //
+    // It is built in sections rather than as one string because the sections are
+    // not the same kind of thing, and the composition measurement has to be able
+    // to say so: this round's report is a reduction, the evidence beneath it is
+    // what the tool actually printed, and the shape counts and the manifest are
+    // derived numbers and addresses. Measuring them as one lump is how "this
+    // layer holds a report" and "this layer holds the whole log" became the same
+    // number.
+    let mut this_round = String::from("## This round\n");
+    let mut report_chars = 0u64;
     match input.report {
         Some(report) => {
-            volatile.push_str(report);
-            volatile.push('\n');
+            this_round.push_str(report);
+            this_round.push('\n');
+            report_chars = report.len() as u64;
         }
-        None => volatile.push_str(
+        None => this_round.push_str(
             "Nothing has been delegated or reported yet. Decide what to do, or \
              delegate the work.\n",
         ),
     }
+
+    let mut evidence = String::new();
     if !input.evidence.is_empty() {
-        volatile.push_str("\n## Evidence\n");
+        evidence.push_str("\n## Evidence\n");
         for e in input.evidence {
             match e.exit_code {
-                Some(code) => volatile.push_str(&format!(
+                Some(code) => evidence.push_str(&format!(
                     "- [{}] exit {}\n{}\n",
                     e.label, code, e.content
                 )),
                 // DESIGN: an assertion with no runnable evidence is unverified.
                 // Saying so in the view is cheaper than hoping the reader notices.
-                None => volatile.push_str(&format!(
+                None => evidence.push_str(&format!(
                     "- [{}] UNVERIFIED — no command was run\n{}\n",
                     e.label, e.content
                 )),
             }
         }
     }
+
+    let mut shape = String::new();
     if !input.shape.is_empty() {
-        volatile.push_str("\n## Shape\n");
+        shape.push_str("\n## Shape\n");
         for s in input.shape {
-            volatile.push_str(&format!("- {}\n", describe_signal(s)));
+            shape.push_str(&format!("- {}\n", describe_signal(s)));
         }
     }
 
@@ -593,18 +727,38 @@ pub fn render(input: RenderInput<'_>) -> View {
         entries: input.omitted.to_vec(),
     };
     let manifest = not_loaded.render();
-    if !manifest.is_empty() {
-        volatile.push('\n');
-        volatile.push_str(&manifest);
-    }
+    let manifest_section = if manifest.is_empty() {
+        String::new()
+    } else {
+        format!("\n{manifest}")
+    };
 
+    let text = format!("{this_round}{evidence}{shape}{manifest_section}")
+        .trim()
+        .to_owned();
     let messages = vec![Message::user(vec![TextBlock {
-        text: volatile.trim().to_owned(),
+        text: text.clone(),
         citations: None,
     }
     .into()])];
 
-    let composition = measure_composition(&tools, &system, &messages, &input);
+    let mut meter = CompositionMeter::new();
+    meter.add_tools(&tools);
+    meter.add_system(&system);
+    // The evidence section is charged whole: it exists only to carry what a tool
+    // printed, and it is the one place raw material can still reach this layer.
+    let evidence_chars = evidence.len() as u64;
+    debug_assert!(
+        report_chars + evidence_chars <= text.len() as u64,
+        "the classified sections are interior, so trimming the ends cannot have removed them"
+    );
+    meter.add_raw_material(evidence_chars);
+    meter.add_reduced_material(report_chars);
+    // Whatever is left — the headings, the shape counts, the manifest's
+    // addresses — is neither raw nor a reduction, and is counted all the same so
+    // the denominator is the context's real size.
+    meter.add_context((text.len() as u64).saturating_sub(report_chars + evidence_chars));
+    let composition = meter.snapshot();
 
     let mut view = View {
         system,
@@ -713,53 +867,6 @@ fn describe_signal(s: &ShapeSignal) -> String {
         ShapeSignal::NoArtifactFor { ms } => {
             format!("no verifiable artifact for {}s", ms / 1000)
         }
-    }
-}
-
-/// What this *rendered prefix* is made of.
-///
-/// Scope matters here, and an earlier version got it wrong in a way worth
-/// recording. It hardcoded `tool_call_chars: 0` and took `tool_result_chars`
-/// from the manifest's own prose, then reported a ratio. For a decision-layer
-/// view — which by construction contains no tool output — that could only ever
-/// produce a number near zero, so the metric could not fail, and a metric that
-/// cannot fail detects nothing.
-///
-/// The rendered prefix genuinely has no tool calls or results: those arrive in
-/// the *conversation* afterwards. So this reports what the prefix does contain —
-/// the tool definitions, and the manifest, which is the one place tool output is
-/// even referred to. The ratio over a whole conversation, which is the number
-/// DESIGN's acceptance criterion actually names, is measured where the
-/// conversation exists: `crate::decision` for the decision layer and
-/// `crate::agent` for the executor.
-fn measure_composition(
-    tools: &[ToolDefinition],
-    system: &[SystemBlock],
-    messages: &[Message],
-    input: &RenderInput<'_>,
-) -> ContextComposition {
-    let definition_chars = tool_definition_chars(tools);
-
-    // Addresses, not payloads: the manifest says what exists and how to reach
-    // it, and the payload stays where it is.
-    let manifest_chars: u64 = input
-        .omitted
-        .iter()
-        .map(|e| (e.what.len() + e.address.len() + e.why.len() + e.how_to_load.len()) as u64)
-        .sum();
-
-    let total: u64 = definition_chars
-        + system.iter().map(|b| b.text.len() as u64).sum::<u64>()
-        + messages
-            .iter()
-            .map(|m| m.content.concat_text().len() as u64)
-            .sum::<u64>();
-
-    ContextComposition {
-        tool_call_chars: 0,
-        tool_result_chars: manifest_chars,
-        tool_definition_chars: definition_chars,
-        total_chars: total,
     }
 }
 
@@ -916,6 +1023,47 @@ mod tests {
         );
     }
 
+    /// A charter that arrived as one sentence pays for it once.
+    ///
+    /// `yu decide "…"` has exactly one piece of intent: the sentence the human
+    /// typed. Writing it into both `text` and `human_words` — which the call site
+    /// used to do — rendered L0 with that sentence under two headings, on every
+    /// round, in the layer the whole design exists to keep small. The
+    /// constructor is the fix; this is the guard on it, and it fails the moment
+    /// the constructor starts filling both fields again.
+    #[test]
+    fn a_charter_that_is_the_humans_own_sentence_renders_it_once() {
+        let sentence = "check.py fails; explain why, and change nothing";
+        let c = Charter::from_the_humans_own_words(sentence, 1_726_000_000_000, "cli");
+        let l0 = render_l0(&c);
+        assert_eq!(
+            l0.matches(sentence).count(),
+            1,
+            "the intent is rendered twice:\n{l0}"
+        );
+        // And it is still there — a deduplication that dropped it would pass the
+        // count above for the wrong reason.
+        assert!(l0.contains(sentence));
+        assert!(l0.contains("cli"), "provenance must survive: {l0}");
+    }
+
+    #[test]
+    fn the_recorded_intent_is_never_empty_for_a_charter_that_has_one() {
+        // L2 is the record that exists to be complete. Journaling `text` alone
+        // wrote an empty charter for every CLI invocation.
+        let c = Charter::from_the_humans_own_words("ship it", 1, "cli");
+        assert_eq!(c.intent(), "ship it");
+        assert!(c.text.is_empty(), "the constructor must not fill both fields");
+        assert!(!c.is_empty());
+        // When a brief was written as well, the brief is the charter.
+        let with_brief = Charter {
+            text: "the brief".into(),
+            ..Charter::from_the_humans_own_words("the utterance", 1, "cli")
+        };
+        assert_eq!(with_brief.intent(), "the brief");
+        assert_eq!(Charter::default().intent(), "");
+    }
+
     #[test]
     fn retiring_records_the_reason() {
         let mut l = Ledger::default();
@@ -1051,14 +1199,73 @@ mod tests {
     }
 
     #[test]
-    fn composition_counts_only_the_manifest_as_tool_machinery() {
+    fn a_view_with_no_evidence_carries_no_raw_material() {
         let c = charter();
         let l = empty_ledger();
         let view = render_with(&c, &l, &[], &[]);
-        // A decision-layer view with no omissions has zero tool machinery.
+        // Everything in a view is either written by the harness or was reduced
+        // before it arrived. The manifest's addresses are neither raw nor judged,
+        // and they are counted anyway so the denominator is the real size.
+        assert_eq!(view.composition.raw_material_chars, 0);
         assert_eq!(view.composition.tool_call_chars, 0);
-        assert_eq!(view.composition.tool_result_chars, 0);
-        assert_eq!(view.tool_machinery_ratio(), Some(0.0));
+        assert_eq!(view.raw_material_ratio(), Some(0.0));
+        assert!(view.composition.total_chars > 0);
+    }
+
+    /// The evidence section is charged as raw material, and the report is not.
+    ///
+    /// This is the difference the metric was changed to be able to see. Both
+    /// sections land in the same text block, so a metric that read the rendered
+    /// text — or classified by block type — would have to give them the same
+    /// answer. `render` charges them as what they are because it is the code that
+    /// wrote them.
+    #[test]
+    fn a_view_charges_evidence_as_raw_material_and_its_report_as_a_reduction() {
+        let c = charter();
+        let l = empty_ledger();
+        let report = "r".repeat(2000);
+        let evidence = Evidence::command("cargo test", "t".repeat(2000), 1);
+
+        let with_both = render(RenderInput {
+            prompt: TEST_PROMPT,
+            tools: &[delegate_tool()],
+            charter: &c,
+            ledger: &l,
+            report: Some(&report),
+            evidence: &[evidence],
+            shape: &[],
+            omitted: &[],
+        });
+        assert_eq!(
+            with_both.composition.reduced_result_chars,
+            report.len() as u64,
+            "this round's report is a reduction and must be charged as one"
+        );
+        assert!(
+            with_both.composition.raw_material_chars >= 2000,
+            "the evidence block is a tool's output carried verbatim: {}",
+            with_both.composition.raw_material_chars
+        );
+
+        // And the number moves when the evidence does — a metric that could not
+        // tell a clean view from one carrying a tool's whole output would be the
+        // vacuous metric this replaced.
+        let without = render(RenderInput {
+            prompt: TEST_PROMPT,
+            tools: &[delegate_tool()],
+            charter: &c,
+            ledger: &l,
+            report: Some(&report),
+            evidence: &[],
+            shape: &[],
+            omitted: &[],
+        });
+        assert_eq!(without.composition.raw_material_chars, 0);
+        assert!(
+            with_both.raw_material_ratio().unwrap()
+                > without.raw_material_ratio().unwrap() + 0.2,
+            "carrying raw evidence has to show up in the ratio"
+        );
     }
 
     #[test]
@@ -1066,6 +1273,7 @@ mod tests {
         // Zero and "undefined" are different claims; conflating them would let a
         // broken renderer look like a perfect one.
         let composition = ContextComposition::default();
+        assert_eq!(composition.raw_material_ratio(), None);
         assert_eq!(composition.tool_machinery_ratio(), None);
     }
 

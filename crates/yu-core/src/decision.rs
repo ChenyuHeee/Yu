@@ -88,15 +88,52 @@ pub struct DecisionOutcome {
     pub delegations: u32,
     pub final_text: String,
     pub usage: TokenUsage,
-    /// **The falsifiable number.** Measured over this layer's real context.
+    /// **The falsifiable number**: the context the run *ended* on.
     pub composition: ContextComposition,
+    /// Every request's context, in the order they were sent.
+    ///
+    /// A series rather than one number, because the criterion names *a context*
+    /// and a run has many. The earlier version summed them into one meter, which
+    /// measured their union — not a context — and charged the system prompt and
+    /// the tool definitions to the denominator once per round. That inflation
+    /// moved the ratio in the direction that flattered the design, which is the
+    /// one direction a measurement here is not allowed to be wrong in.
+    ///
+    /// The series is also what makes growth visible: DESIGN says the view is
+    /// bounded, and a claim of boundedness is only checkable against the shape
+    /// of this curve rather than against its last point.
+    pub contexts: Vec<ContextComposition>,
     /// Every delegation's reduced outcome, for the caller's own audit.
     pub outcomes: Vec<DelegateOutcome>,
 }
 
 impl DecisionOutcome {
+    pub fn raw_material_ratio(&self) -> Option<f64> {
+        self.composition.raw_material_ratio()
+    }
+
     pub fn tool_machinery_ratio(&self) -> Option<f64> {
         self.composition.tool_machinery_ratio()
+    }
+
+    /// The largest context of the run, by total size.
+    ///
+    /// The worst point rather than the last one, because a run that peaked at
+    /// 40 000 characters and ended at 4 000 did not stay small — and "跑完一个
+    /// 真实任务后" is a question about the run, not about its final frame.
+    pub fn peak(&self) -> Option<&ContextComposition> {
+        self.contexts.iter().max_by_key(|c| c.total_chars)
+    }
+
+    /// The highest raw-material ratio any single request reached.
+    ///
+    /// `None` when nothing was measured, which is reported as such rather than
+    /// as zero.
+    pub fn peak_raw_material_ratio(&self) -> Option<f64> {
+        self.contexts
+            .iter()
+            .filter_map(|c| c.raw_material_ratio())
+            .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
     }
 }
 
@@ -154,16 +191,25 @@ impl DecisionLayer {
 
     /// Run the layer to a decision.
     pub async fn run(&mut self) -> Result<DecisionOutcome, LoopError> {
-        let mut meter = CompositionMeter::new();
         let mut usage = TokenUsage::default();
+        let mut contexts: Vec<ContextComposition> = Vec::new();
         let mut all_outcomes: Vec<DelegateOutcome> = Vec::new();
         let mut delegations = 0u32;
+        // Taken from the tool the view actually advertises rather than written
+        // out again here: a copy of the name is a second source of truth, and
+        // the failure it produces — advertising one tool and accepting another —
+        // is silent.
+        let only_tool = delegate::delegate_tool().name().to_owned();
 
         self.journal
             .append(
                 self.config.id.clone(),
                 EventBody::SessionStarted {
-                    charter: self.charter.text.clone(),
+                    // The intent, not the `text` field: a charter that arrived
+                    // as the human's own sentence has an empty `text`, and
+                    // recording that verbatim field would write an empty charter
+                    // into L2.
+                    charter: self.charter.intent().to_owned(),
                     model: self.config.model.clone(),
                     quirks: self.client.quirks().name.clone(),
                 },
@@ -182,11 +228,16 @@ impl DecisionLayer {
                 (view.system.clone(), view.tools.clone(), view.messages.clone());
             assemble.finish();
 
-            meter.add_system(&system);
-            meter.add_tools(&tools);
-            for m in &messages {
-                meter.add_message(m);
-            }
+            // Measured once per *request*, and this meter is rebuilt for each
+            // round rather than carried across them. A run has many contexts;
+            // summing them measures their union, which is not a context and which
+            // charges the system prompt and the tool definitions to the
+            // denominator once per round.
+            let mut meter = CompositionMeter::new();
+            // The view's own parts arrive already classified: `render` knew which
+            // section was a reduction and which was a tool's output, and
+            // recomputing that here would be a second answer to the same question.
+            meter.add_composition(&view.composition);
 
             if let Err(problem) = self.client.quirks().check_history(&messages) {
                 return Err(LoopError::History(problem));
@@ -195,6 +246,10 @@ impl DecisionLayer {
             // ---- one round: delegate until the layer stops asking
             let mut round_delegations = 0u32;
             loop {
+                // The context this request will actually carry. Recorded before
+                // it is sent, because this is the thing the criterion asks about.
+                contexts.push(meter.snapshot());
+
                 let mut req = MessagesRequest::new(
                     self.config.model.clone(),
                     self.config.max_tokens,
@@ -236,8 +291,6 @@ impl DecisionLayer {
                 match stop.disposition() {
                     StopDisposition::RunTools => {}
                     StopDisposition::Complete => {
-                        let msg = Message::assistant(assistant);
-                        meter.add_message(&msg);
                         let final_text = sink.text.clone();
                         self.journal
                             .append(
@@ -247,12 +300,18 @@ impl DecisionLayer {
                                 },
                             )
                             .await?;
+                        // The context the run ended on is the last one it *sent*.
+                        // The assistant turn that just arrived is the answer, not
+                        // part of any context this layer carried, so charging it
+                        // would be charging the layer for its own output.
+                        let composition = contexts.last().copied().unwrap_or_default();
                         return Ok(DecisionOutcome {
                             rounds: round,
                             delegations,
                             final_text,
                             usage,
-                            composition: meter.snapshot(),
+                            composition,
+                            contexts,
                             outcomes: all_outcomes,
                         });
                     }
@@ -285,6 +344,24 @@ impl DecisionLayer {
 
                 let mut result_blocks = Vec::new();
                 for tu in &uses {
+                    // Check the name before the arguments. Every `tool_use` used
+                    // to be deserialised straight into `DelegateArgs`, so a call
+                    // to any other tool whose JSON happened to carry a `task`
+                    // field was executed as a delegation — and the prompt names
+                    // the tools this layer is meant to grow (`decide`, `retire`),
+                    // which makes "the model called one of them" a state the
+                    // harness has to answer rather than one it can assume away.
+                    if tu.name != only_tool {
+                        result_blocks.push(ContentBlock::ToolResult(ToolResultBlock::error(
+                            &tu.id,
+                            format!(
+                                "there is no tool named `{}` in this layer; the only tool \
+                                 available is `{}`",
+                                tu.name, only_tool
+                            ),
+                        )));
+                        continue;
+                    }
                     if round_delegations >= self.config.max_delegations_per_round {
                         result_blocks.push(ContentBlock::ToolResult(ToolResultBlock::error(
                             &tu.id,
@@ -343,7 +420,13 @@ impl DecisionLayer {
                 }
 
                 let results = Message::user(result_blocks);
-                meter.add_message(&results);
+                // A delegation's return is a **reduction**, not raw material: it
+                // is `DelegateOutcome::render`, truncated to a budget with an
+                // address for the rest. Counting it as raw material is exactly
+                // the confusion the metric was changed to end — it made "this
+                // layer holds one report" indistinguishable from "this layer
+                // holds fifty thousand lines of grep".
+                meter.add_reduced_message(&results);
                 messages.push(results);
 
                 if let Err(problem) = self.client.quirks().check_history(&messages) {
@@ -523,9 +606,12 @@ mod tests {
     }
 
     #[test]
-    fn composition_counts_delegate_returns_as_tool_machinery() {
-        // The metric has to see the delegate round trip, or it would report a
-        // perfect zero for a layer that does nothing but delegate.
+    fn a_delegate_return_is_a_reduction_rather_than_raw_material() {
+        // The metric has to see the delegate round trip — a layer that does
+        // nothing but delegate would otherwise report a perfect zero — and it
+        // has to see it as what it is. `DelegateOutcome::render` truncated the
+        // report to a budget and gave an address for the rest, so nothing here
+        // came straight off a tool.
         let mut meter = CompositionMeter::new();
         meter.add_system(&[SystemBlock::text("system prompt")]);
         meter.add_message(&Message::user("the rendered view"));
@@ -536,32 +622,89 @@ mod tests {
                 input: json!({"task": "go and read the whole repository"}),
             },
         )]));
-        meter.add_message(&Message::user(vec![ContentBlock::ToolResult(
-            ToolResultBlock::text("call_00_x", "a report of some length"),
+        meter.add_reduced_message(&Message::user(vec![ContentBlock::ToolResult(
+            ToolResultBlock::text("call_00_x", &"a report of some length".repeat(100)),
         )]));
 
         let composition = meter.snapshot();
         assert!(composition.tool_call_chars > 0, "tool calls must be counted");
         assert!(
-            composition.tool_result_chars > 0,
-            "delegate returns are tool results and must be counted"
+            composition.reduced_result_chars > 1000,
+            "a delegate return is a reduction and must be charged as one"
         );
-        let ratio = composition.tool_machinery_ratio().unwrap();
+        assert_eq!(
+            composition.raw_material_chars, 0,
+            "nothing in this context came straight off a tool"
+        );
+        assert_eq!(composition.raw_material_ratio(), Some(0.0));
+        // Still machinery, though — which is why the two ratios are read
+        // separately rather than one replacing the other.
         assert!(
-            (0.0..1.0).contains(&ratio),
-            "ratio must be a real fraction, got {ratio}"
+            composition.tool_machinery_ratio().unwrap() > 0.5,
+            "the delegate round trip is real machinery in this context"
         );
     }
 
     #[test]
     fn the_ratio_is_undefined_for_an_empty_context_rather_than_zero() {
+        assert_eq!(CompositionMeter::new().snapshot().raw_material_ratio(), None);
         assert_eq!(CompositionMeter::new().snapshot().tool_machinery_ratio(), None);
+    }
+
+    /// **M1's acceptance criterion, as a test.**
+    ///
+    /// One number, and it can tell "this layer holds fifty thousand lines of
+    /// grep" from "this layer holds one report". The two contexts below are
+    /// deliberately the *same size* and carry the *same content block type*, so
+    /// they are indistinguishable to anything that classifies by shape — which is
+    /// what the tool-machinery ratio did, and why it reported the same figure for
+    /// both.
+    #[test]
+    fn the_metric_separates_a_report_from_the_same_volume_of_raw_output() {
+        let volume = 2000usize;
+        let report = {
+            let mut meter = CompositionMeter::new();
+            meter.add_system(&[SystemBlock::text(&"s".repeat(volume))]);
+            meter.add_reduced_message(&Message::user(vec![ContentBlock::ToolResult(
+                ToolResultBlock::text("call_00_x", &"r".repeat(volume)),
+            )]));
+            meter.snapshot()
+        };
+        let grep = {
+            let mut meter = CompositionMeter::new();
+            meter.add_system(&[SystemBlock::text(&"s".repeat(volume))]);
+            // Same shape, same size, and nothing has judged a byte of it.
+            meter.add_message(&Message::user(vec![ContentBlock::ToolResult(
+                ToolResultBlock::text("call_00_x", &"g".repeat(volume)),
+            )]));
+            meter.snapshot()
+        };
+
+        assert_eq!(
+            report.raw_material_ratio(),
+            Some(0.0),
+            "a reduced report is a product of judgment, not poured-in material"
+        );
+        assert!(
+            grep.raw_material_ratio().unwrap() > 0.4,
+            "the same volume of unjudged tool output has to read differently, got {:?}",
+            grep.raw_material_ratio()
+        );
+        // The separation is the whole point, so the old metric's inability to
+        // make it is asserted rather than described — that is what stops it from
+        // being quietly reintroduced as "the same number".
+        assert_eq!(
+            report.tool_machinery_ratio(),
+            grep.tool_machinery_ratio(),
+            "the tool-machinery ratio cannot tell these two contexts apart, which \
+             is precisely why it is not the criterion"
+        );
     }
 
     #[test]
     fn composition_counts_every_message_the_layer_actually_saw() {
-        // A meter that only counted the system prompt would report near-zero
-        // tool machinery for any layer, which is the vacuous-metric failure.
+        // A meter that only counted the system prompt would report near-zero for
+        // any layer, which is the vacuous-metric failure.
         let mut meter = CompositionMeter::new();
         for _ in 0..5 {
             meter.add_message(&Message::user(vec![ContentBlock::ToolResult(
@@ -569,7 +712,9 @@ mod tests {
             )]));
         }
         let c = meter.snapshot();
-        assert!(c.tool_result_chars >= 5000);
+        // Unreduced tool output is raw material by default: the unflattering
+        // reading is the one a caller has to opt out of, not into.
+        assert!(c.raw_material_chars >= 5000);
         assert!(c.total_chars >= 5000);
     }
 

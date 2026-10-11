@@ -37,40 +37,74 @@ impl TokenUsage {
     }
 }
 
-/// DESIGN's acceptance metric: the share of an agent's context occupied by tool
-/// machinery (tool results + tool calls).
+/// DESIGN's acceptance metric: the share of an agent's context that is **raw
+/// material** — bytes poured in as they came off a tool, with neither a human
+/// nor a model having decided what in them mattered.
 ///
-/// Industry shape is that this dominates. The decision layer's target is
-/// "趋近于零". The value of this number is that it makes the claim falsifiable.
+/// DESIGN first stated this as "工具机制" (tool machinery) and that measured the
+/// wrong thing. Under it, a context holding one reduced report and a context
+/// holding fifty thousand lines of grep both read about 30%: both arrive as tool
+/// results, so both are counted the same. They are not the same finding, and the
+/// claim — *this layer is not where the material piles up* — is about the second
+/// one. A report is a product of judgment. It was decided what to leave out.
+///
+/// The breakdown survives the change because the parts answer different
+/// questions, and because collapsing them is what made the old number unable to
+/// tell two very different contexts apart.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextComposition {
-    /// Characters of tool-call arguments in the context.
+    /// Tool output as it came off the tool: stdout, a file's contents, a log,
+    /// an evidence block. **DESIGN's numerator.**
+    pub raw_material_chars: u64,
+    /// Tool output that a reduction produced before it arrived — a report, a
+    /// summary, an address rather than the thing.
+    pub reduced_result_chars: u64,
+    /// Characters of tool-call *arguments* in the context.
+    ///
+    /// The model wrote these, so they are judgment rather than material — but
+    /// they are also pure overhead from the context's point of view, which is
+    /// why they stay counted separately rather than folded into either side.
     pub tool_call_chars: u64,
-    /// Characters of tool results in the context.
-    pub tool_result_chars: u64,
     /// Characters of tool *definitions* in the context.
     ///
-    /// DESIGN's wording is "工具机制(tool 结果 + tool 调用)", which does not
-    /// name definitions — but they occupy context on every single request and
-    /// they are machinery, so a ratio that omits them under-reports precisely
-    /// the quantity the metric exists to expose. It is a separate field rather
-    /// than folded into the two above so the breakdown stays readable.
+    /// Occupies context on every single request, so a ratio that omitted it
+    /// would under-report the prefix's cost. It is neither raw nor judged: it is
+    /// the declared surface.
     pub tool_definition_chars: u64,
     /// All characters in the context, including everything above.
     pub total_chars: u64,
 }
 
 impl ContextComposition {
+    /// Raw material as a fraction of the context.
+    ///
+    /// `None` when the context is empty. Returning `Some(0.0)` there would let a
+    /// renderer that produced nothing at all look like a perfectly lean one —
+    /// and a metric that cannot report "unmeasured" is a metric that cannot fail.
+    pub fn raw_material_ratio(&self) -> Option<f64> {
+        if self.total_chars == 0 {
+            return None;
+        }
+        Some(self.raw_material_chars as f64 / self.total_chars as f64)
+    }
+
     /// Every byte of the context that is tool machinery rather than intent,
     /// state, or a result's prose.
     pub fn tool_machinery_chars(&self) -> u64 {
-        self.tool_call_chars + self.tool_result_chars + self.tool_definition_chars
+        self.tool_call_chars
+            + self.reduced_result_chars
+            + self.raw_material_chars
+            + self.tool_definition_chars
     }
 
     /// Tool machinery as a fraction of the context.
     ///
-    /// `None` when the context is empty. Returning `Some(0.0)` there would let a
-    /// renderer that produced nothing at all look like a perfectly lean one.
+    /// **Not the acceptance criterion.** It is kept because it is a real
+    /// quantity, because it is what the numbers recorded before this metric
+    /// changed were measured in, and because the two ratios disagreeing is
+    /// itself informative: a context can be nearly all machinery and nearly no
+    /// raw material, which is exactly what a context holding one report looks
+    /// like.
     pub fn tool_machinery_ratio(&self) -> Option<f64> {
         if self.total_chars == 0 {
             return None;

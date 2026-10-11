@@ -22,7 +22,7 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand, ValueEnum};
 use yu_core::agent::{Agent, AgentConfig};
 use yu_core::decision::{DecisionConfig, DecisionLayer};
-use yu_core::render::{Charter, HumanUtterance};
+use yu_core::render::Charter;
 use yu_journal::{EventBody, Journal, SessionId};
 use yu_observe::{AgentId, ContextComposition, SpanKind, Timeline};
 use yu_tools::ToolRegistry;
@@ -437,21 +437,58 @@ fn describe_tools(registry: &ToolRegistry) -> String {
 
 /// Report DESIGN's acceptance metric for one layer's context.
 ///
+/// Raw material is the headline: bytes that arrived as they came off a tool,
+/// with neither a human nor a model having decided what in them mattered. It is
+/// the criterion because it is the thing the architecture claims to keep out of
+/// the decision layer, and because it is the one number a context full of reports
+/// and a context full of `grep` output cannot both satisfy.
+///
+/// The breakdown is printed with it so the number can be argued with, and the
+/// tool-machinery ratio is printed too — a context can be nearly all machinery
+/// and nearly no raw material, and that combination is the design working.
+///
 /// `None` means nothing was measured, which is reported as such rather than as
 /// zero — a layer with no measured context and a layer with a perfectly lean one
 /// are different findings.
 fn report_ratio(label: &str, composition: &ContextComposition) {
-    match composition.tool_machinery_ratio() {
+    match composition.raw_material_ratio() {
         Some(ratio) => eprintln!(
-            "--- {label} context: tool machinery {:.1}% of {} chars \
-             (calls {} + results {} + definitions {})",
+            "--- {label} context: raw material {:.1}% of {} chars \
+             (raw {} + reduced {} + calls {} + definitions {}; tool machinery {:.1}%)",
             ratio * 100.0,
             composition.total_chars,
+            composition.raw_material_chars,
+            composition.reduced_result_chars,
             composition.tool_call_chars,
-            composition.tool_result_chars,
             composition.tool_definition_chars,
+            composition.tool_machinery_ratio().unwrap_or(0.0) * 100.0,
         ),
         None => eprintln!("--- {label} context: NOT MEASURED (no context was recorded)"),
+    }
+}
+
+/// Print how the decision layer's context moved over the run.
+///
+/// DESIGN says the view is bounded — "大小有界、前缀字节稳定、永不退化". That is a
+/// claim about a curve, so it is checkable only against the series and not
+/// against its last point: a run that ends small after peaking at forty thousand
+/// characters did not stay bounded, it merely stopped.
+fn report_growth(outcome: &yu_core::decision::DecisionOutcome) {
+    if outcome.contexts.len() < 2 {
+        return;
+    }
+    let curve: Vec<String> = outcome
+        .contexts
+        .iter()
+        .map(|c| c.total_chars.to_string())
+        .collect();
+    eprintln!("--- decision-layer context per request: {}", curve.join(" "));
+    if let Some(peak) = outcome.peak() {
+        eprintln!(
+            "--- peak context: {} chars, raw material {:.1}%",
+            peak.total_chars,
+            peak.raw_material_ratio().unwrap_or(0.0) * 100.0
+        );
     }
 }
 
@@ -489,18 +526,16 @@ async fn cmd_decide(
     let tools = Arc::new(build_tools(tool_set, cwd.clone()));
     init.finish();
 
-    let charter = Charter {
-        text: charter_text.to_owned(),
-        // DESIGN: "人类原话原样存活". The charter arrives as the human typed it
-        // and is kept that way; there is no summarising step between them and
-        // the decision layer.
-        human_words: vec![HumanUtterance {
-            at_ms: chrono::Utc::now().timestamp_millis(),
-            text: charter_text.to_owned(),
-            source: "cli".to_owned(),
-        }],
-        ..Charter::default()
-    };
+    // DESIGN: "人类原话原样存活". The charter arrives as the human typed it and is
+    // kept that way; there is no summarising step between them and the decision
+    // layer. The constructor exists so the sentence lands in exactly one field —
+    // setting both `text` and `human_words` renders L0 with the intent twice on
+    // every round, which is the layer least able to afford it.
+    let charter = Charter::from_the_humans_own_words(
+        charter_text,
+        chrono::Utc::now().timestamp_millis(),
+        "cli",
+    );
 
     let surface = describe_tools(&tools);
     let mut config = DecisionConfig::new(model);
@@ -540,6 +575,7 @@ async fn cmd_decide(
 
     // The comparison the whole design rests on, from one run.
     report_ratio("decision layer", &outcome.composition);
+    report_growth(&outcome);
     for (i, d) in outcome.outcomes.iter().enumerate() {
         report_ratio(&format!("executor #{i}"), &d.executor_composition);
     }
