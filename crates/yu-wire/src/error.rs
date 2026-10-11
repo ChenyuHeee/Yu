@@ -119,7 +119,9 @@ impl WireError {
             });
 
         // Every copy of `message` — logged, journaled, serialized — is made
-        // from here, so this is the only place key material has to be stopped.
+        // from an ingestion point like this one, so key material is stopped
+        // here rather than in each consumer. The other ingestion points are the
+        // in-stream `error` event (`sse.rs`) and `capability::error_detail`.
         let message = redact_key_material(&message);
 
         // `request_id` appears either inside the message or alongside it.
