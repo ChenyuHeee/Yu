@@ -25,6 +25,9 @@ use yu_core::decision::{DecisionConfig, DecisionLayer};
 use yu_core::render::Charter;
 use yu_policy::resource::Policy;
 use yu_journal::{EventBody, Journal, SessionId};
+use yu_workflow::handover::{
+    Handover, ReaderAngle, WireReader, change_generation, trigger_for,
+};
 use yu_observe::{AgentId, ContextComposition, SpanKind, Timeline};
 use yu_tools::ToolRegistry;
 use yu_wire::capability::Capabilities;
@@ -147,6 +150,23 @@ enum Command {
         /// governs how many executors run, not merely what the view says.
         #[arg(long)]
         topology: Option<String>,
+        /// Start from a handover an earlier session wrote: its intent, its
+        /// constraints, its decisions, its loose ends, and an index of where
+        /// each came from. The new session's journal branches from the record
+        /// the handover indexes, so its addresses keep meaning what they meant.
+        #[arg(long)]
+        handover: Option<PathBuf>,
+        /// Write a handover for the next session here, when this run ends. The
+        /// session boundary is where a generation change is decided, and
+        /// completion decides it first.
+        #[arg(long)]
+        handover_out: Option<PathBuf>,
+        /// Also hand over a session that stopped without deciding, once its view
+        /// has grown this many characters past where it started. Growth, never
+        /// window size: a freshly seeded window is large by construction, so
+        /// billing that would fire forever.
+        #[arg(long, requires = "handover_out")]
+        handover_at_growth: Option<u64>,
     },
 
     /// Summarise a recorded session.
@@ -195,6 +215,9 @@ async fn main() -> ExitCode {
             policy,
             constraints,
             topology,
+            handover,
+            handover_out,
+            handover_at_growth,
         } => {
             cmd_decide(
                 &charter,
@@ -206,6 +229,9 @@ async fn main() -> ExitCode {
                 policy.as_deref(),
                 &constraints,
                 topology.as_deref(),
+                handover.as_deref(),
+                handover_out.as_deref(),
+                handover_at_growth,
             )
             .await
         }
@@ -676,6 +702,7 @@ async fn boot_decision(
     cwd: PathBuf,
     model: Option<String>,
     tool_set: ToolSet,
+    resume: Option<&Handover>,
 ) -> anyhow::Result<DecisionBoot> {
     let timeline = Timeline::new();
     timeline.enter(AgentId::decision());
@@ -687,11 +714,15 @@ async fn boot_decision(
         "decide-{}",
         chrono::Utc::now().format("%Y%m%dT%H%M%S")
     ));
-    let journal = Arc::new(
-        Journal::open(dir, session.clone())
-            .await?
-            .with_timeline(timeline.clone()),
-    );
+    // A continuation branches from the record its handover indexes rather than
+    // starting a log of its own. `journal:seq=<n>` names a position in one
+    // lineage, so a session that restarted the numbering would make every
+    // address the handover carries mean something else — silently.
+    let journal = Arc::new(match resume {
+        Some(handover) => handover.resume_into(dir, session.clone()).await?,
+        None => Journal::open(dir, session.clone()).await?,
+    }
+    .with_timeline(timeline.clone()));
     let tools = Arc::new(build_tools(tool_set, cwd));
     init.finish();
 
@@ -705,6 +736,7 @@ async fn boot_decision(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_decide(
     charter_text: &str,
     dir: &PathBuf,
@@ -715,8 +747,26 @@ async fn cmd_decide(
     policy_path: Option<&Path>,
     constraints: &[String],
     topology: Option<&str>,
+    handover_path: Option<&Path>,
+    handover_out: Option<&Path>,
+    handover_at_growth: Option<u64>,
 ) -> anyhow::Result<()> {
     let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    // A handover from a previous session, if this one is a continuation. Read as
+    // text and kept as text: its blob's address is the digest of the bytes that
+    // were stored, so re-serialising it here would name an address that is not
+    // the one the record holds.
+    let resumed = match handover_path {
+        Some(path) => {
+            let raw = std::fs::read_to_string(path)
+                .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+            let handover = Handover::from_json(&raw)
+                .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+            Some((handover, raw))
+        }
+        None => None,
+    };
 
     let DecisionBoot {
         client,
@@ -725,7 +775,7 @@ async fn cmd_decide(
         timeline,
         model,
         session,
-    } = boot_decision(dir, cwd.clone(), model, tool_set).await?;
+    } = boot_decision(dir, cwd.clone(), model, tool_set, resumed.as_ref().map(|(h, _)| h)).await?;
 
     // DESIGN: "人类原话原样存活". The charter arrives as the human typed it and is
     // kept that way; there is no summarising step between them and the decision
@@ -748,12 +798,30 @@ async fn cmd_decide(
         charter.topology = Some(yu_core::topology::TopologySpec::new(kind));
     }
 
+    // **The state half of the handover, into L0 and L1.** The human's sentence
+    // above is this session's; what the previous one carried is added to it —
+    // its intent verbatim, its constraints (which is the list the layer injects
+    // into every executor), its decisions and ruled-out proposals, and its loose
+    // ends as open questions.
+    let mut seed = None;
+    if let Some((handover, raw)) = &resumed {
+        seed = Some(handover.new_session(&charter));
+        charter = seed.as_ref().expect("just set").charter.clone();
+        eprintln!(
+            "--- resuming from a handover: {} item(s) carried, {} angle(s) reported, index at {}",
+            handover.carried_len(),
+            handover.sources.len(),
+            format_args!("blob:{}", yu_journal::digest_of(raw.as_bytes())),
+        );
+    }
+
     let surface = describe_tools(&tools);
     let mut config = DecisionConfig::new(model);
     config.max_rounds = max_rounds;
     // The prediction sets come from the policy file, so changing one is an edit
     // to a resource rather than a rebuild — DESIGN's constraint 0, applied to
     // the one thing the decision layer is forbidden to invent.
+    let reader_client = client.clone();
     let mut layer = DecisionLayer::new(
         client,
         // Cloned rather than moved: the record outlives the layer that wrote it,
@@ -762,9 +830,19 @@ async fn cmd_decide(
         tools,
         timeline.clone(),
         config,
-        charter,
+        charter.clone(),
         cwd,
     );
+    // **The index half.** The layer is not handed the handover's material — it
+    // is told where the material is, which is what a manifest is for, and it can
+    // pay for what it decides to look at.
+    if let (Some(seed), Some((handover, raw))) = (&seed, &resumed) {
+        layer = layer.with_carried(vec![handover.carried_entry(
+            &format!("blob:{}", yu_journal::digest_of(raw.as_bytes())),
+            raw.len() as u64,
+        )]);
+        *layer.ledger_mut() = seed.ledger.clone();
+    }
     if let Some(path) = policy_path {
         let policy = Policy::from_path(path)
             .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
@@ -834,6 +912,52 @@ async fn cmd_decide(
         .collect();
     parts.sort();
     eprintln!("--- spans: {}", parts.join(" "));
+
+    // ---- the generation change, if this run is to hand over
+    //
+    // Decided here, at the session boundary, because that is where the two
+    // things a trigger needs exist: a run that has ended, and a record that has
+    // stopped being written. `trigger_for` owns the decision; this owns the
+    // consequences.
+    if let Some(path) = handover_out {
+        match trigger_for(&outcome, handover_at_growth) {
+            Some(trigger) => {
+                let reader = WireReader::new(reader_client);
+                let change = change_generation(
+                    &reader,
+                    &journal,
+                    trigger,
+                    &charter,
+                    &outcome.ledger,
+                    &ReaderAngle::ALL,
+                )
+                .await?;
+                let json = change.handover.to_json()?;
+                std::fs::write(path, &json)
+                    .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+                eprintln!(
+                    "--- handover ({}): {} item(s) from {} angle(s), index at {} → {}",
+                    change.trigger.describe(),
+                    change.handover.carried_len(),
+                    change.handover.sources.len(),
+                    change.handover_at,
+                    path.display(),
+                );
+                // Said out loud, because a gap is the one thing this flow found
+                // and could not fix by itself.
+                for gap in &change.gaps {
+                    eprintln!(
+                        "--- the handover does not carry: {} [{}]",
+                        gap.text, gap.address
+                    );
+                }
+            }
+            None => eprintln!(
+                "--- no handover: the session stopped without deciding, and its view did not \
+                 grow past the declared threshold"
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -974,7 +1098,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yu-cli-init-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let boot = boot_decision(&dir, dir.clone(), None, ToolSet::ReadOnly)
+        let boot = boot_decision(&dir, dir.clone(), None, ToolSet::ReadOnly, None)
             .await
             .expect("the boot sequence");
 
