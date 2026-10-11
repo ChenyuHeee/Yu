@@ -28,6 +28,7 @@ use serde_json::json;
 
 use yu_journal::{EventBody, Journal};
 use yu_observe::{ContextComposition, ShapeSignal, SpanKind, Timeline, TokenUsage};
+use yu_tools::native::parse_exit_code;
 use yu_wire::client::WireClient;
 use yu_wire::types::{CustomTool, ToolDefinition};
 
@@ -93,7 +94,18 @@ pub struct DelegateOutcome {
     pub tool_calls: u32,
     pub usage: TokenUsage,
     /// Whether the executor reported completion rather than stopping.
+    ///
+    /// Derived from [`Self::stopped_early`], which is the run's own statement
+    /// about itself. Read as a pair: this says whether, that says why.
     pub completed: bool,
+    /// Where the executor stopped, when it stopped before finishing.
+    ///
+    /// Carried because a bare "did not complete" is a state, not an account:
+    /// the decision layer has to be able to tell a run that ran out of steps
+    /// from one that was cut off, and the run's own reason is the only truthful
+    /// source. `None` for a run that completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_early: Option<String>,
     /// Where the executor's full reply is recorded, if it was.
     ///
     /// Carried so that a truncated report can point at the rest instead of
@@ -123,6 +135,14 @@ impl DelegateOutcome {
         } else {
             "DELEGATION STOPPED WITHOUT COMPLETING\n"
         });
+        // The reason directly under the header, because "it stopped" without
+        // "where" leaves the decision layer to guess between states that call
+        // for different responses — re-deriving the answer from the tail of the
+        // report is the work this field exists to remove.
+        if let Some(stopped) = &self.stopped_early {
+            out.push_str(stopped);
+            out.push('\n');
+        }
         out.push_str(&format!(
             "({} step(s), {} tool call(s))\n\n",
             self.steps, self.tool_calls
@@ -225,11 +245,17 @@ pub async fn outcome_from_run(
                     && let Some((id, command)) = &pending
                     && id == tool_use_id
                 {
-                    // The executor's `exec` renders a trailing exit status; if it
-                    // did not, the code is genuinely unknown and is reported as
-                    // such rather than defaulted to success.
+                    // The producer owns the block's format, so the reader lives
+                    // with it (`yu_tools::native`). The command is passed in
+                    // because the block echoes it: the exit marker's position is
+                    // a function of the command, which is what keeps output that
+                    // merely resembles a marker from being read as one.
+                    //
+                    // A reduction that replaced the output with a pointer is not
+                    // a render, so nothing parses there and the code is reported
+                    // as genuinely unknown — never defaulted to success.
                     let text = inline.clone().unwrap_or_default();
-                    let exit_code = parse_exit_code(&text);
+                    let exit_code = parse_exit_code(command, &text);
                     evidence.push(Evidence {
                         label: command.clone(),
                         content: text,
@@ -307,6 +333,12 @@ pub async fn outcome_from_run(
 
     let _ = unpaired_bytes;
 
+    // Whether the run finished is the run's own statement, taken from the field
+    // that says so. Reading it off `stop` instead is what made it vacuously
+    // true: the loop returned only on completion, so every outcome that reached
+    // here was complete by construction and the "stopped" branch below was
+    // unreachable prose (see `LoopOutcome::stopped_early`).
+    let stopped_early = run.stopped_early;
     Ok(DelegateOutcome {
         report: run.text.clone(),
         evidence,
@@ -315,7 +347,8 @@ pub async fn outcome_from_run(
         steps: run.steps,
         tool_calls: run.tool_calls,
         usage: run.usage,
-        completed: matches!(run.stop, yu_wire::types::StopDisposition::Complete),
+        completed: stopped_early.is_none(),
+        stopped_early: stopped_early.map(|stop| stop.describe()),
         executor_composition: run.composition,
         report_address,
     })
@@ -347,19 +380,6 @@ fn truncate_report(report: &str, address: Option<&str>) -> String {
         None => out.push_str("; the full reply was not recorded, so it is gone]\n"),
     }
     out
-}
-
-/// The executor prints a trailing `exit <code>` line; recover it if present.
-///
-/// Returning `None` for "not found" matters: defaulting to 0 would turn an
-/// unrun command into a passing one, which is the exact failure the evidence
-/// block exists to catch.
-fn parse_exit_code(output: &str) -> Option<i32> {
-    output
-        .lines()
-        .rev()
-        .take(3)
-        .find_map(|line| line.trim().strip_prefix("exit ")?.trim().parse().ok())
 }
 
 fn describe_signal(s: &ShapeSignal) -> String {
@@ -481,6 +501,7 @@ pub(crate) mod tests_support {
             tool_calls: 0,
             usage: TokenUsage::default(),
             completed: true,
+            stopped_early: None,
             executor_composition: ContextComposition::default(),
             report_address: None,
         }
@@ -490,6 +511,7 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::test_support::scratch_dir;
 
     #[test]
     fn the_delegate_tool_description_says_it_returns_a_summary_not_a_transcript() {
@@ -521,14 +543,39 @@ mod tests {
         );
     }
 
+    /// The exit code comes from what the `exec` tool actually printed.
+    ///
+    /// The test this replaces fed the reader a hand-written
+    /// `"some output\nexit 0\n"` — a shape no tool in this repository produces —
+    /// so it could not fail when the producer's format changed, which is
+    /// precisely what had happened: the producer wrote `exit: 3` and the reader
+    /// searched for `exit `, with a space, and found nothing on any real run.
+    /// Running real commands through the real tool is what makes a change to
+    /// either end a failure here.
     #[test]
-    fn exit_codes_are_recovered_but_absence_is_not_read_as_success() {
-        assert_eq!(parse_exit_code("some output\nexit 0\n"), Some(0));
-        assert_eq!(parse_exit_code("some output\nexit 1\n"), Some(1));
-        assert_eq!(parse_exit_code("some output\nexit 137"), Some(137));
+    fn the_exit_code_is_read_from_what_the_exec_tool_actually_printed() {
+        use yu_tools::native::{Exec, Tool, ToolContext};
+
+        let ctx = ToolContext::with_default_budget(std::env::temp_dir());
+        let run = |command: &str| -> Option<i32> {
+            let result = Exec.execute(&json!({"command": command}), &ctx);
+            let text = result.payload.text().unwrap_or_default();
+            parse_exit_code(command, text)
+        };
+
+        // A real exit status round-trips from the tool's own output.
+        assert_eq!(run("printf 'six bytes'; exit 3"), Some(3));
+        assert_eq!(run("true"), Some(0));
+
+        // Output that merely resembles the marker is not the status. This
+        // command exits 1 while its output ends with a line that reads exactly
+        // like a success, and the tail scan this replaced reported 0 for it — a
+        // passing verdict drawn from the failed command's own noise.
+        assert_eq!(run("printf 'done\\nexit 0'; exit 1"), Some(1));
+
         // The important case: no exit status must NOT become 0.
-        assert_eq!(parse_exit_code("some output with no status"), None);
-        assert_eq!(parse_exit_code(""), None);
+        assert_eq!(parse_exit_code("true", ""), None);
+        assert_eq!(parse_exit_code("true", "some output with no status"), None);
     }
 
     #[test]
@@ -542,6 +589,7 @@ mod tests {
             tool_calls: 0,
             usage: TokenUsage::default(),
             completed: true,
+            stopped_early: None,
             executor_composition: ContextComposition::default(),
             report_address: None,
         };
@@ -564,6 +612,7 @@ mod tests {
             tool_calls: 30,
             usage: TokenUsage::default(),
             completed: false,
+            stopped_early: None,
             executor_composition: ContextComposition::default(),
             report_address: None,
         };
@@ -583,6 +632,7 @@ mod tests {
             tool_calls: 1,
             usage: TokenUsage::default(),
             completed: true,
+            stopped_early: None,
             executor_composition: ContextComposition::default(),
             report_address: None,
         };
@@ -601,6 +651,7 @@ mod tests {
             tool_calls: 1,
             usage: TokenUsage::default(),
             completed: true,
+            stopped_early: None,
             executor_composition: ContextComposition::default(),
             report_address: address.map(str::to_owned),
         }
@@ -696,6 +747,7 @@ mod tests {
             tool_calls: 1,
             usage: TokenUsage::default(),
             completed: true,
+            stopped_early: None,
             executor_composition: ContextComposition::default(),
             report_address: None,
         };
@@ -704,5 +756,152 @@ mod tests {
         // The decision layer's context is the scarce resource: the view must not
         // expand with the executor's output.
         assert!(outcome.context_chars() < 1200, "{}", outcome.context_chars());
+    }
+
+    // -----------------------------------------------------------------------
+    // Through a real run, against a real socket
+    //
+    // The tests above build outcomes by hand; these drive delegations, so the
+    // mechanism under test is the one that runs in production rather than a
+    // restatement of it.
+    // -----------------------------------------------------------------------
+
+    /// The code a command exited with survives the whole path: the tool, the
+    /// record, and the evidence block the decision layer reads.
+    ///
+    /// The round trip in `yu-tools` proves the two ends agree on the format;
+    /// this proves the number reaches the view. A reader that only worked on the
+    /// tool's immediate return value would pass that one and still leave every
+    /// real run reporting `exit unknown`.
+    #[tokio::test]
+    async fn the_real_exit_code_reaches_the_decision_layers_evidence() {
+        use crate::agent::test_support::{FakeEndpoint, endless_tool_use, final_reply};
+        use yu_journal::SessionId;
+
+        let command = "printf 'six bytes'; exit 3";
+        let fake = FakeEndpoint::scripted(vec![endless_tool_use(command), final_reply("done")]);
+        let dir = scratch_dir("delegate-exit-code");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let tools = Arc::new(yu_tools::ToolRegistry::native(&dir));
+
+        let outcome = run_delegation(
+            &DelegateArgs::new("run the command"),
+            fake.client(),
+            journal,
+            tools,
+            Timeline::new(),
+            dir.clone(),
+        )
+        .await
+        .expect("the executor finishes on its second turn");
+
+        assert!(outcome.completed);
+        assert_eq!(outcome.steps, 2);
+        assert_eq!(outcome.evidence.len(), 1, "one command ran");
+        assert_eq!(outcome.evidence[0].exit_code, Some(3));
+
+        let rendered = outcome.render();
+        assert!(rendered.contains("] exit 3"), "{rendered}");
+        assert!(
+            !rendered.contains("exit unknown"),
+            "the evidence block must conduct: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An executor that runs out of steps returns a report that says where it
+    /// stopped, and the decision layer survives it.
+    ///
+    /// This is the harness's most common failure: a loop that keeps calling
+    /// tools reaches its budget. It used to travel up `run_delegation`'s `?` as
+    /// an `Err`, and `DecisionLayer::run` returned `Err` with it — no report, no
+    /// evidence, no acceptance numbers. A stopped delegation is an outcome like
+    /// any other now, and the header the decision layer reads is the one
+    /// `render` writes for a run that did not finish.
+    #[tokio::test]
+    async fn an_executor_that_exhausts_its_steps_returns_a_report_not_an_error() {
+        use crate::agent::test_support::{FakeEndpoint, endless_tool_use};
+        use yu_journal::SessionId;
+
+        let fake = FakeEndpoint::always(endless_tool_use("printf 'still working'; exit 3"));
+        let dir = scratch_dir("delegate-step-ceiling");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let tools = Arc::new(yu_tools::ToolRegistry::native(&dir));
+
+        let outcome = run_delegation(
+            &DelegateArgs::new("keep going"),
+            fake.client(),
+            journal,
+            tools,
+            Timeline::new(),
+            dir.clone(),
+        )
+        .await
+        .expect("an executor that runs out of steps must not kill the decision layer");
+
+        assert!(!outcome.completed, "a run that stopped did not complete");
+        assert_eq!(outcome.steps, 16, "the delegation's own budget");
+        assert!(
+            !outcome.evidence.is_empty() && outcome.evidence.iter().all(|e| e.exit_code == Some(3)),
+            "what ran before the budget ran out is still evidence"
+        );
+
+        let rendered = outcome.render();
+        assert!(
+            rendered.contains("DELEGATION STOPPED WITHOUT COMPLETING"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("DELEGATION COMPLETE\n"),
+            "a stopped run must not also read as complete: {rendered}"
+        );
+        assert!(
+            rendered.contains("step ceiling of 16"),
+            "the report must say where it stopped: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `pause_turn` reaches the decision layer as an account, not as a death.
+    ///
+    /// Nothing here can serve the disposition — it presupposes a server-side
+    /// tool — so it is refused, and the refusal has to say *which* stop this
+    /// was. The decision layer's next move differs between "the executor ran out
+    /// of budget" and "the endpoint asked for something this harness cannot
+    /// serve", and a stop that reads as the wrong one buys the wrong response.
+    #[tokio::test]
+    async fn a_pause_turn_is_reported_to_the_decision_layer_rather_than_killing_it() {
+        use crate::agent::test_support::{FakeEndpoint, paused_turn_reply};
+        use yu_journal::SessionId;
+
+        let fake = FakeEndpoint::always(paused_turn_reply());
+        let dir = scratch_dir("delegate-pause-turn");
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let tools = Arc::new(yu_tools::ToolRegistry::native(&dir));
+
+        let outcome = run_delegation(
+            &DelegateArgs::new("keep going"),
+            fake.client(),
+            journal,
+            tools,
+            Timeline::new(),
+            dir.clone(),
+        )
+        .await
+        .expect("an unservable stop reason must not kill the decision layer");
+
+        assert!(!outcome.completed);
+        assert_eq!(fake.requests(), 1, "re-sending is the spin this replaced");
+        let rendered = outcome.render();
+        assert!(
+            rendered.contains("DELEGATION STOPPED WITHOUT COMPLETING"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("pause_turn"), "{rendered}");
+        assert!(
+            !rendered.contains("step ceiling"),
+            "the cause must not be confused with the budget: {rendered}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
