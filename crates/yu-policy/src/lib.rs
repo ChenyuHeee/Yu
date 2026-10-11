@@ -12,4 +12,5 @@
 //! Acceptance criterion, to be honoured literally: **changing one policy rule
 //! must not require recompiling Rust.**
 
+pub mod outcomes;
 pub mod resource;

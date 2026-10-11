@@ -18,6 +18,7 @@ pub mod decision;
 pub mod delegate;
 pub mod gate;
 pub mod landing;
+pub mod outcomes;
 pub mod render;
 pub mod spot;
 pub mod topology;
