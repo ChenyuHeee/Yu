@@ -536,9 +536,14 @@ impl DecisionLayer {
                         )));
                         continue;
                     }
-                    round_delegations += 1;
-                    delegations += 1;
-
+                    // The budget is charged only once a delegation actually
+                    // runs, at the bottom of this block. Measured: charging it
+                    // here meant an ill-shaped call could not be corrected
+                    // inside the round — the layer's own words, from a real run,
+                    // were "an ill-shaped call cannot be corrected inside the
+                    // same round — there is no in-round retry, and a wasted call
+                    // costs the entire round's investigative capacity". A call
+                    // that ran nothing has cost nothing.
                     let mut args: DelegateArgs = match serde_json::from_value(tu.input.clone()) {
                         Ok(a) => a,
                         Err(e) => {
@@ -554,7 +559,7 @@ impl DecisionLayer {
                     // running the delegation without a set would silently drop
                     // the contract, and inventing one would be the layer writing
                     // a prediction set — the one thing DESIGN says it must not do.
-                    match tu.input.get("outcomes").and_then(serde_json::Value::as_str) {
+                    match set_id_in(&tu.input) {
                         Some(id) => match self.outcome_sets.get(id) {
                             Some(set) => {
                                 args.outcomes = Some(crate::landing::PlannedOutcomes {
@@ -584,8 +589,38 @@ impl DecisionLayer {
                                 continue;
                             }
                         },
+                        // A policy declares sets, and this call named none.
+                        //
+                        // Refused rather than run unclassified, because an
+                        // unchecked delegation is the one outcome that makes the
+                        // whole mechanism optional: DESIGN's rule is that the
+                        // layer *chooses* a set, not that it may decline to. The
+                        // schema marks the field required; a required field
+                        // nothing enforces is a suggestion.
+                        None if !self.outcome_sets.ids().is_empty() => {
+                            result_blocks.push(ContentBlock::ToolResult(
+                                ToolResultBlock::error(
+                                    &tu.id,
+                                    format!(
+                                        "this delegation named no outcome set, so nothing \
+                                         about it could be checked. The policy declares: \
+                                         {}. Pass one as `outcomes`.",
+                                        self.outcome_sets
+                                            .ids()
+                                            .iter()
+                                            .map(|id| format!("`{id}`"))
+                                            .collect::<Vec<_>>()
+                                            .join(", ")
+                                    ),
+                                ),
+                            ));
+                            continue;
+                        }
                         None => {}
                     }
+
+                    round_delegations += 1;
+                    delegations += 1;
 
                     let outcome = delegate::run_delegation(
                         &args,
@@ -887,6 +922,31 @@ mod round_material_tests {
     fn a_run_with_no_delegations_carries_nothing() {
         let (evidence, shape, omitted) = carry_for_this_round(&[]);
         assert!(evidence.is_empty() && shape.is_empty() && omitted.is_empty());
+    }
+}
+
+/// The set id a delegation named, read however it arrived unambiguously.
+///
+/// The schema says `string`. Measured: a real run sent `["investigation"]` —
+/// the right set, the wrong encoding — and was refused with a message that said
+/// to pass one without saying in what shape. The layer then spent the rest of
+/// the run reasoning about the interface instead of the task, and finished
+/// blocked:
+///
+/// > The array form `["investigation"]` — the form the tool schema specifies —
+/// > was refused with the same "named no outcome set" message, so the encoding
+/// > of the value is the one variable not yet tried … the run is handed back as
+/// > blocked.
+///
+/// A one-element list names exactly what a bare string names, so it is read as
+/// one. Anything else is not a name, and the refusal says so — strictness about
+/// *which* set is the point; strictness about JSON punctuation is a way to lose
+/// a run to a comma.
+fn set_id_in(input: &serde_json::Value) -> Option<&str> {
+    match input.get("outcomes") {
+        Some(serde_json::Value::String(id)) => Some(id.as_str()),
+        Some(serde_json::Value::Array(items)) if items.len() == 1 => items[0].as_str(),
+        _ => None,
     }
 }
 
