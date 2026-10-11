@@ -248,6 +248,34 @@
 
 ## 端到端验收
 
+> **状态:未通过。六条里三条成立,两条未行使,一条跑不了。** 下面是那一次真实运行的全部读数,不做修饰。
+
+任务(在 `sandbox-exec` 沙箱里跑,写权限只放行 `/private/tmp/yu-e2e-sandbox`):*"在这目录里交付一个能用的 `report.sh`,打印每个 `.txt` 的文件名与行数、再打印总数;还没有 `.txt`,先造 `sample-a.txt` 与 `sample-b.txt`,然后真的跑一遍 `report.sh` 把输出show 出来。别改别的。"* 工具面 `--tools full`,五轮,两条 standing constraint,一份声明了 `delivery` 预测集的策略。
+
+**交付物是真的,而且是我在 harness 外面独立复核的:**
+
+```
+$ (cd /private/tmp/yu-e2e-sandbox && sh report.sh)
+sample-a.txt 3
+sample-b.txt 5
+total 8          exit=0
+```
+
+| # | 条件 | 判据 | 结果 |
+|---|---|---|---|
+| 1 | 决策层上下文是决策形状的 | 原始材料占比 ≈ 0 | ✅ `raw material 0.0% of 23308 chars (raw 0 + reduced 6490 + calls 0 + definitions 4278)` |
+| 2 | 没有任何东西被静默丢弃 | 清单的完整性可验证 | ✅ 层自己用清单完成了一次判断:"Shape flags 2 files touched outside the declared 3 (policy.toml, run.log) — resolved as read-only: both listings show identical sizes and mtimes across the whole run, and the manifest contains only read_file results for them, no writes." |
+| 3 | 中途 `kill -9` | 恢复后继续,且**没有重复副作用** | ❌ **跑不了** —— 见下 |
+| 4 | 中途换代一次 | 换代后仍生效的约束一条不少 | ⚠️ **没被触发** —— `handover.json` 没写出 |
+| 5 | 事后可重建 | 能从记录里重建任意一个历史点 | ⚠️ **记录支持,但这次没有行使** —— 74 条事件、blob store、`delegated` 血缘都在 |
+| 6 | harness 开销 | ≤ 模型时间的 X% | ✅ 含执行者真跑的命令 3.27%,不含则 0.061%(X 定为 10%) |
+
+**条件 3 为什么跑不了 —— 这是一处真实的缺口,不是环境问题。** `yu decide` **没有 `--session`**。daemon 能续会话但**不跑 turn**(`Send` 只把消息记进记录并明说没有 turn 运行过),而 decide 跑 turn 却不能续。于是一次被 `kill -9` 打断的 `yu decide` **无法继续**。`--handover` 也救不了它:交接是在会话**结束时**写的,而被杀掉的会话什么都没写。**这条验收在设计这次运行的过程中才暴露出来** —— 想写编排脚本时才发现没有可用的续跑入口。
+
+**条件 4 为什么没被触发。** 这次运行在第 5 轮撞到轮数上限(`stopped_early`),所以走的不是"决定达成"那条触发,而是阈值那条;视野增长没越过去,于是没有交接。它打印的原因是 *"the session stopped without deciding"* —— **措辞有歧义**:L1 里明明有 1 条决策,它想说的应该是"没有达成最终答复"。这条要改的是文案,不是逻辑,但歧义的后果是读的人会以为层什么都没决定。
+
+---
+
 前面六步全绿之后,一次:
 
 > **一个真实长程任务,从人类的一句话开始,跑到交付。**
