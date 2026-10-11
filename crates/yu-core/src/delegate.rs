@@ -427,7 +427,11 @@ fn describe_signal(s: &ShapeSignal) -> String {
 /// about. `decision_layer_advertises_exactly_the_tools_it_is_offered` compares
 /// this list against the prompt's own.
 pub fn decision_surface() -> Vec<ToolDefinition> {
-    vec![delegate_tool()]
+    let mut surface = vec![delegate_tool()];
+    // `decide` and `retire` after `delegate`, in that fixed order: the order is
+    // part of the cache prefix, so it must not depend on anything.
+    surface.extend(crate::decide::decision_tools());
+    surface
 }
 
 pub fn delegate_tool() -> ToolDefinition {

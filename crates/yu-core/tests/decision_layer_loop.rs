@@ -27,7 +27,7 @@ use serde_json::{json, Value};
 
 use yu_core::agent::{Agent, AgentConfig};
 use yu_core::decision::{DecisionConfig, DecisionLayer, DecisionOutcome, DECISION_PROMPT};
-use yu_core::delegate::{decision_surface, delegate_tool};
+use yu_core::delegate::decision_surface;
 use yu_core::render::{render, Charter, Ledger, RenderInput};
 use yu_journal::{EventBody, Journal, SessionId};
 use yu_observe::{AgentId, SpanKind, Timeline};
@@ -762,7 +762,7 @@ async fn every_request_carries_a_freshly_rendered_view_and_its_own_measurement()
             prompt: DECISION_PROMPT,
             charter: &charter,
             ledger: &ledger,
-            tools: &[delegate_tool()],
+            tools: &decision_surface(),
             report: None,
             evidence: &[],
             shape: &[],
@@ -864,17 +864,23 @@ async fn a_second_delegation_in_a_round_is_answered_rather_than_run() {
 /// what makes the surface real: the prompt names the tools this layer is meant
 /// to grow (`decide`, `retire`), so a call to one of them whose JSON happens to
 /// carry a `task` field used to be executed as a delegation.
+///
+/// The name used is one the layer famously does **not** have: DESIGN's tool
+/// surface is "`delegate` / `decide` / `retire` / ... — **not** Read/Write/Bash",
+/// and a layer that quietly acquired a file reader would be a different layer.
 #[tokio::test]
 async fn a_tool_use_naming_another_tool_is_answered_rather_than_run_as_a_delegation() {
     let endpoint = FakeEndpoint::start(vec![
         Reply::Json(tool_use_reply(
             "msg-d1",
-            "retire the finished item",
+            "read the file myself",
             "call-d1",
-            "retire",
+            "read_file",
             // The field `DelegateArgs` deserialises: a harness without the name
-            // check would take this for a delegation and run it.
-            json!({"task": "read the whole repository"}),
+            // check would take this for a delegation and run it. (And `decide`
+            // and `retire` are real tools now, so the name has to be one that
+            // genuinely is not on the surface.)
+            json!({"task": "read the whole repository", "path": "check.py"}),
         )),
         Reply::Json(text_reply("msg-d2", "understood")),
     ]);
@@ -893,7 +899,7 @@ async fn a_tool_use_naming_another_tool_is_answered_rather_than_run_as_a_delegat
     assert!(
         message_texts(&requests[1])
             .iter()
-            .any(|text| text.contains("there is no tool named `retire`")),
+            .any(|text| text.contains("there is no tool named `read_file`")),
         "the model has to be told the call was not a delegation: {:?}",
         message_texts(&requests[1])
     );
@@ -1062,4 +1068,285 @@ fn the_prompts_tool_section_is_readable_in_the_shape_this_guard_expects() {
         "the parser found {named:?} in the prompt's tool section — it says the \
          section is no longer shaped the way the guard reads it"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The executor's number is its context, not its context plus its answer
+// ---------------------------------------------------------------------------
+
+/// Two runs that differ only in the length of the final reply.
+///
+/// They sent byte-identical requests, so they carried byte-identical contexts,
+/// and the reported composition has to say so. Measuring at the *end* of the run
+/// instead — which is what it did — charges the agent for the assistant turn
+/// that answered the last request: that turn is the model's output, it is never
+/// sent, and in an executor it is a large share of the bytes, because the report
+/// is the whole point of the turn.
+///
+/// A differential test rather than an absolute one because the absolute number
+/// depends on how every block is counted, and re-deriving that here would be a
+/// second implementation of the metric — free to drift, and drifting invisibly.
+#[tokio::test]
+async fn the_executors_reported_context_does_not_include_the_answer_it_never_sent() {
+    async fn run_with_final_reply(reply: &str, name: &str) -> yu_observe::ContextComposition {
+        let endpoint = FakeEndpoint::start(vec![Reply::Json(text_reply("msg-1", reply))]);
+        let dir = scratch(name);
+        let timeline = Timeline::new();
+        let journal = Arc::new(
+            Journal::open(&dir, SessionId::new(name))
+                .await
+                .expect("opening the journal"),
+        );
+        let mut agent = Agent::new(
+            client(&endpoint, &timeline),
+            journal,
+            registry(),
+            timeline,
+            AgentConfig::new(AgentId::new("executor"), TEST_MODEL),
+            dir.clone(),
+        );
+        let outcome = agent
+            .run("say what you found")
+            .await
+            .expect("the scripted run completes");
+        assert_eq!(outcome.text, reply, "the turn's words are the run's words");
+        outcome.composition
+    }
+
+    let brief = run_with_final_reply("ok", "ctx-brief").await;
+    let wordy = run_with_final_reply(&"x".repeat(4000), "ctx-wordy").await;
+
+    assert_eq!(
+        brief, wordy,
+        "the same request reported two different contexts, so the number is \
+         counting the answer rather than the context: brief {brief:?}, wordy {wordy:?}"
+    );
+    assert!(
+        brief.total_chars > 0,
+        "and the number is real — an empty context and an unmeasured one are \
+         different findings, and this run measured something"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// M2 — L1 is written, and what was ruled out stays ruled out
+// ---------------------------------------------------------------------------
+
+/// **M2: "跑一个真实任务,结束后 L1 里有这次运行的决策与理由 —— 是决策,不是报告."**
+///
+/// The distinction is the whole point. A report is what the executor found; a
+/// decision is what the layer concluded and why, and it is the only kind of
+/// thing that can be carried into the next round without being re-derived. Until
+/// this milestone the layer had no way to write one, so L1 stayed empty and the
+/// layer began every round with no memory of its own conclusions.
+#[tokio::test]
+async fn the_decisions_the_layer_makes_are_in_l1_when_the_run_ends() {
+    let endpoint = FakeEndpoint::start(vec![
+        Reply::Json(tool_use_reply(
+            "msg-c1",
+            "the probe answered, so I can decide",
+            "call-c1",
+            "decide",
+            json!({
+                "what": "the config is read twice",
+                "why": "the probe showed both reads in the trace",
+                "verdict": "accepted",
+            }),
+        )),
+        Reply::Json(text_reply("msg-c2", "cause identified")),
+    ]);
+    let run = decide("l1-written", &endpoint, 4).await;
+
+    let decisions: Vec<(&str, &str)> = run
+        .outcome
+        .ledger
+        .decisions
+        .iter()
+        .map(|d| (d.what.as_str(), d.why.as_str()))
+        .collect();
+    assert_eq!(
+        decisions,
+        vec![(
+            "the config is read twice",
+            "the probe showed both reads in the trace"
+        )],
+        "L1 must hold what the layer decided and why it decided it"
+    );
+
+    // And the decision is in the record, not only in memory: L1 lives in the
+    // head of a process that ends.
+    let notes: Vec<String> = run
+        .journal
+        .events()
+        .await
+        .expect("reading the journal")
+        .iter()
+        .filter_map(|event| match &event.body {
+            EventBody::Note { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        notes.iter().any(|text| text.contains("the config is read twice")
+            && text.contains("the probe showed both reads")),
+        "the decision has to reach L2 as well, or a resumed run cannot rebuild \
+         the state it was working from: {notes:?}"
+    );
+}
+
+/// **M2: "否决过的方案不会在后续轮次被重新提出."**
+///
+/// The mechanism is not a filter on what the model may say — it is that the
+/// rejection is *in front of* the layer on every subsequent turn, under a
+/// heading that says what it is for. This drives a deliberately constructed
+/// re-proposal: the layer rules something out, and the very next round's
+/// executor proposes exactly that thing again. The next view has to carry the
+/// rejection, or the layer has nothing to refuse it with but its own memory —
+/// which DESIGN says it does not have, because the view is re-rendered.
+#[tokio::test]
+async fn a_ruled_out_proposal_is_in_front_of_the_layer_when_it_comes_back() {
+    let endpoint = FakeEndpoint::start(vec![
+        Reply::Json(tool_use_reply(
+            "msg-x1",
+            "a regex would be unreadable here",
+            "call-x1",
+            "decide",
+            json!({
+                "what": "parse the config with a regex",
+                "why": "unreadable, and the format is nested",
+                "verdict": "rejected",
+            }),
+        )),
+        // Round two: the same proposal comes back, from the executor this time.
+        Reply::Json(tool_use_reply(
+            "msg-x2",
+            "asking what the config loader should look like",
+            "call-x2",
+            "delegate",
+            json!({"task": "propose a way to parse the config"}),
+        )),
+        Reply::Json(text_reply(
+            "msg-x3",
+            "PROPOSAL: parse the config with a regex",
+        )),
+        Reply::Json(text_reply("msg-x4", "refused: that was already ruled out")),
+    ]);
+    let run = decide("reproposal", &endpoint, 4).await;
+
+    assert_eq!(
+        run.outcome.ledger.rejected.len(),
+        1,
+        "the rejection is on the ledger"
+    );
+
+    // Every request the layer made *after* ruling it out has to carry it.
+    let after: Vec<Value> = endpoint
+        .to_the_decision_layer()
+        .into_iter()
+        .filter(|request| {
+            message_texts(request)
+                .iter()
+                .any(|text| text.contains("PROPOSAL: parse the config with a regex"))
+        })
+        .collect();
+    assert!(
+        !after.is_empty(),
+        "the scripted re-proposal never reached the layer, so this test would \
+         pass without testing anything"
+    );
+    for (index, request) in after.iter().enumerate() {
+        let view = system_text(request);
+        assert!(
+            view.contains("parse the config with a regex"),
+            "request {index} carries the re-proposal but not the rejection, so the \
+             layer has to rely on remembering it: {view}"
+        );
+        assert!(
+            view.contains("Already rejected"),
+            "and it must be under the heading that says what to do about it, \
+             rather than mixed in with open questions: {view}"
+        );
+    }
+}
+
+/// **M2: "连续 8 轮后视野不随轮数单调增长."**
+///
+/// The property is not "the view is small" — L1 is complete state, so it grows
+/// when the layer decides things, and that growth is the ledger working. The
+/// property is that **the view is a function of state, not of history**: eight
+/// rounds in which nothing was written must render the same view as one.
+///
+/// The run below never moves — every turn names a tool this layer does not have —
+/// so it reaches the round ceiling with an untouched ledger, and every round's
+/// first request must be the same view. Requests with exactly one message are the
+/// freshly rendered view; the others are the same round's conversation.
+///
+/// **What this does not cover, and why.** It cannot see the evidence section: the
+/// test registry has one synthetic tool, and evidence is only produced by `exec`,
+/// so nothing in this run generates any. A version of this test that restored
+/// the old accumulating `build_view` still passed — measured, not assumed. The
+/// evidence guard is `the_rounds_material_does_not_grow_with_the_runs_history`
+/// and its neighbours in `decision.rs`, which drive `carry_for_this_round`
+/// directly. This test guards the other half: that a round's view is rendered
+/// from state rather than appended to, and that per-request costs are not
+/// multiplied by the round count.
+#[tokio::test]
+async fn eight_rounds_that_decide_nothing_do_not_grow_the_view() {
+    // Three barren turns end a round, so eight rounds is twenty-four turns.
+    let script: Vec<Reply> = (0..24)
+        .map(|i| {
+            Reply::Json(tool_use_reply(
+                &format!("msg-n{i}"),
+                "reading it myself",
+                &format!("call-n{i}"),
+                "read_file",
+                json!({"path": "check.py"}),
+            ))
+        })
+        .collect();
+    let endpoint = FakeEndpoint::start(script);
+    let run = decide("no-growth", &endpoint, 8).await;
+
+    assert_eq!(
+        run.outcome.rounds, 8,
+        "the run has to actually reach the eighth round"
+    );
+    assert!(
+        run.outcome.stopped_early.is_some(),
+        "and it never decided anything, which it must say"
+    );
+    assert!(
+        run.outcome.ledger.decisions.is_empty() && run.outcome.ledger.rejected.is_empty(),
+        "the ledger is untouched, so nothing in the growth below is state"
+    );
+
+    let requests = endpoint.to_the_decision_layer();
+    let fresh: Vec<&yu_observe::ContextComposition> = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| message_count(request) == 1)
+        .map(|(index, _)| &run.outcome.contexts[index])
+        .collect();
+
+    assert_eq!(
+        fresh.len(),
+        8,
+        "one freshly rendered view per round, and the run had eight rounds"
+    );
+    let first = fresh[0];
+    assert!(first.total_chars > 0, "a rendered view is not empty");
+    for (round, context) in fresh.iter().enumerate() {
+        assert_eq!(
+            context.total_chars, first.total_chars,
+            "round {}'s view is {} chars against round 0's {}: the view is \
+             accumulating rather than being rendered",
+            round + 1,
+            context.total_chars,
+            first.total_chars
+        );
+        assert_eq!(
+            context.tool_definition_chars, first.tool_definition_chars,
+            "the tool definitions are charged once per request, not once per round"
+        );
+    }
 }

@@ -286,6 +286,10 @@ impl Agent {
 
         let mut usage = TokenUsage::default();
         let mut signals = Vec::new();
+        // The context of the most recent request actually sent. Replaced every
+        // step, so a run that ends at the ceiling reports the last context it
+        // carried rather than one it was about to build.
+        let mut sent_context = ContextComposition::default();
         let mut reductions = Vec::new();
         let mut tool_calls = 0u32;
 
@@ -301,6 +305,12 @@ impl Agent {
             // ---- assemble, and validate before spending anything
             let assemble = self.timeline.start(SpanKind::Assemble);
             let req = self.build_request();
+            // What this request carries — which is the thing the number is
+            // about. Measuring at the *end* would charge the agent for the
+            // assistant turn that answered the last request: that turn is the
+            // model's output, it was never sent, and in the executor it is a
+            // substantial share of the bytes (the report itself).
+            sent_context = self.measure_context();
             let quirks = self.client.quirks();
             if let Err(problem) = quirks.check_history(&req.messages) {
                 assemble.finish();
@@ -427,7 +437,7 @@ impl Agent {
                         signals,
                         reductions,
                         stopped_early: Some(LoopStop::PauseTurn),
-                        composition: self.measure_context(),
+                        composition: sent_context,
                     });
                 }
                 StopDisposition::Complete => {
@@ -440,7 +450,7 @@ impl Agent {
                         signals,
                         reductions,
                         stopped_early: None,
-                        composition: self.measure_context(),
+                        composition: sent_context,
                     });
                 }
                 StopDisposition::Truncated => return Err(LoopError::Truncated { steps: step }),
@@ -487,7 +497,7 @@ impl Agent {
             signals,
             reductions,
             stopped_early: Some(LoopStop::StepCeiling(self.config.max_steps)),
-            composition: self.measure_context(),
+            composition: sent_context,
         })
     }
 

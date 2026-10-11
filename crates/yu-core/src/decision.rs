@@ -33,6 +33,7 @@ use yu_wire::types::{
 };
 
 use crate::agent::LoopError;
+use crate::decide;
 use crate::delegate::{self, DelegateArgs, DelegateOutcome};
 use crate::render::{
     render, Charter, CompositionMeter, Evidence, Ledger, NotLoadedEntry, RenderInput, View,
@@ -114,6 +115,15 @@ pub struct DecisionOutcome {
     /// bounded, and a claim of boundedness is only checkable against the shape
     /// of this curve rather than against its last point.
     pub contexts: Vec<ContextComposition>,
+    /// **L1 as the run left it.**
+    ///
+    /// Carried rather than left on the layer because it is not a by-product of
+    /// the run — it is what the run produced. DESIGN's L1 is *state*: it is what
+    /// survives across rounds, across generations, and across a restart, and a
+    /// state the caller cannot obtain is a state that only exists until the
+    /// process exits.
+    #[serde(default)]
+    pub ledger: Ledger,
     /// Why the run ended without the layer deciding, when it did.
     ///
     /// `None` means the layer reached a decision. `Some` means it did not — and
@@ -222,6 +232,13 @@ impl DecisionLayer {
         // the failure it produces — advertising one tool and accepting another —
         // is silent.
         let only_tool = delegate::delegate_tool().name().to_owned();
+        // Every name the layer was offered, for the message that tells it a name
+        // it used is not one of them.
+        let surface = delegate::decision_surface()
+            .iter()
+            .map(|tool| format!("`{}`", tool.name()))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         self.journal
             .append(
@@ -268,6 +285,10 @@ impl DecisionLayer {
             // ---- one round: delegate until the layer stops asking
             let mut round_delegations = 0u32;
             let mut barren_turns = 0u32;
+            // Whether the layer wrote to L1 this round. Read by the boundary
+            // below, and reset with the round because that is the scope it has
+            // meaning in.
+            let mut ledger_changed = false;
             loop {
                 // The context this request will actually carry. Recorded before
                 // it is sent, because this is the thing the criterion asks about.
@@ -338,6 +359,7 @@ impl DecisionLayer {
                             usage,
                             composition,
                             contexts,
+                            ledger: self.ledger.clone(),
                             stopped_early: None,
                             outcomes: all_outcomes,
                         });
@@ -376,20 +398,60 @@ impl DecisionLayer {
                 // spends without moving.
                 let mut executed = 0u32;
                 for tu in &uses {
-                    // Check the name before the arguments. Every `tool_use` used
-                    // to be deserialised straight into `DelegateArgs`, so a call
-                    // to any other tool whose JSON happened to carry a `task`
-                    // field was executed as a delegation — and the prompt names
-                    // the tools this layer is meant to grow (`decide`, `retire`),
-                    // which makes "the model called one of them" a state the
-                    // harness has to answer rather than one it can assume away.
+                    // The ledger's own tools first: they are what the layer
+                    // writes with, and a round in which it wrote something is a
+                    // round that has to end so the next one can show it.
+                    if decide::is_decision_tool(&tu.name) {
+                        let applied = decide::apply(&tu.name, &tu.input, &mut self.ledger);
+                        if applied.changed {
+                            ledger_changed = true;
+                            // L1 is state and lives in memory; a state that
+                            // exists only in memory is one a resumed run cannot
+                            // rebuild. The record gets the decision and its
+                            // reason verbatim, which is also what makes
+                            // `retire`'s "可审、可回滚" true rather than
+                            // aspirational.
+                            self.journal
+                                .append(
+                                    self.config.id.clone(),
+                                    EventBody::Note {
+                                        text: format!(
+                                            "{} — {}",
+                                            tu.name,
+                                            // The *record*, not the model-facing
+                                            // text: L2 has to be able to rebuild
+                                            // the state, and the model-facing text
+                                            // does not repeat the reason back.
+                                            if applied.record.is_empty() {
+                                                &applied.text
+                                            } else {
+                                                &applied.record
+                                            }
+                                        ),
+                                    },
+                                )
+                                .await?;
+                        }
+                        result_blocks.push(ContentBlock::ToolResult(if applied.malformed {
+                            ToolResultBlock::error(&tu.id, applied.text)
+                        } else {
+                            ToolResultBlock::text(&tu.id, applied.text)
+                        }));
+                        executed += 1;
+                        continue;
+                    }
+
+                    // Then check the name before the arguments. Every `tool_use`
+                    // used to be deserialised straight into `DelegateArgs`, so a
+                    // call to any other tool whose JSON happened to carry a
+                    // `task` field was executed as a delegation.
                     if tu.name != only_tool {
                         result_blocks.push(ContentBlock::ToolResult(ToolResultBlock::error(
                             &tu.id,
                             format!(
-                                "there is no tool named `{}` in this layer; the only tool \
-                                 available is `{}`",
-                                tu.name, only_tool
+                                "there is no tool named `{}` in this layer; the tools \
+                                 available are {}",
+                                tu.name, surface
                             ),
                         )));
                         continue;
@@ -489,12 +551,20 @@ impl DecisionLayer {
                 // and the layer sees state it wrote rather than state it
                 // remembers writing.
                 //
-                // (The round also ends when the ledger changes. That condition
-                // arrives with `decide` and `retire`, which are not wired in
-                // yet — see `crate::decide`.)
+                // **The ledger changing ends it immediately**, before the
+                // looping check and regardless of how productive the turn was.
+                // The layer wrote a decision or retired something, and the whole
+                // point of writing is that the next request sees it. Converse
+                // further and it decides several more things without ever seeing
+                // the state it is building — which is the failure that made L1
+                // worth having.
                 //
                 // It is never "the model stopped talking": that is `end_turn`,
                 // which ends the run, not the round.
+                if ledger_changed {
+                    tracing::debug!(round, "round ends: the ledger changed");
+                    break;
+                }
                 barren_turns = if executed == 0 { barren_turns + 1 } else { 0 };
                 if barren_turns >= MAX_BARREN_TURNS_PER_ROUND {
                     tracing::debug!(round, barren_turns, "round ends: the layer is looping");
@@ -520,6 +590,7 @@ impl DecisionLayer {
             usage,
             composition: contexts.last().copied().unwrap_or_default(),
             contexts,
+            ledger: self.ledger.clone(),
             stopped_early: Some(format!(
                 "the round ceiling of {} was reached: the layer stopped moving, it did \
                  not stop working",

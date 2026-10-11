@@ -39,6 +39,17 @@ pub struct Applied {
     /// error. A well-formed call that wrote nothing — a repeat — is not
     /// malformed; it is reported, not refused.
     pub malformed: bool,
+    /// What went on the ledger, **in the words it went on with**, for the record.
+    ///
+    /// Not the same as `text`. `text` is written for the model, which does not
+    /// need its own reasoning read back to it and is being answered in a turn it
+    /// paid for; `record` is written for L2, which has to be able to rebuild the
+    /// state. Journaling `text` loses the reason — the first version of the
+    /// wiring did exactly that, and the loss is invisible from the outcome,
+    /// because L1 in memory still had it.
+    ///
+    /// Empty when nothing was written.
+    pub record: String,
 }
 
 /// The two definitions, in a fixed order.
@@ -143,6 +154,7 @@ fn refuse(tool: &str, problem: impl std::fmt::Display) -> Applied {
         ),
         changed: false,
         malformed: true,
+        record: String::new(),
     }
 }
 
@@ -173,6 +185,7 @@ fn repeat(what: &str, verdict: &str, same_reason: bool) -> Applied {
         text,
         changed: false,
         malformed: false,
+        record: String::new(),
     }
 }
 
@@ -182,7 +195,7 @@ fn repeat(what: &str, verdict: &str, same_reason: bool) -> Applied {
 /// thing; both would render, and the view would contradict itself. The old
 /// entry leaves, and the result quotes its reason, because a removal whose
 /// reason vanishes is a silent forgetting — DESIGN: "任何遗忘都是一个显式事件".
-fn reversal(what: &str, old_why: &str, from: &str, to: &str) -> Applied {
+fn reversal(what: &str, old_why: &str, why: &str, from: &str, to: &str) -> Applied {
     Applied {
         text: format!(
             "Reversal recorded: `{what}` was on the ledger as {from} — because {old_why} \
@@ -191,10 +204,13 @@ fn reversal(what: &str, old_why: &str, from: &str, to: &str) -> Applied {
         ),
         changed: true,
         malformed: false,
+        record: format!(
+            "reversed: `{what}` was {from} (because {old_why}) and is now {to} — because {why}"
+        ),
     }
 }
 
-fn recorded(what: &str, verdict: Verdict) -> Applied {
+fn recorded(what: &str, why: &str, verdict: Verdict) -> Applied {
     let text = match verdict {
         Verdict::Accepted => format!(
             "Recorded as accepted: `{what}`. It is on the ledger from now on, so it does \
@@ -205,10 +221,15 @@ fn recorded(what: &str, verdict: Verdict) -> Applied {
              must not come back without new information."
         ),
     };
+    let word = match verdict {
+        Verdict::Accepted => "decided",
+        Verdict::Rejected => "ruled out",
+    };
     Applied {
         text,
         changed: true,
         malformed: false,
+        record: format!("{word}: `{what}` — because {why}"),
     }
 }
 
@@ -320,19 +341,21 @@ fn decide(input: &Value, ledger: &mut Ledger) -> Applied {
             }
             if let Some(index) = ledger.rejected.iter().position(|r| r.what == what) {
                 let old = ledger.rejected.remove(index);
+                let record = reversal(&old.what, &old.why, &why, "rejected", "accepted");
                 ledger.decisions.push(Decision {
                     what,
                     why,
                     at_ms: yu_observe::now_ms(),
                 });
-                return reversal(&old.what, &old.why, "rejected", "accepted");
+                return record;
             }
+            let record = recorded(&what, &why, Verdict::Accepted);
             ledger.decisions.push(Decision {
-                what: what.clone(),
+                what,
                 why,
                 at_ms: yu_observe::now_ms(),
             });
-            recorded(&what, Verdict::Accepted)
+            record
         }
         Verdict::Rejected => {
             if let Some(existing) = ledger.rejected.iter().find(|r| r.what == what) {
@@ -340,14 +363,16 @@ fn decide(input: &Value, ledger: &mut Ledger) -> Applied {
             }
             if let Some(index) = ledger.decisions.iter().position(|d| d.what == what) {
                 let old = ledger.decisions.remove(index);
+                let record = reversal(&old.what, &old.why, &why, "accepted", "rejected");
                 ledger.rejected.push(Rejected { what, why });
-                return reversal(&old.what, &old.why, "accepted", "rejected");
+                return record;
             }
+            let record = recorded(&what, &why, Verdict::Rejected);
             ledger.rejected.push(Rejected {
-                what: what.clone(),
+                what,
                 why,
             });
-            recorded(&what, Verdict::Rejected)
+            record
         }
     }
 }
@@ -396,6 +421,7 @@ fn retire(input: &Value, ledger: &mut Ledger) -> Applied {
         text,
         changed: true,
         malformed: false,
+        record: format!("retired: `{item}` — {reason}"),
     }
 }
 
