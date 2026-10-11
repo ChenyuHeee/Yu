@@ -15,7 +15,7 @@
 //! this has stopped being a bypass.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -496,20 +496,30 @@ fn report_growth(outcome: &yu_core::decision::DecisionOutcome) {
 // decide — the vertical slice
 // ---------------------------------------------------------------------------
 
-async fn cmd_decide(
-    charter_text: &str,
-    dir: &PathBuf,
-    cwd: Option<PathBuf>,
-    model: Option<String>,
-    max_rounds: u32,
-    tool_set: ToolSet,
-) -> anyhow::Result<()> {
-    let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+/// Everything a decision run needs standing up before the layer exists.
+struct DecisionBoot {
+    client: Arc<WireClient>,
+    journal: Arc<Journal>,
+    tools: Arc<ToolRegistry>,
+    timeline: Arc<Timeline>,
+    model: String,
+    session: SessionId,
+}
 
+/// Stand up the timeline, client, journal and tool surface for a decision run.
+///
+/// Extracted from `cmd_decide` so that it has a caller other than `main`. DESIGN
+/// lists `init` among the spans, and this is the only place it is emitted —
+/// process and pool start-up is exactly the per-step cost flower paid — so it
+/// needs a guard, and a guard needs a caller a test can reach.
+async fn boot_decision(
+    dir: &Path,
+    cwd: PathBuf,
+    model: Option<String>,
+    tool_set: ToolSet,
+) -> anyhow::Result<DecisionBoot> {
     let timeline = Timeline::new();
     timeline.enter(AgentId::decision());
-    // DESIGN lists `init` among the spans. It is here rather than nowhere
-    // because process start-up is exactly the cost flower paid per step.
     let init = timeline.start(SpanKind::Init);
 
     let client = Arc::new(WireClient::from_env()?.with_timeline(timeline.clone()));
@@ -523,8 +533,37 @@ async fn cmd_decide(
             .await?
             .with_timeline(timeline.clone()),
     );
-    let tools = Arc::new(build_tools(tool_set, cwd.clone()));
+    let tools = Arc::new(build_tools(tool_set, cwd));
     init.finish();
+
+    Ok(DecisionBoot {
+        client,
+        journal,
+        tools,
+        timeline,
+        model,
+        session,
+    })
+}
+
+async fn cmd_decide(
+    charter_text: &str,
+    dir: &PathBuf,
+    cwd: Option<PathBuf>,
+    model: Option<String>,
+    max_rounds: u32,
+    tool_set: ToolSet,
+) -> anyhow::Result<()> {
+    let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let DecisionBoot {
+        client,
+        journal,
+        tools,
+        timeline,
+        model,
+        session,
+    } = boot_decision(dir, cwd.clone(), model, tool_set).await?;
 
     // DESIGN: "人类原话原样存活". The charter arrives as the human typed it and is
     // kept that way; there is no summarising step between them and the decision
@@ -702,4 +741,64 @@ async fn cmd_metrics(dir: &PathBuf) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **M1: "删掉任意一种 span 的 `timeline.start(...)` → 有测试失败."**
+    ///
+    /// `init` measures process and pool start-up — the cost flower paid per step
+    /// — so it is emitted by the boot sequence and nowhere else, and it is the
+    /// one span a test that is already running cannot produce. The other eight
+    /// are guarded by `yu-core`'s scripted-endpoint run; this is the guard for
+    /// the ninth.
+    #[tokio::test]
+    async fn the_boot_sequence_records_an_init_span() {
+        // A credential and nothing else. `WireClient::from_env` builds an HTTP
+        // client with a connection pool, which is startup cost rather than a
+        // request, so nothing here reaches the network. This is the only test in
+        // this binary, which is what makes touching the process environment
+        // acceptable.
+        if std::env::var_os("ANTHROPIC_API_KEY").is_none() {
+            unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-not-a-real-key") };
+        }
+
+        let dir = std::env::temp_dir().join(format!("yu-cli-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let boot = boot_decision(&dir, dir.clone(), None, ToolSet::ReadOnly)
+            .await
+            .expect("the boot sequence");
+
+        let init = boot
+            .timeline
+            .spans()
+            .into_iter()
+            .find(|span| span.kind == SpanKind::Init)
+            .expect("the boot sequence recorded no `init` span");
+        assert_eq!(
+            init.agent,
+            AgentId::decision(),
+            "start-up belongs to the decision layer, whatever runs next"
+        );
+        // Finished rather than dropped: a span that is only recorded because its
+        // guard was dropped measures nothing, and says so in `attrs`.
+        assert!(
+            !init.attrs.contains_key("unfinished"),
+            "the span was dropped rather than finished: {:?}",
+            init.attrs
+        );
+
+        // Boot produces the layer's whole surface, not just a timeline.
+        assert_eq!(boot.session.as_str().split('-').next(), Some("decide"));
+        assert!(
+            !boot.tools.names().is_empty(),
+            "a layer with no tools cannot delegate"
+        );
+        assert!(dir.join(format!("{}.jsonl", boot.session.as_str())).is_file());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
