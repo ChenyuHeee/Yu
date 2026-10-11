@@ -38,8 +38,10 @@
 //! (an [`Anchor`]), and the new session can follow an address back to the bytes.
 //!
 //! Where it fires is [`trigger_for`]: completion first, because completion is the
-//! legitimate contraction; the growth threshold as the backstop; and the agent's
-//! own request as the third case `Trigger` names (nothing produces it yet — see
+//! legitimate contraction; the round ceiling, because a session that ran out of
+//! rounds is over and its unfinished work is what the next session is for; the
+//! growth threshold as the backstop for a stop that is neither; and the agent's
+//! own request as the case `Trigger` names last (nothing produces it yet — see
 //! [`Trigger::AgentRequested`]).
 
 use std::collections::BTreeSet;

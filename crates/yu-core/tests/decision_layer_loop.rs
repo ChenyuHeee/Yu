@@ -1936,13 +1936,18 @@ async fn a_continued_session_picks_up_its_ledger_rounds_and_numbering_from_the_r
         );
         let mut config = DecisionConfig::new(TEST_MODEL);
         config.max_rounds = 1;
+        // A constraint, so the run has L0 beyond its intent: the only thing
+        // that can carry it across the restart is the recorded seed, and a
+        // continuation that lost it would work without it.
+        let mut charter = charter();
+        charter.constraints = vec!["never touch the release branch".to_owned()];
         let mut layer = DecisionLayer::new(
             client(&first, &timeline),
             journal.clone(),
             registry(),
             timeline.clone(),
             config,
-            charter(),
+            charter,
             dir.clone(),
         );
         layer.run().await.expect("the first run completes")
@@ -2020,6 +2025,14 @@ async fn a_continued_session_picks_up_its_ledger_rounds_and_numbering_from_the_r
     assert!(
         system.contains("keep the probe's output"),
         "the recorded decision has to come back into L1: {system}"
+    );
+    // **L0 as well.** The constraint was never written into the record as
+    // prose: it lived in the charter the first run was handed, and the seed
+    // event is the only place a continuation can read it. Lose the seed and the
+    // continuation silently works without the standing condition.
+    assert!(
+        system.contains("## Constraints") && system.contains("never touch the release branch"),
+        "the constraints the session ran under have to come back with it: {system}"
     );
     assert!(
         system.contains("do not re-propose"),

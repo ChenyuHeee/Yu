@@ -162,6 +162,11 @@ fn a_killed_decide_continues_without_performing_its_effects_twice() {
             "deliver the artifact",
             "--session",
             session,
+            // A standing constraint, passed once and never again: run two is
+            // given no `--constraint`, so the only way it can still be in force
+            // is out of the record.
+            "--constraint",
+            "the artifact is the deliverable; do not overwrite it",
             "--tools",
             "full",
             "--dir",
@@ -298,6 +303,13 @@ fn a_killed_decide_continues_without_performing_its_effects_twice() {
     assert!(
         system_text(&request).contains("the artifact is written by the first command"),
         "the recorded decision has to be rebuilt into L1: {}",
+        system_text(&request)
+    );
+    // And L0: the standing constraint run one was given, which run two was
+    // *not* given again — so it can only be in the request out of the record.
+    assert!(
+        system_text(&request).contains("the artifact is the deliverable; do not overwrite it"),
+        "the constraint the session ran under has to come back with it: {}",
         system_text(&request)
     );
 

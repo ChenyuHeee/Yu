@@ -57,6 +57,10 @@ pub struct DecisionConfig {
     pub max_tokens: u32,
     pub effort: Effort,
     /// How many times the layer may re-render and reconsider.
+    ///
+    /// The session's ceiling, not the invocation's: a continuation is given
+    /// what is left of it, and the rounds it runs are numbered from where the
+    /// record left off.
     pub max_rounds: u32,
     /// Ceiling on delegations within one round, so a layer that keeps asking for
     /// more reading cannot spend without bound.
@@ -98,7 +102,11 @@ const MAX_BARREN_TURNS_PER_ROUND: u32 = 3;
 /// What the decision layer reports back to whoever invoked it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecisionOutcome {
+    /// Rounds the *session* has run, counted across its whole life: a
+    /// continuation inherits the count and continues it, so "round 5" means one
+    /// thing in the record rather than one thing per process.
     pub rounds: u32,
+    /// Delegations the session has made, counted the same way.
     pub delegations: u32,
     pub final_text: String,
     pub usage: TokenUsage,
