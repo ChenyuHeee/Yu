@@ -15,7 +15,7 @@
 //! statement of the run being driven, and every request is recorded verbatim so
 //! a test can assert what the loop actually sent.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -27,8 +27,9 @@ use serde_json::{json, Value};
 
 use yu_core::agent::{Agent, AgentConfig};
 use yu_core::decision::{DecisionConfig, DecisionLayer, DecisionOutcome, DECISION_PROMPT};
-use yu_core::delegate::decision_surface;
+use yu_core::delegate::{decision_surface, spawn_edges, SpawnEdge};
 use yu_core::render::{render, Charter, Ledger, RenderInput};
+use yu_core::topology::{TopologyKind, TopologySpec};
 use yu_journal::{EventBody, Journal, SessionId};
 use yu_observe::{AgentId, SpanKind, Timeline};
 use yu_tools::{ResultKind, Tool, ToolContext, ToolRegistry, ToolResult};
@@ -437,6 +438,19 @@ impl Drop for DecisionRun {
 }
 
 async fn decide(name: &str, endpoint: &FakeEndpoint, max_rounds: u32) -> DecisionRun {
+    decide_with(name, endpoint, max_rounds, charter()).await
+}
+
+/// The same run, on a charter the caller states.
+///
+/// M4 is about what a *declaration* does to a run, so the tests below have to be
+/// able to change one and change nothing else.
+async fn decide_with(
+    name: &str,
+    endpoint: &FakeEndpoint,
+    max_rounds: u32,
+    charter: Charter,
+) -> DecisionRun {
     let dir = scratch(name);
     let timeline = Timeline::new();
     let journal = Arc::new(
@@ -455,7 +469,7 @@ async fn decide(name: &str, endpoint: &FakeEndpoint, max_rounds: u32) -> Decisio
         registry(),
         timeline.clone(),
         config,
-        charter(),
+        charter,
         dir.clone(),
     );
     let outcome = layer.run().await.expect("the scripted run completes");
@@ -465,6 +479,19 @@ async fn decide(name: &str, endpoint: &FakeEndpoint, max_rounds: u32) -> Decisio
         timeline,
         dir,
     }
+}
+
+/// The names of the tools a request carries.
+fn tool_names(request: &Value) -> Vec<String> {
+    request["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A run that delegates once, asks for a second delegation in the same round —
@@ -579,7 +606,13 @@ async fn a_full_run_records_every_span_kind_the_timeline_declares() {
     // its view and the executor building a step's request — and a check that
     // only asked whether the kind appeared would not notice one of them going
     // away. Both layers have to be seen doing it.
-    for agent in [AgentId::decision(), AgentId::new("executor")] {
+    //
+    // The executor's name is its address now: this run's only delegation is the
+    // first agent the decision layer derived, so `executor#1`. Every executor
+    // being called `executor` was correct while only one could exist, and became
+    // a defect the moment a run could hold several — two runs under one name,
+    // and every reader of the record scoping to a name that names them all.
+    for agent in [AgentId::decision(), AgentId::new("executor#1")] {
         assert!(
             spans
                 .iter()
@@ -601,7 +634,7 @@ async fn a_full_run_records_every_span_kind_the_timeline_declares() {
         .find(|span| span.kind == SpanKind::ToolExec)
         .expect("the executor ran a tool");
     assert_eq!(tool_exec.label.as_deref(), Some("probe"));
-    assert_eq!(tool_exec.agent, AgentId::new("executor"));
+    assert_eq!(tool_exec.agent, AgentId::new("executor#1"));
     let reduce = spans
         .iter()
         .find(|span| span.kind == SpanKind::Reduce)
@@ -1347,5 +1380,463 @@ async fn eight_rounds_that_decide_nothing_do_not_grow_the_view() {
             context.tool_definition_chars, first.tool_definition_chars,
             "the tool definitions are charged once per request, not once per round"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M4 — the executor is given its conditions, and the declaration governs the run
+// ---------------------------------------------------------------------------
+
+/// A constraint the tests below put in the charter.
+const STANDING_RULE: &str = "never touch the release branch";
+
+/// A run whose executor only reports: one delegation, and a decision.
+fn one_delegation(task: &str) -> Vec<Reply> {
+    vec![
+        Reply::Json(tool_use_reply(
+            "msg-d1",
+            "hand the work over",
+            "call-d1",
+            "delegate",
+            json!({ "task": task }),
+        )),
+        Reply::Json(text_reply("msg-x1", "REPORT: done")),
+        Reply::Json(text_reply("msg-d2", "decided")),
+    ]
+}
+
+/// **M4: "把 constraints 从 charter 里删掉,执行者的行为会变 —— 证明它真的被注入."**
+///
+/// What this proves, and what it does not. It does not prove that a real model
+/// *obeys* a constraint: no scripted endpoint can, and a claim about model
+/// compliance is not something a deterministic test can make. What it proves is
+/// the mechanism DESIGN's third derived principle rests on — "约束靠注入,不靠记忆":
+/// the standing conditions of the run reach the **executor**, in its system
+/// block, because the harness puts them there; and removing them from the
+/// charter removes them from the request.
+///
+/// The second half is what makes the first half mean anything. Without it, an
+/// executor that happened not to violate a constraint looks identical to one
+/// that was never told about it — which is precisely the difference between
+/// injection and luck.
+///
+/// The constraint must *not* arrive in the per-delegation text either. A task is
+/// per-delegation and a constraint is a standing condition, so a standing
+/// condition carried in the task text is dropped on the delegation where nobody
+/// restated it — and nothing in the record would show the loss.
+#[tokio::test]
+async fn the_charters_constraints_are_injected_into_the_executors_system_block() {
+    async fn run_with(name: &str, constraints: Vec<String>) -> FakeEndpoint {
+        let endpoint = FakeEndpoint::start(one_delegation("run the probe"));
+        let mut charter = charter();
+        charter.constraints = constraints;
+        let run = decide_with(name, &endpoint, 4, charter).await;
+        assert_eq!(run.outcome.delegations, 1, "one delegation ran");
+        endpoint
+    }
+
+    let given = run_with("constraints-present", vec![STANDING_RULE.to_owned()]).await;
+    let absent = run_with("constraints-absent", Vec::new()).await;
+
+    let asked = given.to_an_executor();
+    assert_eq!(asked.len(), 1);
+    assert!(
+        system_text(&asked[0]).contains(STANDING_RULE),
+        "the executor was not given the constraint the charter states, so it could only \
+         have obeyed it by luck: {}",
+        system_text(&asked[0])
+    );
+    assert!(
+        !message_texts(&asked[0])
+            .iter()
+            .any(|text| text.contains(STANDING_RULE)),
+        "a standing condition in the per-delegation text is dropped the round nobody \
+         restates it, which is the failure this injects to prevent: {:?}",
+        message_texts(&asked[0])
+    );
+
+    let unconstrained = absent.to_an_executor();
+    assert_eq!(unconstrained.len(), 1);
+    assert!(
+        !system_text(&unconstrained[0]).contains(STANDING_RULE),
+        "removing the constraint from the charter has to remove it from the request, or \
+         the first assertion above proves nothing"
+    );
+    assert_eq!(given.beyond_the_script(), 0);
+    assert_eq!(absent.beyond_the_script(), 0);
+}
+
+/// **M4: "改一条拓扑声明,运行行为跟着变(不是只有渲染变)."**
+///
+/// The declaration is the only difference between the two runs below: same task,
+/// same items, same script shape. `width = 2` runs two executors and `width = 4`
+/// runs four, and the count is read off the endpoint — a request the model
+/// answered — rather than off the rendered view. That is the difference between
+/// a strategy and a comment.
+///
+/// Each derived agent is also given the conditions, which is the other half of
+/// "每一层每一轮被给予约束": if injection stopped at the first level, a fan-out
+/// would be a way to get work done outside the constraints.
+#[tokio::test]
+async fn the_declared_width_decides_how_many_executors_run() {
+    const ITEMS: [&str; 4] = [
+        "read module a",
+        "read module b",
+        "read module c",
+        "read module d",
+    ];
+
+    async fn fan_out(name: &str, width: &str) -> FakeEndpoint {
+        let mut script = vec![Reply::Json(tool_use_reply(
+            "msg-d1",
+            "read them in parallel",
+            "call-d1",
+            "delegate",
+            json!({"task": "read every module", "items": ITEMS}),
+        ))];
+        for (index, item) in ITEMS.iter().enumerate().take(width.parse().unwrap()) {
+            script.push(Reply::Json(text_reply(
+                &format!("msg-x{index}"),
+                &format!("REPORT: {item} read"),
+            )));
+        }
+        script.push(Reply::Json(text_reply("msg-d2", "decided")));
+
+        let endpoint = FakeEndpoint::start(script);
+        let mut charter = charter();
+        charter.constraints = vec![STANDING_RULE.to_owned()];
+        charter.topology = Some(TopologySpec::new(TopologyKind::FanOut).param("width", width));
+        let run = decide_with(name, &endpoint, 4, charter).await;
+        assert_eq!(
+            run.outcome.delegations, 1,
+            "a fan-out is one delegation, however many agents it derives"
+        );
+        endpoint
+    }
+
+    let two = fan_out("width-2", "2").await;
+    let four = fan_out("width-4", "4").await;
+
+    assert_eq!(
+        two.to_an_executor().len(),
+        2,
+        "the declaration said two, so two agents ran"
+    );
+    assert_eq!(
+        four.to_an_executor().len(),
+        4,
+        "the declaration said four and one executor ran — the shape did not reach the run"
+    );
+    assert_eq!(two.beyond_the_script(), 0);
+    assert_eq!(four.beyond_the_script(), 0);
+
+    // Which items ran, and under what conditions: a fan-out that derived the
+    // right number of agents with the wrong tasks would satisfy a count.
+    let requests = four.to_an_executor();
+    for (index, request) in requests.iter().enumerate() {
+        let carried = message_texts(request).join("\n");
+        assert!(
+            carried.contains(ITEMS[index]),
+            "derived agent {} was not given its item: {carried}",
+            index + 1
+        );
+        assert!(
+            system_text(request).contains(STANDING_RULE),
+            "derived agent {} was not given the run's constraints, so injection stops at \
+             the first level: {}",
+            index + 1,
+            system_text(request)
+        );
+    }
+
+    // And all four reports come back. A parent that reduced only the last child
+    // would satisfy every count above while losing three quarters of the work —
+    // the failure the whole "parent reduces" half of the shape exists to avoid.
+    let back = four
+        .to_the_decision_layer()
+        .last()
+        .cloned()
+        .expect("the decision layer was answered");
+    let carried = message_texts(&back).join("\n");
+    assert!(
+        carried.contains("DELEGATION DERIVED 4 AGENTS"),
+        "the reports did not come back as a derivation: {carried}"
+    );
+    for item in ITEMS {
+        assert!(
+            carried.contains(item),
+            "`{item}` was read by nobody the decision layer can see: {carried}"
+        );
+    }
+}
+
+/// **M4: "追踪一次运行,能画出一棵深度 ≥ 3 的树."**
+///
+/// One run — the decision layer delegating once, and executors deriving executors
+/// below that — leaves a record from which the tree can be drawn, edge by edge.
+/// The edges come from the typed `delegated` events rather than from task text or
+/// timestamps, so "血缘记录完整" is checkable: every node that ran has exactly one
+/// parent, and the tree is as deep as the run went.
+///
+/// The script is the shape: each reply belongs to the agent at that level, in the
+/// order the depth-first walk reaches it.
+#[tokio::test]
+async fn one_run_leaves_a_tree_three_delegations_deep() {
+    let endpoint = FakeEndpoint::start(vec![
+        // decision → executor#1
+        Reply::Json(tool_use_reply(
+            "msg-d1",
+            "hand the whole thing over",
+            "call-d1",
+            "delegate",
+            json!({"task": "split the work"}),
+        )),
+        // executor#1 → executor#1.1
+        Reply::Json(tool_use_reply(
+            "msg-e1",
+            "more than one job here",
+            "call-e1",
+            "delegate",
+            json!({"task": "split it once more"}),
+        )),
+        // executor#1.1 → executor#1.1.1, which is deep enough to just work
+        Reply::Json(tool_use_reply(
+            "msg-e2",
+            "one piece left to hand out",
+            "call-e2",
+            "delegate",
+            json!({"task": "do the last piece"}),
+        )),
+        Reply::Json(text_reply("msg-e3", "REPORT: the piece is done")),
+        Reply::Json(text_reply("msg-e4", "REPORT: the split is done")),
+        Reply::Json(text_reply("msg-e5", "REPORT: the work is done")),
+        Reply::Json(text_reply("msg-d2", "decided: the work is done")),
+    ]);
+    let mut charter = charter();
+    charter.constraints = vec![STANDING_RULE.to_owned()];
+    let run = decide_with("tree", &endpoint, 4, charter).await;
+
+    assert_eq!(
+        endpoint.beyond_the_script(),
+        0,
+        "the run asked for more replies than the shape has"
+    );
+
+    // Draw the tree the record describes.
+    let edges = spawn_edges(&run.journal.events().await.expect("reading the journal"));
+    let tree = children_of(&edges);
+    let depth = depth_from(&tree, "decision");
+    assert!(
+        depth >= 3,
+        "the record draws a tree {depth} level(s) deep, not the three the run walked: {edges:#?}"
+    );
+    assert_eq!(
+        endpoint.to_an_executor().len(),
+        5,
+        "three executors: the two that derived took a step to derive and one to answer, \
+         and the deepest answered on its first"
+    );
+
+    assert_eq!(
+        depth_from(&tree, "decision#wrong"),
+        0,
+        "a node that never ran has no subtree, or the drawing is inventing one"
+    );
+    let roots = edges
+        .iter()
+        .filter(|edge| edge.parent == AgentId::decision())
+        .count();
+    assert_eq!(roots, 1, "one delegation was made at the top: {edges:#?}");
+    let mut seen = BTreeSet::new();
+    for edge in &edges {
+        assert!(
+            seen.insert(edge.child.as_str().to_owned()),
+            "`{}` has two parents, so this is not a tree: {edges:#?}",
+            edge.child
+        );
+    }
+    assert!(
+        tree.contains_key("executor#1"),
+        "the middle node is an executor that derived in its own run: {edges:#?}"
+    );
+    assert_eq!(
+        edges.iter().map(|edge| edge.depth).collect::<Vec<_>>(),
+        vec![1, 2, 3],
+        "each edge records the level it belongs to"
+    );
+
+    // The deepest agent is still given the run's conditions: the chain of
+    // injection does not stop at the level the decision layer can see.
+    let deepest = endpoint
+        .to_an_executor()
+        .into_iter()
+        .find(|request| {
+            message_texts(request)
+                .iter()
+                .any(|text| text.contains("do the last piece"))
+        })
+        .expect("the deepest agent was asked to do the last piece");
+    assert!(
+        system_text(&deepest).contains(STANDING_RULE),
+        "the constraint did not survive two levels of derivation: {}",
+        system_text(&deepest)
+    );
+}
+
+/// **M4: "一个子 agent 能在自己的运行里再派 agent", and what stops it.**
+///
+/// The bound is [`yu_core::delegate::MAX_DELEGATION_DEPTH`]: the decision layer's
+/// delegations are depth 1, and a run at the ceiling is not offered `delegate` at
+/// all. A call to the name anyway is answered with the reason — an agent that
+/// cannot derive should be told which wall it hit, not handed "no such tool",
+/// because the two call for different next moves.
+///
+/// The count is the guard on the bound: three edges and six executor requests,
+/// where an unbounded tree would have taken a fourth level and a seventh.
+#[tokio::test]
+async fn the_depth_ceiling_refuses_a_fourth_level_rather_than_running_it() {
+    /// One agent's run: it derives, the derived run happens inside that step,
+    /// and it answers once the report comes back. Nested, because that is the
+    /// order the requests arrive in.
+    fn node(index: usize, task: &str, inside: Vec<Reply>) -> Vec<Reply> {
+        let mut out = vec![Reply::Json(tool_use_reply(
+            &format!("msg-e{index}"),
+            "this is more than one job",
+            &format!("call-e{index}"),
+            "delegate",
+            json!({ "task": task }),
+        ))];
+        out.extend(inside);
+        out.push(Reply::Json(text_reply(
+            &format!("msg-f{index}"),
+            "REPORT: done here",
+        )));
+        out
+    }
+
+    // The agent at the ceiling asks anyway. This is the call under test.
+    let at_the_ceiling = vec![
+        Reply::Json(tool_use_reply(
+            "msg-e3",
+            "hand off the last piece",
+            "call-e3",
+            "delegate",
+            json!({"task": "the fourth level"}),
+        )),
+        Reply::Json(text_reply("msg-f3", "REPORT: I did it here")),
+    ];
+    let mut script = vec![Reply::Json(tool_use_reply(
+        "msg-d1",
+        "hand it over",
+        "call-d1",
+        "delegate",
+        json!({"task": "the first level"}),
+    ))];
+    script.extend(node(
+        1,
+        "the second level",
+        node(2, "the third level", at_the_ceiling),
+    ));
+    script.push(Reply::Json(text_reply("msg-d2", "decided")));
+
+    let endpoint = FakeEndpoint::start(script);
+    // This test reads the **record**, not the run's return value. With the
+    // ceiling gone a fourth level starts and asks for replies this script does
+    // not have, so the run would end in an endpoint error — a failure, but one
+    // that names the endpoint rather than the defect. The tree is the assertion.
+    let dir = scratch("depth-ceiling");
+    let timeline = Timeline::new();
+    let journal = Arc::new(
+        Journal::open(&dir, SessionId::new("depth-ceiling"))
+            .await
+            .expect("opening the journal"),
+    );
+    let mut layer = DecisionLayer::new(
+        client(&endpoint, &timeline),
+        journal.clone(),
+        registry(),
+        timeline.clone(),
+        DecisionConfig::new(TEST_MODEL),
+        charter(),
+        dir.clone(),
+    );
+    let _ = layer.run().await;
+
+    let edges = spawn_edges(&journal.events().await.expect("reading the journal"));
+    assert_eq!(
+        edges.len(),
+        3,
+        "a fourth level ran despite the ceiling: {edges:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(edges.last().map(|edge| edge.depth), Some(3));
+    assert_eq!(
+        endpoint.to_an_executor().len(),
+        6,
+        "three agents, two steps each: the one at the ceiling answered rather than derived"
+    );
+
+    let asked = endpoint
+        .to_an_executor()
+        .into_iter()
+        .find(|request| {
+            message_texts(request)
+                .iter()
+                .any(|text| text.contains("there is no `delegate` here"))
+        })
+        .expect("the refusal has to reach the agent that asked");
+    let refusal = message_texts(&asked)
+        .into_iter()
+        .find(|text| text.contains("there is no `delegate` here"))
+        .expect("found by the filter above");
+    assert!(
+        refusal.contains(&format!("{} levels", yu_core::delegate::MAX_DELEGATION_DEPTH)),
+        "the refusal has to name the bound it hit: {refusal}"
+    );
+
+    // And the surface does not offer what it will refuse: the agent at the
+    // ceiling is not handed a `delegate` tool, so a model is not invited to
+    // spend a step on a call that cannot run.
+    let tools = tool_names(&asked);
+    assert!(
+        !tools.contains(&"delegate".to_owned()),
+        "an agent at the ceiling is still offered `delegate`: {tools:?}"
+    );
+    let shallower = endpoint
+        .to_an_executor()
+        .into_iter()
+        .find(|request| {
+            message_texts(request)
+                .iter()
+                .any(|text| text.contains("the second level"))
+        })
+        .expect("the second-level agent ran");
+    assert!(
+        tool_names(&shallower).contains(&"delegate".to_owned()),
+        "an agent with depth left is offered the tool it may use: {:?}",
+        tool_names(&shallower)
+    );
+}
+
+/// The children of each node, from the recorded edges.
+fn children_of(edges: &[SpawnEdge]) -> BTreeMap<String, Vec<String>> {
+    let mut tree: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for edge in edges {
+        tree.entry(edge.parent.as_str().to_owned())
+            .or_default()
+            .push(edge.child.as_str().to_owned());
+    }
+    tree
+}
+
+/// How many edges there are from `node` down to the deepest leaf below it.
+fn depth_from(tree: &BTreeMap<String, Vec<String>>, node: &str) -> usize {
+    match tree.get(node) {
+        None => 0,
+        Some(children) => children
+            .iter()
+            .map(|child| 1 + depth_from(tree, child))
+            .max()
+            .unwrap_or(0),
     }
 }

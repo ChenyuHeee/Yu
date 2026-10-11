@@ -552,6 +552,66 @@ fn report_ledger(ledger: &yu_core::render::Ledger) {
     }
 }
 
+/// Print the delegation tree the run left in the record.
+///
+/// Read back out of L2 rather than out of anything the run held in memory, for
+/// the same reason every other reader of the record is: the tree is a fact about
+/// the run, and a fact that lived only in the process that produced it is one no
+/// later reader can check. DESIGN's claim — "每一个 agent 都可以再派生 agent" — is
+/// a claim about the shape a run actually took, and this is where that shape
+/// becomes visible instead of asserted.
+async fn report_agents(journal: &yu_journal::Journal) {
+    let Ok(events) = journal.events().await else {
+        return;
+    };
+    let edges = yu_core::delegate::spawn_edges(&events);
+    if edges.is_empty() {
+        return;
+    }
+    let mut children: std::collections::BTreeMap<String, Vec<(String, String)>> =
+        std::collections::BTreeMap::new();
+    let mut parents: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut derived: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for edge in &edges {
+        let parent = edge.parent.as_str().to_owned();
+        children
+            .entry(parent.clone())
+            .or_default()
+            .push((edge.child.as_str().to_owned(), edge.task.clone()));
+        parents.insert(parent);
+        derived.insert(edge.child.as_str().to_owned());
+    }
+
+    eprintln!("\n--- agents: {} derived", edges.len());
+    // Whoever derives and is never derived is a root. Naming the root rather
+    // than assuming the decision layer means a tree read back from a forked or
+    // resumed record still prints.
+    for root in parents.difference(&derived) {
+        eprintln!("      {root}");
+        print_subtree(&children, root, 1);
+    }
+}
+
+fn print_subtree(
+    children: &std::collections::BTreeMap<String, Vec<(String, String)>>,
+    node: &str,
+    depth: usize,
+) {
+    let Some(kids) = children.get(node) else {
+        return;
+    };
+    for (child, task) in kids {
+        // The task, cut to one line: this is a shape report, and the tasks
+        // themselves are in the record at full length.
+        let mut label: String = task.chars().take(60).collect();
+        if label.chars().count() < task.chars().count() {
+            label.push('…');
+        }
+        eprintln!("      {}└ {child} — {label}", "  ".repeat(depth));
+        print_subtree(children, child, depth + 1);
+    }
+}
+
 /// Print how the decision layer's context moved over the run.
 ///
 /// DESIGN says the view is bounded — "大小有界、前缀字节稳定、永不退化". That is a
@@ -670,7 +730,9 @@ async fn cmd_decide(
     // the one thing the decision layer is forbidden to invent.
     let mut layer = DecisionLayer::new(
         client,
-        journal,
+        // Cloned rather than moved: the record outlives the layer that wrote it,
+        // and the tree this run left is read back out of it below.
+        journal.clone(),
         tools,
         timeline.clone(),
         config,
@@ -728,6 +790,7 @@ async fn cmd_decide(
     );
 
     report_landings(&outcome);
+    report_agents(&journal).await;
     report_ledger(&outcome.ledger);
     // The comparison the whole design rests on, from one run.
     report_ratio("decision layer", &outcome.composition);

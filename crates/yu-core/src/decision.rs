@@ -35,10 +35,11 @@ use yu_wire::types::{
 
 use crate::agent::LoopError;
 use crate::decide;
-use crate::delegate::{self, DelegateArgs, DelegateOutcome};
+use crate::delegate::{self, DelegateArgs, DelegateOutcome, Standing};
 use crate::render::{
     render, Charter, CompositionMeter, Ledger, NotLoadedEntry, RenderInput, View,
 };
+use crate::topology::ExecutorRunner;
 
 /// DESIGN: "`output_config.effort`: … 决策层 `xhigh`,执行层降档".
 pub const DECISION_EFFORT: Effort = Effort::Xhigh;
@@ -243,6 +244,12 @@ pub struct DecisionLayer {
     /// writing slots. Empty means none were declared, and then `delegate` is
     /// offered without the field at all rather than with a blank one.
     outcome_sets: crate::outcomes::OutcomeSets,
+    /// How many agents this layer has derived, across every round.
+    ///
+    /// Carried so that each derived agent has its own address in the record.
+    /// Two delegations that both numbered from one would put two runs under one
+    /// name, and the record is the only thing that says which of them ran.
+    derived: u32,
 }
 
 impl DecisionLayer {
@@ -265,6 +272,7 @@ impl DecisionLayer {
             ledger: Ledger::default(),
             cwd,
             outcome_sets: crate::outcomes::OutcomeSets::default(),
+            derived: 0,
         }
     }
 
@@ -291,6 +299,14 @@ impl DecisionLayer {
         let mut usage = TokenUsage::default();
         let mut contexts: Vec<ContextComposition> = Vec::new();
         let mut all_outcomes: Vec<DelegateOutcome> = Vec::new();
+        // What the most recent delegation derived, and what it rendered to.
+        //
+        // Kept apart from `all_outcomes` because a fan-out is *one* delegation
+        // that derived several agents, and the view's "this round" section and
+        // its shape signals are about the delegation in front of the layer —
+        // not about one of its children.
+        let mut latest: Vec<DelegateOutcome> = Vec::new();
+        let mut last_report: Option<String> = None;
         let mut delegations = 0u32;
         // The last thing the layer said. A run that exhausts its rounds still
         // produced one, and discarding it would leave the caller an error with
@@ -330,8 +346,7 @@ impl DecisionLayer {
             // ---- render, fresh. This is the whole point: the view is built from
             // L0 + L1 + this round's inputs, never appended to a running history.
             let assemble = self.timeline.start(SpanKind::Assemble);
-            let report = all_outcomes.last().map(DelegateOutcome::render);
-            let view = self.build_view(report.as_deref(), &all_outcomes);
+            let view = self.build_view(last_report.as_deref(), &all_outcomes, &latest);
             let (system, tools, mut messages) =
                 (view.system.clone(), view.tools.clone(), view.messages.clone());
             assemble.finish();
@@ -661,36 +676,69 @@ impl DecisionLayer {
                     round_delegations += 1;
                     delegations += 1;
 
-                    let outcome = delegate::run_delegation(
-                        &args,
+                    // **The conditions, injected here.** The layer was given them
+                    // in L0 this round; the executor is given them because they
+                    // are put on the delegation, not because the layer
+                    // remembered to restate them. Removing them from the charter
+                    // therefore removes them from every request the run makes,
+                    // which is the difference between a constraint and a
+                    // convention.
+                    args.standing = Standing {
+                        constraints: self.charter.constraints.clone(),
+                        topology: self.charter.topology.clone(),
+                    };
+                    args.depth = 1;
+
+                    // **The declared shape governs the derivation.** DESIGN:
+                    // "拓扑是可声明的策略,不是硬编码结构" — and a declaration that
+                    // only changes what a view says is not a strategy. The runner
+                    // carries the conditions down; the plan decides how many
+                    // executors there are and what each is asked.
+                    let runner = ExecutorRunner::new(
                         self.client.clone(),
                         self.journal.clone(),
                         self.tools.clone(),
                         self.timeline.clone(),
                         self.cwd.clone(),
+                        self.config.id.clone(),
+                        args.standing.clone(),
                     )
-                    .await?;
+                    // The layer's own delegations are the first level: what it
+                    // derives runs at depth 1, and may derive down to the ceiling.
+                    .at(1)
+                    .landing_in(args.outcomes.clone())
+                    .starting_at(self.derived);
+                    let outcomes = delegate::run_derivation(&args, &runner).await?;
+                    self.derived += outcomes.len() as u32;
 
-                    let rendered = outcome.render();
+                    let rendered = delegate::render_derivation(&outcomes);
                     self.journal
                         .append(
                             self.config.id.clone(),
                             EventBody::Note {
                                 text: format!(
-                                    "delegation {}: {} step(s), {} evidence block(s), {} bytes \
-                                     returned to the decision layer",
-                                    delegations,
-                                    outcome.steps,
-                                    outcome.evidence.len(),
+                                    "delegation {delegations}: {} agent(s), {} step(s) each, \
+                                     {} bytes returned to the decision layer",
+                                    outcomes.len(),
+                                    outcomes
+                                        .iter()
+                                        .map(|outcome| outcome.steps)
+                                        .sum::<u32>(),
                                     rendered.len()
                                 ),
                             },
                         )
                         .await?;
                     result_blocks.push(ContentBlock::ToolResult(ToolResultBlock::text(
-                        &tu.id, rendered,
+                        &tu.id,
+                        rendered.clone(),
                     )));
-                    all_outcomes.push(outcome);
+                    // Every derived agent's outcome is kept: the tally counts
+                    // landings, and the manifest has to be able to address what
+                    // the view does not carry.
+                    latest = outcomes.clone();
+                    all_outcomes.extend(outcomes);
+                    last_report = Some(rendered);
                     executed += 1;
                 }
 
@@ -780,8 +828,13 @@ impl DecisionLayer {
         })
     }
 
-    fn build_view(&self, report: Option<&str>, outcomes: &[DelegateOutcome]) -> View {
-        let (shape, omitted) = carry_for_this_round(outcomes);
+    fn build_view(
+        &self,
+        report: Option<&str>,
+        outcomes: &[DelegateOutcome],
+        latest: &[DelegateOutcome],
+    ) -> View {
+        let (shape, omitted) = carry_for_this_round(outcomes, latest);
         render(RenderInput {
             prompt: DECISION_PROMPT,
             charter: &self.charter,
@@ -815,12 +868,22 @@ impl DecisionLayer {
 /// which is the one structure whose job is to say what is not in front of you
 /// and how to reach it — and `spot_check` is the door that follows an address
 /// when the layer decides the bytes are worth their cost.
+///
+/// **`latest` is a delegation, not an agent.** A fan-out is one call that
+/// derived several agents, so the shape signals and the omissions of *all* of
+/// them are this round's — taking only the last one's would drop the other three
+/// children's records out of the manifest silently, which is the one thing a
+/// manifest may not do.
 fn carry_for_this_round(
     outcomes: &[DelegateOutcome],
+    latest: &[DelegateOutcome],
 ) -> (Vec<ShapeSignal>, Vec<NotLoadedEntry>) {
-    let latest = outcomes.last();
-    let shape = latest.map(|o| o.shape.clone()).unwrap_or_default();
-    let mut omitted = latest.map(|o| o.omitted.clone()).unwrap_or_default();
+    let mut shape = Vec::new();
+    let mut omitted = Vec::new();
+    for outcome in latest {
+        shape.extend(outcome.shape.clone());
+        omitted.extend(outcome.omitted.clone());
+    }
 
     for (index, outcome) in outcomes.iter().enumerate() {
         for e in &outcome.evidence {
@@ -888,7 +951,7 @@ mod round_material_tests {
     #[test]
     fn no_evidence_reaches_the_view_and_all_of_it_is_addressed() {
         let outcomes: Vec<_> = (0..10).map(|i| outcome_with(i, 500)).collect();
-        let (shape, omitted) = carry_for_this_round(&outcomes);
+        let (shape, omitted) = carry_for_this_round(&outcomes, &outcomes);
         let _ = shape;
 
         for index in 0..10 {
@@ -920,9 +983,9 @@ mod round_material_tests {
     /// size must produce ten address lines and not ten payloads.
     #[test]
     fn the_manifest_grows_by_addresses_not_by_payloads() {
-        let one = carry_for_this_round(&[outcome_with(0, 100_000)]);
+        let one = carry_for_this_round(&[outcome_with(0, 100_000)], &[outcome_with(0, 100_000)]);
         let ten: Vec<_> = (0..10).map(|i| outcome_with(i, 100_000)).collect();
-        let many = carry_for_this_round(&ten);
+        let many = carry_for_this_round(&ten, &ten);
 
         let lines = |(_, omitted): &(Vec<ShapeSignal>, Vec<NotLoadedEntry>)| omitted.len();
         assert!(lines(&one) < lines(&many), "each delegation is accounted for once");
@@ -940,7 +1003,7 @@ mod round_material_tests {
     fn evidence_with_nowhere_to_point_says_so_rather_than_inventing_an_address() {
         let mut old = outcome_with(0, 10);
         old.evidence[0].address = None;
-        let (_, omitted) = carry_for_this_round(&[old]);
+        let (_, omitted) = carry_for_this_round(&[old.clone()], &[old]);
         let entry = omitted
             .iter()
             .find(|e| e.what.contains("cmd 0"))
@@ -960,7 +1023,7 @@ mod round_material_tests {
         // loading at all.
         let mut failing = outcome_with(0, 10);
         failing.evidence[0].exit_code = Some(3);
-        let (_, omitted) = carry_for_this_round(&[failing]);
+        let (_, omitted) = carry_for_this_round(&[failing.clone()], &[failing]);
         assert!(
             omitted.iter().any(|e| e.what.contains("exit 3")),
             "a failing command has to be visible as one in the manifest: {:#?}",
@@ -970,7 +1033,7 @@ mod round_material_tests {
 
     #[test]
     fn a_run_with_no_delegations_carries_nothing() {
-        let (shape, omitted) = carry_for_this_round(&[]);
+        let (shape, omitted) = carry_for_this_round(&[], &[]);
         assert!(shape.is_empty() && omitted.is_empty());
     }
 }

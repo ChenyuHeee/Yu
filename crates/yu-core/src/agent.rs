@@ -79,6 +79,50 @@ pub struct AgentConfig {
     /// here rather than in the registry because its slot list is the delegation's
     /// and changes per call, while a registry is built once and shared.
     pub extra_tools: Vec<ToolDefinition>,
+    /// Whether this agent may derive, and what a child of it is given.
+    ///
+    /// DESIGN puts no fixed two-level hierarchy — "每一个 agent 都可以再派生
+    /// agent" — so this is a property of the run, not of the role.
+    pub deriving: Deriving,
+}
+
+/// Whether an agent may derive, and why not when it may not.
+///
+/// Three states rather than a boolean, because the two ways of not deriving call
+/// for different answers: an agent the surface never offered `delegate` to, and
+/// an agent that has run out of depth. Flattening them would make one of the two
+/// refusals invent a reason it does not have.
+#[derive(Debug, Clone, Default)]
+pub enum Deriving {
+    /// Not part of this run at all.
+    #[default]
+    No,
+    /// May derive, under the conditions given.
+    Allowed(Spawn),
+    /// At the depth ceiling: no children, and a call to the name is answered
+    /// with that reason rather than with "no such tool".
+    AtDepthCeiling,
+}
+
+/// What an agent hands down when it derives.
+///
+/// Everything here is *injected into the child*, never remembered by it —
+/// DESIGN's derived principle 3 applied to the one place it is easiest to get
+/// wrong: an executor that could derive would otherwise have to restate the
+/// constraints itself, and the delegation where it forgot would look like every
+/// other delegation.
+#[derive(Debug, Clone)]
+pub struct Spawn {
+    /// The conditions the child is given: the constraints this agent was given,
+    /// and the declared shape of the work.
+    pub standing: crate::delegate::Standing,
+    /// The pre-registered set this whole call was launched with. A derived run
+    /// is part of the same call, so it classifies into the same set.
+    pub outcomes: Option<crate::landing::PlannedOutcomes>,
+    /// This agent's own address in the lineage, which its children extend.
+    pub path: String,
+    /// How deep this agent sits. A child runs one deeper.
+    pub depth: u32,
 }
 
 impl AgentConfig {
@@ -94,12 +138,31 @@ impl AgentConfig {
             system: vec![SystemBlock::text(EXECUTOR_PROMPT)],
             max_steps: 40,
             extra_tools: Vec::new(),
+            deriving: Deriving::No,
         }
     }
 
     /// Add a tool that is answered rather than executed.
     pub fn extra_tool(mut self, tool: ToolDefinition) -> Self {
         self.extra_tools.push(tool);
+        self
+    }
+
+    /// Add a block the agent is *given*: a standing condition of the run rather
+    /// than a part of any task.
+    ///
+    /// Appended rather than replacing, so the agent's own prompt keeps the front
+    /// of the prefix — the most cacheable bytes there are — and the standing
+    /// conditions sit after it, where they are byte-stable across delegations in
+    /// a way the per-task text can never be.
+    pub fn standing(mut self, block: SystemBlock) -> Self {
+        self.system.push(block);
+        self
+    }
+
+    /// Set whether this agent derives, and under what conditions.
+    pub fn deriving(mut self, deriving: Deriving) -> Self {
+        self.deriving = deriving;
         self
     }
 
@@ -188,6 +251,14 @@ impl LoopStop {
 
 #[derive(Debug, Clone)]
 pub struct LoopOutcome {
+    /// Which agent ran this, by its own statement.
+    ///
+    /// Carried because a record holds a whole tree of runs and every reader of
+    /// an outcome has to be able to say which run it is: the evidence in
+    /// `crate::delegate` is recovered from the journal by agent, and a reader
+    /// that scoped by "executor" — which is what every executor used to be
+    /// called — would hand a parent its children's evidence as its own.
+    pub agent: AgentId,
     pub steps: u32,
     pub text: String,
     /// The model's last `stop_reason`, as a disposition. For a run that ends on
@@ -252,6 +323,13 @@ pub struct Agent {
     config: AgentConfig,
     messages: Vec<Message>,
     shape: ShapeTracker,
+    /// How many agents this one has derived so far.
+    ///
+    /// It exists so that a derived agent's address is unique among its
+    /// siblings: two delegations from the same parent both numbering from one
+    /// would put two different runs under one name in the record, and a parent
+    /// recovering its evidence by name would then read a sibling's as its own.
+    derived: std::sync::atomic::AtomicU32,
 }
 
 impl Agent {
@@ -273,6 +351,7 @@ impl Agent {
             config,
             messages: Vec::new(),
             shape: ShapeTracker::new(),
+            derived: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -444,6 +523,7 @@ impl Agent {
                     // layer that ever serves server tools is the one case that
                     // makes `Resume` legitimate again, and it makes it for both.
                     return Ok(LoopOutcome {
+                        agent: self.config.id.clone(),
                         steps: step,
                         text: sink.text.clone(),
                         stop: disposition,
@@ -457,6 +537,7 @@ impl Agent {
                 }
                 StopDisposition::Complete => {
                     return Ok(LoopOutcome {
+                        agent: self.config.id.clone(),
                         steps: step,
                         text: sink.text.clone(),
                         stop: disposition,
@@ -504,6 +585,7 @@ impl Agent {
             )
         });
         Ok(LoopOutcome {
+            agent: self.config.id.clone(),
             steps,
             text,
             stop,
@@ -546,6 +628,13 @@ impl Agent {
             req = req.system(self.config.system.clone());
         }
         let mut definitions = self.tools.definitions();
+        // The deriving tool is offered exactly when this agent may derive. A
+        // surface that offered it at the ceiling would be advertising something
+        // the harness refuses every time, and one that offered it to an agent
+        // that cannot derive at all would be advertising a role it does not have.
+        if matches!(self.config.deriving, Deriving::Allowed(_)) {
+            definitions.push(crate::delegate::executor_delegate_tool());
+        }
         // After the registry's, so the registered surface keeps its order and
         // the prefix stays byte-stable as extra tools come and go.
         definitions.extend(self.config.extra_tools.iter().cloned());
@@ -632,7 +721,13 @@ impl Agent {
         // the harness will check the evidence against, so a landing that never
         // reached the journal would make the check silently vacuous.
         for (index, tu) in uses.iter().enumerate() {
-            if self.config.extra_tools.iter().any(|t| t.name() == tu.name) {
+            // Deriving first, because it is answered by *running* something: it
+            // is the one tool that cannot be a `Tool` — a `Tool` executes in a
+            // blocking task and this has to await a whole model loop — so the
+            // harness answers it here or not at all.
+            if tu.name == crate::delegate::DELEGATE {
+                slots[index] = Some(self.answer_delegation(tu).await?);
+            } else if self.config.extra_tools.iter().any(|t| t.name() == tu.name) {
                 slots[index] = Some(self.answer_in_place(tu, pressure).await?);
             }
         }
@@ -658,11 +753,12 @@ impl Agent {
             let ctx = self.ctx.clone();
             let journal = self.journal.clone();
             let timeline = self.timeline.clone();
+            let agent = self.config.id.clone();
             handles.push((
                 index,
                 spawn_abortable(async move {
                     let _admission = gate.admit(true).await;
-                    run_one(registry, ctx, journal, tu, pressure, timeline).await
+                    run_one(registry, ctx, journal, agent, tu, pressure, timeline).await
                 }),
             ));
         }
@@ -683,6 +779,7 @@ impl Agent {
                 self.tools.clone(),
                 self.ctx.clone(),
                 self.journal.clone(),
+                self.config.id.clone(),
                 tu,
                 pressure,
                 self.timeline.clone(),
@@ -709,6 +806,7 @@ async fn run_one(
     registry: Arc<ToolRegistry>,
     ctx: ToolContext,
     journal: Arc<Journal>,
+    agent: AgentId,
     tu: ToolUseBlock,
     pressure: Pressure,
     timeline: Arc<Timeline>,
@@ -784,9 +882,14 @@ async fn run_one(
         Payload::Dropped(_) => (None, None),
     };
 
+    // Attributed to the agent that ran the tool, not to a fixed label. The
+    // record holds a whole tree of runs now, and every reader scopes to one
+    // agent: `outcome_from_run` recovers a delegation's evidence from here, and
+    // an event filed under a name every executor shares would be handed to
+    // whichever one asked first.
     journal
         .append(
-            AgentId::new("exec"),
+            agent,
             EventBody::ToolResult {
                 tool_use_id: tu.id.clone(),
                 name: tu.name.clone(),
@@ -844,6 +947,89 @@ impl Agent {
                     inline: Some(text.clone()),
                     blob: None,
                     reduction: Some("pass_through".to_owned()),
+                },
+            )
+            .await?;
+        Ok((
+            ContentBlock::ToolResult(yu_wire::types::ToolResultBlock::text(&tu.id, text)),
+            Reduction::PassThrough,
+        ))
+    }
+
+    /// Answer a `delegate` call by deriving, and hand back the reduced reports.
+    ///
+    /// Recursion is here and nowhere else. The child is a full run of this same
+    /// loop — fresh, with its own report, its own evidence and its own entry in
+    /// the record — and what reaches this agent is the reduction, never the
+    /// child's transcript. DESIGN: "溢出靠分解,不靠压缩", and a child reports back
+    /// a reduction rather than a transcript, which is what keeps a tree from
+    /// costing its root every leaf's bytes.
+    async fn answer_delegation(
+        &self,
+        tu: &ToolUseBlock,
+    ) -> Result<(ContentBlock, Reduction), LoopError> {
+        let text = match &self.config.deriving {
+            Deriving::Allowed(spawn) => {
+                // Only the model's own fields come off the wire. Everything the
+                // child runs under — its conditions, its depth, its address, its
+                // set — is the harness's, and `DelegateArgs` skips it for
+                // exactly this reason: a model that could write its own
+                // constraints could write a run that has none.
+                let args: crate::delegate::DelegateArgs =
+                    serde_json::from_value(tu.input.clone()).map_err(|e| {
+                        LoopError::Wire(yu_wire::WireError::transport(format!(
+                            "could not read the delegation arguments: {e}"
+                        )))
+                    })?;
+                let inherited = self.derived.load(std::sync::atomic::Ordering::SeqCst);
+                let runner = crate::topology::ExecutorRunner::new(
+                    self.client.clone(),
+                    self.journal.clone(),
+                    self.tools.clone(),
+                    self.timeline.clone(),
+                    self.ctx.cwd.clone(),
+                    self.config.id.clone(),
+                    spawn.standing.clone(),
+                )
+                .at(spawn.depth + 1)
+                .under(spawn.path.clone())
+                .landing_in(spawn.outcomes.clone())
+                .starting_at(inherited);
+                let outcomes = crate::delegate::run_derivation(&args, &runner).await?;
+                self.derived.fetch_add(
+                    outcomes.len() as u32,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+                crate::delegate::render_derivation(&outcomes)
+            }
+            Deriving::AtDepthCeiling => format!(
+                "there is no `{}` here: derivation stops at {} levels, and this run is at the \
+                 last one. Do the work here, or report what you could not do and why.",
+                crate::delegate::DELEGATE,
+                crate::delegate::MAX_DELEGATION_DEPTH
+            ),
+            Deriving::No => format!(
+                "there is no tool named `{}` in this run; it does not derive agents.",
+                crate::delegate::DELEGATE
+            ),
+        };
+        // The result is journaled the way a real tool's is — one event, with the
+        // payload once. Everything downstream reads the record rather than this
+        // loop's memory, and a delegation's answer that never reached L2 would be
+        // a hole in the one artefact the design says is complete.
+        self.journal
+            .append(
+                self.config.id.clone(),
+                EventBody::ToolResult {
+                    tool_use_id: tu.id.clone(),
+                    name: tu.name.clone(),
+                    kind: yu_tools::ResultKind::Structured.as_str().to_owned(),
+                    bytes: text.len() as u64,
+                    reproducible: false,
+                    addressable: false,
+                    inline: Some(text.clone()),
+                    blob: None,
+                    reduction: Some("delegation".to_owned()),
                 },
             )
             .await?;
@@ -1514,6 +1700,7 @@ mod tests {
             registry(),
             ToolContext::with_default_budget(&dir),
             journal.clone(),
+            AgentId::new("exec"),
             big_call(),
             Pressure::high(),
             Timeline::new(),
@@ -1576,6 +1763,7 @@ mod tests {
             registry(),
             ToolContext::with_default_budget(&dir),
             journal.clone(),
+            AgentId::new("exec"),
             big_call(),
             Pressure::high(),
             Timeline::new(),
