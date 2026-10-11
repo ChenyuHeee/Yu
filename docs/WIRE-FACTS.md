@@ -115,6 +115,14 @@ record by — see Quirk 1 — so rewriting one silently changes behaviour.)
 Two identical requests with the same long system prefix: first `cr=0`, second `cr=2299`.
 An explicit `cache_control` breakpoint changes nothing.
 
+The probe sends both: the same prefix twice with a breakpoint, and twice without, and
+compares. It used to send only the unadorned pair and read the answer off that — which
+could not distinguish "breakpoints do nothing here" from "this probe never placed one",
+and on a breakpoint-honouring endpoint would have reported `No` and overwritten the
+correct default in `Quirks::anthropic()`. The `inert` above is now an observation rather
+than an inference; `capability::tests` guards both the verdict and the fact that a
+breakpoint actually went out on the wire.
+
 Consequence: DESIGN's "字节稳定是铁律" is **more** important here, not less. There is no
 breakpoint to place and no way to steer the cache — stability of the byte prefix is the
 entire mechanism. `cache_control` is still emitted (it is correct for Anthropic and costs
