@@ -1110,3 +1110,56 @@ mod tests {
         assert!(shown.render().contains("read_file"));
     }
 }
+
+#[cfg(test)]
+mod wire_shape_baseline {
+    use super::*;
+
+    /// The four built-in tools' wire shape, as of the commit that introduced
+    /// this constant. One entry per tool, in registry order.
+    const WIRE_SHAPE: [&str; 4] = [
+        r#"{"name":"read_file","description":"Read a file as UTF-8 text, relative to the working directory.","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"File to read, absolute or relative to the working directory.","type":"string"}},"required":["path"],"type":"object"}}"#,
+        r#"{"name":"write_file","description":"Write UTF-8 text to a file, creating parent directories as needed.","input_schema":{"additionalProperties":false,"properties":{"content":{"description":"Exact contents of the file after the call.","type":"string"},"path":{"description":"File to write, absolute or relative to the working directory.","type":"string"}},"required":["path","content"],"type":"object"}}"#,
+        r#"{"name":"list_dir","description":"List one directory's entries, sorted, directories suffixed with `/`.","input_schema":{"additionalProperties":false,"properties":{"path":{"description":"Directory to list, relative to the working directory. Defaults to `.`.","type":"string"}},"type":"object"}}"#,
+        r#"{"name":"exec","description":"Run a shell command with `sh -c` in the working directory; stdout, stderr and the exit code are captured.","input_schema":{"additionalProperties":false,"properties":{"command":{"description":"Command line, executed with `sh -c`.","type":"string"}},"required":["command"],"type":"object"}}"#,
+    ];
+
+
+    /// **TODO 第 3 步的判据:「不给 profile 时,发出去的请求与今天逐字节相同」.**
+    ///
+    /// This pins the wire shape of the four built-in tools as it is *today*, so
+    /// that adding a profile cannot quietly move it. The profile work is only
+    /// safe if the un-profiled path is provably unchanged — and "provably" means
+    /// a test that fails when a byte moves, not a review that reads two diffs and
+    /// believes them.
+    ///
+    /// Compared as the serialized wire form rather than as Rust values, because
+    /// the wire form is what the model sees: a `serde(rename)` or a reordered
+    /// field moves the request without moving any Rust-level equality.
+    #[test]
+    fn the_built_in_tool_shapes_are_unchanged() {
+        let rendered: Vec<String> = ToolRegistry::native(".")
+            .definitions()
+            .iter()
+            .map(|d| serde_json::to_string(d).expect("a definition serializes"))
+            .collect();
+        assert_eq!(
+            rendered.as_slice(),
+            WIRE_SHAPE,
+            "the built-in tools' wire shape moved. If that was deliberate, update \
+             this constant — and say in the commit why, because every request sent \
+             before the change described a shape that no longer exists, and the \
+             models trained on it have not been told."
+        );
+    }
+
+    /// The four names, pinned separately: the JSON above says *something* moved,
+    /// this says *what*, which is the difference between a guard and a riddle.
+    #[test]
+    fn the_built_in_tool_names_are_unchanged() {
+        assert_eq!(
+            ToolRegistry::native(".").names(),
+            vec!["read_file", "write_file", "list_dir", "exec"]
+        );
+    }
+}
