@@ -563,6 +563,22 @@ impl Resumed {
     }
 }
 
+/// The executor surface as the decision layer describes it: the names the model
+/// that runs those executors will actually call.
+///
+/// The wire names, not the implementations': under a profile a reader is
+/// advertised as `Read`, and a layer told its executors hold `read_file` would
+/// be describing a surface that does not exist — the same failure as a tool
+/// whose description does not match its implementation, one layer up.
+///
+/// Written out rather than inlined because it is a claim the layer makes about
+/// other agents, and a claim deserves a name and a test.
+fn executor_surface(tools: &ToolRegistry) -> Vec<String> {
+    let mut names = tools.wire_names();
+    names.sort();
+    names
+}
+
 /// One line of arbitrary text, cut so a manifest entry stays one line.
 fn one_line(text: &str) -> String {
     let flat: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -781,11 +797,7 @@ impl DecisionLayer {
                 let seed = SessionSeed {
                     charter: self.charter.clone(),
                     ledger: self.ledger.clone(),
-                    tool_surface: {
-                        let mut names = self.tools.names();
-                        names.sort();
-                        names
-                    },
+                    tool_surface: executor_surface(&self.tools),
                     outcome_sets: self
                         .outcome_sets
                         .ids()
@@ -1989,6 +2001,39 @@ mod landing_distribution_tests {
             1,
             "an unasked delegation must not be counted as landing anywhere — \
              `we did not ask` is not a slot"
+        );
+    }
+
+    /// The surface the layer records is the one its executors advertise.
+    ///
+    /// The names are the ones a model calls, so a profile renames them; the
+    /// record and every comparison against it must move with them, or a
+    /// continuation would be told its executors' surface changed when nothing
+    /// did (or, worse, would not be told when it did).
+    #[test]
+    fn the_recorded_executor_surface_is_the_names_the_model_calls() {
+        let plain = ToolRegistry::native("/tmp");
+        assert_eq!(
+            executor_surface(&plain),
+            vec!["exec", "list_dir", "read_file", "write_file"],
+            "un-profiled, the wire names are the implementations' own"
+        );
+
+        let profile = yu_tools::ToolProfile::from_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../captures/claude-code/profile/claude-code-2.1.248.json"
+        ))
+        .expect("the committed capture loads");
+        let profiled =
+            ToolRegistry::profiled("/tmp", std::sync::Arc::new(profile)).expect("every face binds");
+        assert_eq!(
+            executor_surface(&profiled),
+            vec!["Bash", "Edit", "Read", "Write"]
+        );
+        assert_ne!(
+            executor_surface(&profiled),
+            profiled.names(),
+            "the implementations' names are not what the model was offered"
         );
     }
 }

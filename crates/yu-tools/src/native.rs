@@ -27,15 +27,18 @@
 //! [`ToolResult::to_error_block`]: crate::result::ToolResult::to_error_block
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use yu_journal::digest_of;
 use yu_wire::types::{CustomTool, ToolDefinition};
 
+use crate::profile::{ProfileError, ToolProfile};
 use crate::reduce::{Budget, Pressure, Reducer, Reduction};
 use crate::result::{Payload, Provenance, ResultKind, ToolResult};
 
@@ -44,6 +47,13 @@ use crate::result::{Payload, Provenance, ResultKind, ToolResult};
 pub struct ToolContext {
     pub cwd: PathBuf,
     pub reducer: Arc<Reducer>,
+    /// The face this call arrived under, when it arrived through a profile.
+    ///
+    /// `None` is the unmeasured case: our own invented face, and our own result
+    /// form. `Some("Read")` means the call came in wearing a face the model was
+    /// trained on, and the implementation answers in the shape that face implies
+    /// — see [`ReadFile::execute`] for the one place it is consulted.
+    face: Option<String>,
 }
 
 impl ToolContext {
@@ -51,7 +61,18 @@ impl ToolContext {
         Self {
             cwd: cwd.into(),
             reducer,
+            face: None,
         }
+    }
+
+    /// The name this call wore on the wire, when a profile gave it one.
+    pub fn face(&self) -> Option<&str> {
+        self.face.as_deref()
+    }
+
+    /// Whether this call arrived under a profiled face at all.
+    pub fn is_aligned(&self) -> bool {
+        self.face.is_some()
     }
 
     /// A context with the default budget, for callers that have no policy yet.
@@ -171,6 +192,370 @@ pub struct ListDir;
 /// `exec` — `sh -c`, output and exit code captured.
 pub struct Exec;
 
+/// `edit` — exact string replacement, the heaviest convention of the four.
+///
+/// Not registered by [`ToolRegistry::native`] or [`ToolRegistry::read_only`]:
+/// those two surfaces are pinned byte for byte by `wire_shape_baseline`, and a
+/// fifth tool is a surface change those surfaces are not meant to absorb. It
+/// comes in with a profile, which is where its face is the measured one.
+pub struct Edit;
+
+// ---------------------------------------------------------------------------
+// The face table
+// ---------------------------------------------------------------------------
+
+/// A sentence of a captured description this harness will not repeat, and why.
+///
+/// Note what this is *not*: it is not a rewrite. A sentence that cannot be
+/// honoured is removed whole — the surrounding text is left exactly as the
+/// snapshot wrote it, because borrowed-sounding wording that nobody was trained
+/// on is the failure DESIGN names when it says 借来的措辞 … 看起来熟悉、所以更难被发现.
+struct Refusal {
+    /// The text as the snapshot carries it, including the separator that goes
+    /// with it, so that removing it leaves the rest of the description joined
+    /// the way its author wrote it.
+    text: &'static str,
+    /// Why this harness cannot stand behind the sentence. Not decoration: the
+    /// load fails if `text` is missing from the snapshot, so a re-captured
+    /// profile that reworded a sentence cannot quietly resurrect the claim.
+    why: &'static str,
+}
+
+/// A name on the aligned surface, the implementation that answers it, and what
+/// this harness does about the parts of the captured face it cannot honour.
+///
+/// This table is the whole of `wire_name → impl`, and the only place the
+/// correspondence is written down. Everything else about a profiled tool — its
+/// name, its description, its schema — comes from the snapshot, because
+/// 形状是数据,不是编译进去的. What a snapshot cannot say is which of *our*
+/// implementations stands behind each face, and which of the face's promises
+/// that implementation can keep; that is this table, and every entry in it is a
+/// claim this crate has to be able to defend.
+struct Face {
+    /// The name the profile carries for this tool.
+    wire: &'static str,
+    /// The implementation that wears it.
+    make: fn() -> Box<dyn Tool>,
+    /// wire parameter → the key the implementation reads.
+    ///
+    /// A parameter of the captured schema that is not listed here is one this
+    /// harness does not back, and it does not go on the wire: DESIGN 约束 2,
+    /// 「抄了 `Grep` 的 `output_mode` 就得实现它」 — a parameter is a promise.
+    params: &'static [(&'static str, &'static str)],
+    /// Whether this implementation can change the world — the same split
+    /// `native` and `read_only` make, and the reason `profiled_read_only`
+    /// exists.
+    mutates: bool,
+    /// Sentences of the captured description this harness refuses to adopt.
+    refuses: &'static [Refusal],
+}
+
+/// The four faces this crate can answer, out of the 26 a 2.1.248 profile names.
+///
+/// DESIGN 约束 4: 「不提供的,就不要放进去」 — an entry with no implementation is not
+/// advertised at all, so the other 22 simply do not exist for this run. What is
+/// *not* here is as deliberate as what is: `Grep`/`Glob` are absent from this
+/// client's surface entirely (measured — zero occurrences in the capture), and
+/// the `Task*`, `Cron*`, `Agent`, `Skill`, `NotebookEdit`, `WebFetch` and
+/// `WebSearch` faces all describe machinery this harness does not have.
+static FACES: [Face; 4] = [
+    Face {
+        wire: "Read",
+        make: || Box::new(ReadFile),
+        params: &[("file_path", "path"), ("offset", "offset"), ("limit", "limit")],
+        mutates: false,
+        refuses: READ_REFUSES,
+    },
+    Face {
+        wire: "Write",
+        make: || Box::new(WriteFile),
+        params: &[("file_path", "path"), ("content", "content")],
+        mutates: true,
+        refuses: WRITE_REFUSES,
+    },
+    Face {
+        wire: "Edit",
+        make: || Box::new(Edit),
+        params: &[
+            ("file_path", "file_path"),
+            ("old_string", "old_string"),
+            ("new_string", "new_string"),
+            ("replace_all", "replace_all"),
+        ],
+        mutates: true,
+        refuses: EDIT_REFUSES,
+    },
+    Face {
+        wire: "Bash",
+        make: || Box::new(Exec),
+        params: &[
+            ("command", "command"),
+            ("timeout", "timeout"),
+            ("description", "description"),
+        ],
+        mutates: true,
+        refuses: BASH_REFUSES,
+    },
+];
+
+/// `Read`'s captured sentences this harness will not repeat.
+///
+/// Kept: "Reads a file from the local filesystem."; the offset/limit invitation
+/// (both parameters are implemented, and line-based as it says); and the
+/// `cat -n` sentence — [`ReadFile::execute`] numbers lines under this face,
+/// starting at 1, exactly as the capture's own `tool_result` shows (see
+/// `captures/claude-code/raw/requests/0003.body.bin`: `"1\tThe blue crumb…\n2\t"`).
+/// Note that the measurement, not the tool's name, is the authority there: a
+/// real `cat -n` does not number a file's trailing empty piece, and the captured
+/// output does.
+const READ_REFUSES: &[Refusal] = &[
+    Refusal {
+        text: "- `file_path` must be an absolute path.\n",
+        why: "TODO step 4 names this one: this harness resolves a relative path against the \
+              working directory (ToolContext::resolve), so a relative path does not fail. The \
+              schema's own property text still asks for an absolute path — asking is not \
+              claiming.",
+    },
+    Refusal {
+        text: "- Reads up to 2000 lines by default.\n",
+        why: "there is no default line cap. Truncation is the reduction machinery's job and it \
+              does it with an explicit manifest; a second, silent cap inside the reader would \
+              hide bytes that no manifest accounts for.",
+    },
+    Refusal {
+        text: "- Reads images (PNG, JPG, …) and presents them visually. Reads PDFs via the `pages` \
+               parameter (e.g. \"1-5\", max 20 pages/request; required for PDFs over 10 pages). \
+               Reads Jupyter notebooks (.ipynb) as cells with outputs.\n",
+        why: "this crate reads UTF-8 text and nothing else; there is no image, PDF or notebook \
+              reader behind this face. The `pages` parameter goes with the sentence — it is not \
+              in the face table's parameter list, so it is not advertised either.",
+    },
+    Refusal {
+        text: "- Reading a directory, a missing file, or an empty file returns an error or system \
+               reminder rather than content.\n",
+        why: "two of the three hold here (a directory and a missing file are errors) and the \
+              third does not: an empty file is an empty result, not an error, because nothing \
+              failed. There is also no 'system reminder' channel in this harness. A sentence \
+              that is two-thirds true is a sentence a model cannot act on.",
+    },
+    Refusal {
+        text: "- Do NOT re-read a file you just edited to verify — Edit/Write would have errored \
+               if the change failed, and the harness tracks file state for you.",
+        why: "this harness keeps no record of which files a conversation has read, so 'the \
+              harness tracks file state for you' is false. (TODO step 4 names the `Edit` twin of \
+              this sentence; they are the same claim.)",
+    },
+];
+
+/// `Write`'s captured sentences this harness will not repeat.
+const WRITE_REFUSES: &[Refusal] = &[
+    Refusal {
+        text: " Overwriting an existing file you haven't Read will fail.",
+        why: "same missing state as `Read`'s refusal above: nothing here refuses a write because \
+              a file was not read first. 'When to use: … one you've already Read' stays, because \
+              it recommends an order of work rather than claiming an enforcement that does not \
+              exist.",
+    },
+];
+
+/// `Edit`'s captured sentences this harness will not repeat.
+const EDIT_REFUSES: &[Refusal] = &[
+    Refusal {
+        text: "- You must Read the file in this conversation before editing, or the call will \
+               fail.\n",
+        why: "TODO step 4's example, and the one that decided this whole exercise: the harness \
+              does not track which files a conversation has read, so the sentence is false as \
+              written. The other two bullets are kept *because they are true* — exact match and \
+              uniqueness are enforced in `Edit::execute`, and the strip-the-prefix instruction is \
+              exactly right for the numbered output `Read` produces under this face.",
+    },
+];
+
+/// `Bash`'s captured sentences this harness will not repeat.
+///
+/// Kept: the avoid-list bullet (this harness has dedicated tools for `cat`,
+/// `head`, `tail`, `sed`, `awk` and `echo` — that is what it is telling the model
+/// to use) and the `timeout` bullet, which `Exec` implements: default 120000 ms,
+/// clamped at 600000. The Git section keeps its two operating rules and loses
+/// Claude Code's own bylines, which are not this harness's to sign.
+const BASH_REFUSES: &[Refusal] = &[
+    Refusal {
+        text: "Executes a bash command and returns its output.\n\n",
+        why: "`Exec` runs `sh -c` (see `Exec::execute`). On a machine whose /bin/sh is dash that \
+              sentence is false, and rather than swap the shell the harness actually runs — which \
+              would change the un-profiled path too — the sentence is removed. What is left \
+              starts with the avoid-list, which is the part of this description a model acts on.",
+    },
+    Refusal {
+        text: "- Working directory persists between calls, but prefer absolute paths — `cd` in a \
+               compound command can trigger a permission prompt. Shell state (env vars, \
+               functions) does not persist; the shell is initialized from the user's profile.\n",
+        why: "nothing in it holds: each call is a fresh `sh -c` started in the context's working \
+              directory (no persistence), there is no permission prompt to trigger, and a \
+              non-interactive shell reads no profile.",
+    },
+    Refusal {
+        text: "- Command output is displayed to you, not reliably to the user.\n",
+        why: "this harness has no user-facing display; the sentence describes a UI that does not \
+              exist here.",
+    },
+    Refusal {
+        text: "- `run_in_background` runs the command detached: it keeps running across turns and \
+               re-invokes you when it exits. No `&` needed.\n",
+        why: "there is no background-task registry: a call here either finishes inside the step \
+              or is killed by its deadline. The parameter goes with the sentence — it is not in \
+              the face table's parameter list, so it is not advertised either.",
+    },
+    Refusal {
+        text: "- Interactive flags (`-i`, e.g. `git rebase -i`, `git add -i`) are not supported in \
+               this environment.\n",
+        why: "a claim about an environment that does not exist here: `exec` runs whatever it is \
+              given, and an interactive command simply reads from a closed stdin.",
+    },
+    Refusal {
+        text: "- End git commit messages with:\nCo-Authored-By: Claude <noreply@anthropic.com>\n",
+        why: "Claude Code's own attribution. It is not this harness's, and copying it would have \
+              the model sign Yu's commits with another product's byline.",
+    },
+    Refusal {
+        text: "- End PR bodies with:\n🤖 Generated with [Claude Code](https://claude.com/claude-code)",
+        why: "same: another product's mark, in text this harness would be putting in its model's \
+              mouth.",
+    },
+];
+
+fn face_named(name: &str) -> Option<&'static Face> {
+    FACES.iter().find(|face| face.wire == name)
+}
+
+/// The captured description, minus every sentence this harness refuses.
+///
+/// A refusal whose text is not in the snapshot is an error rather than a no-op.
+/// That is the whole point of keeping the refusals as text: a refreshed profile
+/// that reworded one of these sentences would otherwise load cleanly, with the
+/// false claim still in it and nothing anywhere to say so.
+///
+/// Nothing else is touched: each refusal carries the separator that belongs to
+/// the line it removes, so the sentences that stay are joined exactly as their
+/// author joined them. The one repair is at the very end, where the separator
+/// belongs to the *preceding* line and would otherwise be left dangling.
+fn adopt(profile: &str, face: &Face, captured: &str) -> Result<String, ProfileError> {
+    let mut text = captured.to_owned();
+    for refusal in face.refuses {
+        if !text.contains(refusal.text) {
+            return Err(ProfileError::Unrefused {
+                profile: profile.to_owned(),
+                wire: face.wire,
+                text: refusal.text.to_owned(),
+                why: refusal.why.to_owned(),
+            });
+        }
+        text = text.replace(refusal.text, "");
+    }
+    Ok(text.trim_end().to_owned())
+}
+
+/// The captured schema, minus every parameter this harness does not read.
+///
+/// Derived from the face's parameter list rather than hand-listed, so an
+/// implementation that learns to read a new parameter starts advertising it the
+/// moment the table says so — and a parameter the table does not know about
+/// disappears from the wire instead of becoming a promise nobody keeps.
+///
+/// The other direction is checked here too: every parameter the implementation
+/// reads must exist in the snapshot. A missing one means the face is being
+/// described from memory, which is the failure the whole capture exists to
+/// prevent.
+fn backed_schema(
+    profile: &str,
+    face: &Face,
+    implementation: &str,
+    schema: &Value,
+) -> Result<Value, ProfileError> {
+    let mut shaped = schema.clone();
+    let Some(object) = shaped.as_object_mut() else {
+        return Err(ProfileError::Shape {
+            path: profile.into(),
+            problem: format!("`{}`'s input_schema is not a JSON object", face.wire),
+        });
+    };
+    let Some(properties) = object.get("properties").and_then(Value::as_object) else {
+        return Err(ProfileError::Shape {
+            path: profile.into(),
+            problem: format!("`{}`'s input_schema declares no properties", face.wire),
+        });
+    };
+    for (wire, _) in face.params {
+        if !properties.contains_key(*wire) {
+            return Err(ProfileError::NoSuchParameter {
+                profile: profile.to_owned(),
+                wire: face.wire,
+                parameter: wire,
+                implementation: implementation.to_owned(),
+            });
+        }
+    }
+    let backed: Vec<&str> = face.params.iter().map(|(wire, _)| *wire).collect();
+    let kept: Map<String, Value> = properties
+        .iter()
+        .filter(|(name, _)| backed.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    object.insert("properties".to_owned(), Value::Object(kept));
+    if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+        // A required name whose property is gone would make the schema
+        // unsatisfiable — and `additionalProperties: false` means the model
+        // could not satisfy it by guessing either.
+        required.retain(|name| {
+            name.as_str().map(|name| backed.contains(&name)).unwrap_or(false)
+        });
+    }
+    Ok(shaped)
+}
+
+/// One implementation wearing one face: the shape that will go on the wire,
+/// resolved once at construction so that rendering it cannot fail later.
+struct Shaped {
+    face: &'static Face,
+    definition: CustomTool,
+}
+
+/// Bind one face to the snapshot and to the implementation that will wear it.
+///
+/// Done once, at construction, and it can fail — which is the point. Every
+/// failure here is "the snapshot does not say what this implementation needs it
+/// to say", and the alternative to failing is a request that describes a tool
+/// nobody has.
+fn shaped(
+    profile: &ToolProfile,
+    face: &'static Face,
+    implementation: &str,
+) -> Result<Shaped, ProfileError> {
+    let entry = profile
+        .entry(face.wire)
+        .ok_or_else(|| ProfileError::NoSuchTool {
+            profile: profile.name().to_owned(),
+            wire: face.wire,
+            implementation: implementation.to_owned(),
+        })?;
+    let input_schema = backed_schema(profile.name(), face, implementation, &entry.input_schema)?;
+    let mut definition = CustomTool::new(entry.name.clone(), String::new(), input_schema);
+    definition.description = match entry.description.as_deref() {
+        Some(captured) => Some(adopt(profile.name(), face, captured)?),
+        None => None,
+    };
+    Ok(Shaped { face, definition })
+}
+
+/// What a profile-bound registry is allowed to carry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Everything the profile names and this crate can back.
+    Everything,
+    /// The readers only, as in [`ToolRegistry::read_only`].
+    Readers,
+}
+
 impl Tool for ReadFile {
     fn name(&self) -> &str {
         "read_file"
@@ -194,15 +579,44 @@ impl Tool for ReadFile {
         ))
     }
 
+    /// One file, or a window of lines out of it.
+    ///
+    /// Two things happen here that the capture decided, and they are one
+    /// decision rather than two:
+    ///
+    /// * **`offset` / `limit` are line numbers and line counts**, as the captured
+    ///   schema's own text says. `offset` is 1-based — the number a caller can
+    ///   read off the output — and `0` is accepted as "from the beginning"
+    ///   because the captured schema allows 0 and a schema that allows a value
+    ///   cannot make it an error.
+    /// * **Under a profiled face the lines come back numbered**, `{n}\t{line}`,
+    ///   which is what the capture's own `tool_result` shows (`0003.body.bin`:
+    ///   `"1\tThe blue crumb is under the third stone.\n2\t"`). Numbering is what
+    ///   makes an offset usable: an unnumbered slice of a file tells the model
+    ///   nothing about where in the file it is looking, and `Edit`'s captured
+    ///   instruction — strip the line prefix before matching — only parses if the
+    ///   prefix is there.
+    ///
+    /// Un-profiled, the whole file comes back exactly as it is on disk, byte for
+    /// byte, which is what every request this harness has ever sent carried. The
+    /// window joins lines with `\n`; a trailing newline is a line boundary, not a
+    /// line, so a window that ends at end-of-file loses nothing.
     fn execute(&self, input: &Value, ctx: &ToolContext) -> ToolResult {
         let path = match required_str(self.name(), input, "path") {
             Ok(path) => path,
             Err(why) => return failed(self.name(), input, ResultKind::File, why),
         };
+        let window = match Window::read(self.name(), input) {
+            Ok(window) => window,
+            Err(why) => return failed(self.name(), input, ResultKind::File, why),
+        };
         let resolved = ctx.resolve(path);
         match std::fs::read(&resolved) {
             Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(text) => text_result(self.name(), input, ResultKind::File, text, true, true),
+                Ok(text) => {
+                    let rendered = window.render(&text, ctx.is_aligned());
+                    text_result(self.name(), input, ResultKind::File, rendered, true, true)
+                }
                 Err(err) => failed(
                     self.name(),
                     input,
@@ -221,6 +635,78 @@ impl Tool for ReadFile {
                 format!("cannot read `{}`: {err}", resolved.display()),
             ),
         }
+    }
+}
+
+/// Which lines of a file a read asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Window {
+    /// 1-based, and never 0: `0` is the first line, which is line 1.
+    from: usize,
+    /// How many lines, when the caller said.
+    lines: Option<usize>,
+}
+
+impl Window {
+    fn read(tool: &str, input: &Value) -> Result<Self, String> {
+        let offset = whole_number(tool, input, "offset")?.unwrap_or(1);
+        let lines = whole_number(tool, input, "limit")?;
+        if let Some(0) = lines {
+            return Err(format!(
+                "`{tool}` requires `limit` to be at least 1 line; 0 lines is not a read, and \
+                 returning nothing for it would look like an empty file"
+            ));
+        }
+        Ok(Self {
+            from: offset.max(1),
+            lines,
+        })
+    }
+
+    /// The requested lines, numbered when the call wore a profiled face.
+    ///
+    /// A window past the end of the file is empty, and an empty answer is a true
+    /// answer — there are no such lines — so it is not an error. Nothing failed.
+    fn render(&self, text: &str, numbered: bool) -> String {
+        if !numbered && self.lines.is_none() && self.from <= 1 {
+            // The un-profiled whole-file read, unchanged: the file's own bytes.
+            return text.to_owned();
+        }
+        let all: Vec<&str> = text.split('\n').collect();
+        let last = match self.lines {
+            Some(lines) => self.from.saturating_sub(1).saturating_add(lines),
+            None => all.len(),
+        };
+        let start = (self.from - 1).min(all.len());
+        let end = last.min(all.len());
+        let selected = &all[start..end.max(start)];
+        if !numbered {
+            return selected.join("\n");
+        }
+        selected
+            .iter()
+            .enumerate()
+            .map(|(index, line)| format!("{}\t{line}", start + index + 1))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// A whole number from the input, when the caller sent one.
+///
+/// A fractional or negative line count is a request this harness cannot honour,
+/// and saying so is better than rounding it: the captured schema declares
+/// integers, so a non-integer means the caller and the schema disagree about
+/// what the parameter is.
+fn whole_number(tool: &str, input: &Value, key: &str) -> Result<Option<usize>, String> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => match value.as_u64() {
+            Some(number) => Ok(Some(number as usize)),
+            None => Err(format!(
+                "`{tool}` requires `{key}` to be a whole number of lines, and got {value}"
+            )),
+        },
     }
 }
 
@@ -323,6 +809,262 @@ impl Tool for WriteFile {
     }
 }
 
+impl Tool for Edit {
+    fn name(&self) -> &str {
+        "edit"
+    }
+
+    /// The built-in shape, for a registry that carries `edit` without a profile
+    /// — which nothing in this crate does today (see [`ToolRegistry::native`]).
+    /// It is written truthfully anyway, because a definition that only exists to
+    /// be overridden is how a fallback starts lying.
+    ///
+    /// The names here are the implementation's own, and they are the same names
+    /// Claude Code's `Edit` uses, which is the one of the four faces where the
+    /// un-profiled and profiled vocabularies coincide.
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::Custom(CustomTool::new(
+            self.name(),
+            "Replace an exact string in a file, in place.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "File to edit, absolute or relative to the working directory."
+                    },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to replace; it must occur exactly once unless `replace_all` is set."
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Text to replace it with. May be empty, to delete `old_string`."
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": "Replace every occurrence of `old_string` (default false)."
+                    }
+                },
+                "required": ["file_path", "old_string", "new_string"],
+                "additionalProperties": false
+            }),
+        ))
+    }
+
+    fn effect(&self, input: &Value) -> Option<EffectIntent> {
+        let path = input.get("file_path").and_then(Value::as_str)?;
+        let old = input.get("old_string").and_then(Value::as_str)?;
+        let new = input.get("new_string").and_then(Value::as_str)?;
+        let replace_all = input.get("replace_all").and_then(Value::as_bool).unwrap_or(false);
+        Some(edit_intent(path, old, new, replace_all))
+    }
+
+    /// Whether the edit's target text is in the file and what it replaced is
+    /// gone.
+    ///
+    /// Deliberately not "is the file what the edit would have produced": the
+    /// only states this tool can *see* are its two strings, and the three
+    /// answers below are the three cases those two can distinguish. See
+    /// [`EffectVerdict`] for why "cannot tell" is one of them rather than a
+    /// guess.
+    fn effect_in_place(&self, input: &Value, ctx: &ToolContext) -> EffectVerdict {
+        let Some(path) = input.get("file_path").and_then(Value::as_str) else {
+            return EffectVerdict::Unknown;
+        };
+        let Some(old) = input.get("old_string").and_then(Value::as_str) else {
+            return EffectVerdict::Unknown;
+        };
+        let Some(new) = input.get("new_string").and_then(Value::as_str) else {
+            return EffectVerdict::Unknown;
+        };
+        match std::fs::read(ctx.resolve(path)) {
+            Ok(bytes) => {
+                let Ok(text) = String::from_utf8(bytes) else {
+                    return EffectVerdict::Unknown;
+                };
+                match (text.contains(old), text.contains(new)) {
+                    // What it replaced is gone and what it wrote is there.
+                    (false, true) => EffectVerdict::InPlace,
+                    // The text it was to replace is still there untouched.
+                    (true, false) => EffectVerdict::NotInPlace,
+                    // Both, or neither: the file is in neither the state before
+                    // the edit nor the state the edit describes. A substring
+                    // relationship between the two strings is enough to produce
+                    // this (`old = "ab"`, `new = "xab"`), so answering either way
+                    // would be a claim nothing supports.
+                    _ => EffectVerdict::Unknown,
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => EffectVerdict::NotInPlace,
+            Err(_) => EffectVerdict::Unknown,
+        }
+    }
+
+    /// Exact string replacement, with the two refusals the captured description
+    /// promises: the text must match exactly, and it must be unique unless
+    /// `replace_all` is set.
+    ///
+    /// Both refusals happen *before* anything is written, and the file is
+    /// written in one call rather than truncated first — an edit that fails its
+    /// own contract must leave the file exactly as it found it.
+    fn execute(&self, input: &Value, ctx: &ToolContext) -> ToolResult {
+        let tool = self.name();
+        let path = match required_str(tool, input, "file_path") {
+            Ok(path) => path,
+            Err(why) => return failed(tool, input, ResultKind::Diff, why),
+        };
+        let old = match required_str(tool, input, "old_string") {
+            Ok(old) => old,
+            Err(why) => return failed(tool, input, ResultKind::Diff, why),
+        };
+        // `new_string` may be empty — deleting the matched text is an edit —
+        // so presence and non-emptiness are asked separately here.
+        let new = match input.get("new_string").and_then(Value::as_str) {
+            Some(new) => new,
+            None => {
+                return failed(
+                    tool,
+                    input,
+                    ResultKind::Diff,
+                    format!("`{tool}` requires a string `new_string`; it may be empty, but it must be there"),
+                );
+            }
+        };
+        let replace_all = match input.get("replace_all") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(flag)) => *flag,
+            Some(other) => {
+                return failed(
+                    tool,
+                    input,
+                    ResultKind::Diff,
+                    format!("`{tool}` requires `replace_all` to be true or false, and got {other}"),
+                );
+            }
+        };
+        if old == new {
+            return failed(
+                tool,
+                input,
+                ResultKind::Diff,
+                "`old_string` and `new_string` are the same, so this call would change nothing. \
+                 The schema says they must differ.",
+            );
+        }
+        let resolved = ctx.resolve(path);
+        let text = match std::fs::read(&resolved) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    return failed(
+                        tool,
+                        input,
+                        ResultKind::Diff,
+                        format!("`{}` is not valid UTF-8, so exact string replacement cannot be done on it", resolved.display()),
+                    );
+                }
+            },
+            Err(err) => {
+                return failed(
+                    tool,
+                    input,
+                    ResultKind::Diff,
+                    format!("cannot read `{}`: {err}. `edit` changes a file that exists; use `write_file` to create one", resolved.display()),
+                );
+            }
+        };
+        let replacements = text.matches(old).count();
+        if replacements == 0 {
+            return failed(
+                tool,
+                input,
+                ResultKind::Diff,
+                format!(
+                    "the text to replace was not found in `{}`. The match is exact — whitespace \
+                     and indentation included — so nothing was changed.",
+                    resolved.display()
+                ),
+            );
+        }
+        if replacements > 1 && !replace_all {
+            return failed(
+                tool,
+                input,
+                ResultKind::Diff,
+                format!(
+                    "`{}` contains {replacements} occurrences of that text of {} bytes, and \
+                     `replace_all` is false, so which one to replace is undecidable. Nothing was \
+                     changed: give more surrounding text to make the match unique, or set \
+                     `replace_all`.",
+                    resolved.display(),
+                    old.len()
+                ),
+            );
+        }
+        let replaced = if replace_all {
+            text.replace(old, new)
+        } else {
+            text.replacen(old, new, 1)
+        };
+        match std::fs::write(&resolved, &replaced) {
+            Ok(()) => text_result(
+                tool,
+                input,
+                ResultKind::Diff,
+                // A write, so not reproducible: re-running the call is not a way
+                // to re-obtain this result, it is a way to edit twice.
+                format!(
+                    "edited `{}`: replaced {}{} occurrence{} of {} bytes with {} bytes",
+                    resolved.display(),
+                    if replace_all { "all " } else { "" },
+                    if replace_all { replacements.to_string() } else { "1".to_owned() },
+                    if replacements == 1 { "" } else { "s" },
+                    old.len(),
+                    new.len()
+                ),
+                false,
+                true,
+            ),
+            Err(err) => failed(
+                tool,
+                input,
+                ResultKind::Diff,
+                format!("cannot write `{}`: {err}; nothing was changed", resolved.display()),
+            ),
+        }
+    }
+}
+
+/// The intent behind an `edit` call, in the one place the tool and its tests
+/// read it from.
+///
+/// The key names the place, both strings and the flag, because the effect is the
+/// whole of that: the same replacement in a different file, or with
+/// `replace_all` flipped, is a different effect. It is *not* certified
+/// idempotent — see [`edit_intent`]'s caller in `Execute` and the doc below.
+///
+/// **Not idempotent**, unlike a write, and for a reason that is one character
+/// deep: `new_string` may contain `old_string` (`old = "ab"`, `new = "xab"`),
+/// and then performing the edit twice is not performing it once. A key that
+/// certifies otherwise would let a replay duplicate work under cover of a claim.
+fn edit_intent(path: &str, old: &str, new: &str, replace_all: bool) -> EffectIntent {
+    let description = format!(
+        "edit `{path}`: replace `{old}` with `{new}`{}",
+        if replace_all { " (all occurrences)" } else { "" }
+    );
+    EffectIntent {
+        key: format!(
+            "edit:{path}#sha256:{}{}#{}",
+            digest_of(old.as_bytes()),
+            digest_of(new.as_bytes()),
+            if replace_all { "all" } else { "one" }
+        ),
+        description,
+        idempotent: false,
+    }
+}
+
 impl Tool for ListDir {
     fn name(&self) -> &str {
         "list_dir"
@@ -422,11 +1164,25 @@ impl Tool for Exec {
     /// `cargo test` and `rm -rf build` arrive through the same door, and the tool
     /// has no way to tell them apart — so the honest declaration is that a shell
     /// command may change anything.
+    ///
+    /// `description`, when the model sends one, is carried into the record: it is
+    /// the model's own one-line account of what the command does, which is the
+    /// thing a reader of the journal after the fact most wants and the thing
+    /// nothing else in the record supplies. It changes no behaviour, and that is
+    /// deliberate — the captured schema requires only `command`, so a call
+    /// without a description must not fail.
     fn effect(&self, input: &Value) -> Option<EffectIntent> {
         let command = input.get("command").and_then(Value::as_str)?;
+        let said = input
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|said| !said.is_empty());
         Some(EffectIntent {
             key: format!("exec:sha256:{}", digest_of(command.as_bytes())),
-            description: format!("run `sh -c {command}`"),
+            description: match said {
+                Some(said) => format!("run `sh -c {command}` — the model says: {said}"),
+                None => format!("run `sh -c {command}`"),
+            },
             // A command is not its own key: running the same one twice is two
             // effects, which is why this is `false` and not a claim that the
             // second run is free.
@@ -439,19 +1195,25 @@ impl Tool for Exec {
             Ok(command) => command,
             Err(why) => return failed(self.name(), input, ResultKind::Log, why),
         };
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .current_dir(&ctx.cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output();
-        match output {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let text = render_exec_output(command, &output.status, &stdout, &stderr);
+        let deadline = match deadline_for(input, ctx.is_aligned()) {
+            Ok(deadline) => deadline,
+            Err(why) => return failed(self.name(), input, ResultKind::Log, why),
+        };
+        match run_command(command, &ctx.cwd, deadline) {
+            Ok(Run { status, stdout, stderr, timed_out }) => {
+                let stdout = String::from_utf8_lossy(&stdout);
+                let stderr = String::from_utf8_lossy(&stderr);
+                let mut text = render_exec_output(command, &status, &stdout, &stderr);
+                if timed_out {
+                    // After the streams, never inside the header: the exit
+                    // marker's position is a function of the command, and
+                    // `parse_exit_code` reads that position rather than the text.
+                    text.push_str(&format!(
+                        "\nthe command was still running after {} ms and was killed; what it \
+                         printed before that is above\n",
+                        deadline.map(|d| d.as_millis()).unwrap_or(0)
+                    ));
+                }
                 // A pure command re-runs to the same bytes; the provenance
                 // carries the command, so `rerun` is exactly this string.
                 text_result(self.name(), input, ResultKind::Log, text, true, true)
@@ -467,6 +1229,126 @@ impl Tool for Exec {
             ),
         }
     }
+}
+
+/// The one place a command is run: `sh -c`, in `cwd`, with a deadline.
+///
+/// Not `Command::output()` any more, and the reason is the deadline rather than
+/// the pipes: `output()` reads both streams while the child runs (so a command
+/// cannot deadlock on a full pipe) but it waits forever. This keeps the reading
+/// on its own threads and watches the clock on this one, so the two properties
+/// hold together.
+struct Run {
+    status: ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    timed_out: bool,
+}
+
+fn run_command(command: &str, cwd: &Path, deadline: Option<Duration>) -> std::io::Result<Run> {
+    use std::os::unix::process::CommandExt;
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // Its own process group, so that a deadline can end the *command*
+        // rather than the shell it was started in. Without this, `sh -c "sleep
+        // 5"` leaves `sleep` running and holding our pipes open after the shell
+        // has been killed — a timeout that stops nothing, which is what the
+        // first version of this did, and what its test caught.
+        .process_group(0)
+        .spawn()?;
+    let pid = child.id();
+    let mut stdout = child.stdout.take().expect("stdout was piped");
+    let mut stderr = child.stderr.take().expect("stderr was piped");
+    // Both pipes are drained on their own threads, so a child that fills one
+    // while this thread is polling for its exit still makes progress.
+    let out_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stdout.read_to_end(&mut bytes);
+        bytes
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = stderr.read_to_end(&mut bytes);
+        bytes
+    });
+    let started = Instant::now();
+    let (status, timed_out) = loop {
+        if let Some(status) = child.try_wait()? {
+            break (status, false);
+        }
+        match deadline {
+            Some(deadline) if started.elapsed() >= deadline => {
+                // The group, by its id, through the shell's own `kill` builtin —
+                // no dependency and no signal bindings, and POSIX guarantees the
+                // builtin. Then the child is waited for: a `Child` dropped
+                // without waiting leaves a zombie, and the readers would never
+                // see end-of-file.
+                let _ = Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("kill -KILL -{pid}"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                break (child.wait()?, true);
+            }
+            // 5 ms is the polling granularity and therefore the floor on how
+            // precisely a deadline is honoured; a command that finishes inside a
+            // poll interval is not killed for it.
+            _ => std::thread::sleep(Duration::from_millis(5)),
+        }
+    };
+    Ok(Run {
+        status,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+        timed_out,
+    })
+}
+
+/// How long a command may run, from the call and the face it arrived under.
+///
+/// The captured `Bash` description says two things about `timeout` — "default
+/// 120000, max 600000" — and both are implemented, but only under a profiled
+/// face, because they are *that face's* claims. Un-profiled there is no deadline
+/// at all, which is what this harness has always done: a `cargo build` that
+/// takes ten minutes is not a hanging command, and a harness that started
+/// killing it would be changing the un-measured path in the name of a sentence
+/// nobody had sent it. An explicitly supplied `timeout` is honoured either way,
+/// and clamped to the captured maximum under a profiled face so that "max
+/// 600000" stays true.
+fn deadline_for(input: &Value, aligned: bool) -> Result<Option<Duration>, String> {
+    const DEFAULT_MS: u64 = 120_000;
+    const MAX_MS: u64 = 600_000;
+    let asked = match input.get("timeout") {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_f64() {
+            Some(ms) if ms > 0.0 => Some(ms),
+            Some(ms) => {
+                return Err(format!(
+                    "`exec` requires `timeout` to be a positive number of milliseconds, and got {ms}"
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "`exec` requires `timeout` to be a number of milliseconds, and got {value}"
+                ));
+            }
+        },
+    };
+    let ms = match (asked, aligned) {
+        (Some(ms), true) => ms.min(MAX_MS as f64),
+        (Some(ms), false) => ms,
+        (None, true) => DEFAULT_MS as f64,
+        (None, false) => return Ok(None),
+    };
+    Ok(Some(Duration::from_millis(ms as u64)))
 }
 
 /// The header's two halves, defined once because the writer and the reader must
@@ -598,6 +1480,15 @@ pub struct ToolRegistry {
     /// and a policy that reached only some of the tools would be a second,
     /// contradicting account of what the run does.
     reducer: Option<Arc<Reducer>>,
+    /// wire name → tool index, built at construction.
+    ///
+    /// Empty when no profile is loaded, which is what keeps the un-profiled
+    /// path exactly as it was: `get` falls back to the implementation's own
+    /// name, and that is the only lookup that ever happens.
+    wire: HashMap<String, usize>,
+    /// The face each tool wears, aligned with `tools` by index. `None` is a tool
+    /// with no profile behind it — its own definition is what goes on the wire.
+    faces: Vec<Option<Shaped>>,
 }
 
 impl ToolRegistry {
@@ -607,7 +1498,74 @@ impl ToolRegistry {
             index: HashMap::new(),
             cwd: PathBuf::from("."),
             reducer: None,
+            wire: HashMap::new(),
+            faces: Vec::new(),
         }
+    }
+
+    /// The surface a profile names, restricted to what this harness can back.
+    ///
+    /// This is the whole of step 3: the registry asks the snapshot what each
+    /// tool is called and what it says, and asks [`FACES`] which of our
+    /// implementations stands behind it. An entry with no implementation is not
+    /// advertised at all (DESIGN 约束 4, 「不提供的,就不要放进去」), so a 26-tool
+    /// profile becomes the four faces this crate can answer and the other 22 do
+    /// not exist for this run — the model cannot call what it was never shown,
+    /// and it is shown nothing that would answer with an error.
+    ///
+    /// The order is the snapshot's, not ours: the tool array renders in the
+    /// order the profile listed, and DESIGN's cache rule wants that byte prefix
+    /// stable.
+    pub fn profiled(
+        ctx_cwd: impl Into<PathBuf>,
+        profile: Arc<ToolProfile>,
+    ) -> Result<Self, ProfileError> {
+        Self::from_profile(ctx_cwd, profile, Reach::Everything)
+    }
+
+    /// The same surface with everything that can change the world left out —
+    /// the profiled analogue of [`Self::read_only`], and the reason [`Reach`]
+    /// exists rather than a second table.
+    pub fn profiled_read_only(
+        ctx_cwd: impl Into<PathBuf>,
+        profile: Arc<ToolProfile>,
+    ) -> Result<Self, ProfileError> {
+        Self::from_profile(ctx_cwd, profile, Reach::Readers)
+    }
+
+    fn from_profile(
+        ctx_cwd: impl Into<PathBuf>,
+        profile: Arc<ToolProfile>,
+        reach: Reach,
+    ) -> Result<Self, ProfileError> {
+        let mut registry = Self::new();
+        registry.cwd = ctx_cwd.into();
+        for entry in profile.entries() {
+            let Some(face) = face_named(&entry.name) else {
+                continue;
+            };
+            if reach == Reach::Readers && face.mutates {
+                continue;
+            }
+            let tool = (face.make)();
+            let implementation = tool.name().to_owned();
+            let worn = shaped(profile.as_ref(), face, &implementation)?;
+            let index = registry.tools.len();
+            registry.index.insert(implementation, index);
+            registry.tools.push(tool);
+            registry.wire.insert(face.wire.to_owned(), index);
+            registry.faces.push(Some(worn));
+        }
+        Ok(registry)
+    }
+
+    fn shaped(&self, name: &str) -> Option<&Shaped> {
+        let index = self
+            .wire
+            .get(name)
+            .or_else(|| self.index.get(name))
+            .copied()?;
+        self.faces.get(index).and_then(Option::as_ref)
     }
 
     /// Build every context from `reducer` instead of the default budget.
@@ -626,10 +1584,19 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: Box<dyn Tool>) -> &mut Self {
         let name = tool.name().to_owned();
         match self.index.get(&name).copied() {
-            Some(existing) => self.tools[existing] = tool,
+            Some(existing) => {
+                self.tools[existing] = tool;
+                // A face belongs to the implementation a profile bound it to.
+                // Replacing that implementation replaces the thing the face was
+                // measured against, so the face and its wire name go with it
+                // rather than going on describing the new one.
+                self.faces[existing] = None;
+                self.wire.retain(|_, index| *index != existing);
+            }
             None => {
                 self.index.insert(name, self.tools.len());
                 self.tools.push(tool);
+                self.faces.push(None);
             }
         }
         self
@@ -669,19 +1636,86 @@ impl ToolRegistry {
         registry
     }
 
+    /// The implementation that answers `name`.
+    ///
+    /// Two names resolve, and both resolve on purpose. The wire name is what a
+    /// model calls (`Read`); the implementation's own name is its identity
+    /// (satisfied by `read_file`) and stays dispatchable, which is what keeps a
+    /// recorded re-run instruction — `read_file({"path": …})` — working in a run
+    /// whose surface is aligned.
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.index.get(name).map(|index| &*self.tools[*index])
+        self.wire
+            .get(name)
+            .or_else(|| self.index.get(name))
+            .map(|index| &*self.tools[*index])
     }
 
+    /// The shapes as they go on the wire: the profile's where a profile is
+    /// loaded and the snapshot carries this tool, the built-in one otherwise.
     pub fn definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.iter().map(|tool| tool.definition()).collect()
+        self.tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| match self.faces.get(index).and_then(Option::as_ref) {
+                Some(shaped) => ToolDefinition::Custom(shaped.definition.clone()),
+                None => tool.definition(),
+            })
+            .collect()
     }
 
+    /// The implementations' own names: the identity a result's provenance
+    /// records, and the same vocabulary the record speaks no matter which face
+    /// the call arrived under.
     pub fn names(&self) -> Vec<String> {
         self.tools
             .iter()
             .map(|tool| tool.name().to_owned())
             .collect()
+    }
+
+    /// The names the model sees, which are the ones it will call.
+    ///
+    /// Anything that *describes* this surface to anybody — the run's own
+    /// account of itself, the decision layer's view of its executors — has to
+    /// use these rather than [`Self::names`], or it describes a surface no model
+    /// was offered.
+    pub fn wire_names(&self) -> Vec<String> {
+        self.tools
+            .iter()
+            .enumerate()
+            .map(|(index, tool)| match self.faces.get(index).and_then(Option::as_ref) {
+                Some(shaped) => shaped.face.wire.to_owned(),
+                None => tool.name().to_owned(),
+            })
+            .collect()
+    }
+
+    /// One wire call's input, in the implementation's own vocabulary.
+    ///
+    /// The wire speaks the profile's parameter names (`file_path`) and the
+    /// implementation reads its own (`path`). The translation happens once, in
+    /// the loop, before anything looks at the input — effect, effect check and
+    /// execution all see the same object — and it is why the record is in one
+    /// vocabulary whichever face a call arrived under.
+    ///
+    /// Keys the face does not map are passed through untouched: `additionalProperties: false`
+    /// means a conforming model sends none, and dropping what a non-conforming
+    /// one sent would hide it from the tool that could say so.
+    pub fn input_for(&self, wire_name: &str, input: &Value) -> Value {
+        let Some(shaped) = self.shaped(wire_name) else {
+            return input.clone();
+        };
+        let Some(object) = input.as_object() else {
+            return input.clone();
+        };
+        let mut translated = object.clone();
+        for (wire, implementation) in shaped.face.params {
+            if let Some(value) = object.get(*wire) {
+                translated.remove(*wire);
+                translated.insert((*implementation).to_owned(), value.clone());
+            }
+        }
+        Value::Object(translated)
     }
 
     /// The working directory this registry's tools were built for.
@@ -700,6 +1734,19 @@ impl ToolRegistry {
             Some(reducer) => ToolContext::new(self.cwd.clone(), reducer.clone()),
             None => ToolContext::with_default_budget(self.cwd.clone()),
         }
+    }
+
+    /// A context for one wire call, carrying the face that call arrived under.
+    ///
+    /// Per call rather than per run because the face is per call: two calls in
+    /// one batch can arrive under different names, and an implementation that
+    /// answers in the shape a face implies has to know which one it is answering.
+    pub fn context_for(&self, wire_name: &str) -> ToolContext {
+        let mut context = self.context();
+        if let Some(shaped) = self.shaped(wire_name) {
+            context.face = Some(shaped.face.wire.to_owned());
+        }
+        context
     }
 
     /// The reducer this registry's contexts run under.
@@ -1091,6 +2138,80 @@ mod tests {
             "the registry's table did not reach the reducer: {path:?}"
         );
         assert!(!shown.is_complete());
+    }
+
+    /// The two surfaces that were pinned before any of this existed still carry
+    /// exactly what they carried. `edit` is not one of their tools: it arrives
+    /// with a profile, and `the_built_in_tool_shapes_are_unchanged` is the test
+    /// that says so in bytes.
+    #[test]
+    fn edit_is_not_on_an_unprofiled_surface() {
+        for registry in [ToolRegistry::native("/tmp"), ToolRegistry::read_only("/tmp")] {
+            assert!(
+                registry.get("edit").is_none(),
+                "an un-profiled surface advertises {:?}, and `edit` has no measured face of its \
+                 own to wear there",
+                registry.names()
+            );
+        }
+    }
+
+    /// A context carries the face of the call it was built for, and an
+    /// un-profiled context carries none.
+    #[test]
+    fn only_a_profiled_call_wears_a_face() {
+        let plain = ToolRegistry::native("/tmp");
+        assert!(plain.context_for("read_file").face().is_none());
+        assert!(!plain.context_for("read_file").is_aligned());
+
+        let profile = crate::profile::ToolProfile::from_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../captures/claude-code/profile/claude-code-2.1.248.json"
+        ))
+        .expect("the committed capture loads");
+        let registry = ToolRegistry::profiled("/tmp", Arc::new(profile)).expect("every face binds");
+        assert_eq!(registry.context_for("Read").face(), Some("Read"));
+        assert_eq!(
+            registry.context_for("read_file").face(),
+            Some("Read"),
+            "the implementation's own name is the same call, so it wears the same face"
+        );
+        assert_eq!(registry.context_for("Bash").face(), Some("Bash"));
+        assert_eq!(registry.wire_names(), vec!["Bash", "Edit", "Read", "Write"]);
+        assert_eq!(registry.names(), vec!["exec", "edit", "read_file", "write_file"]);
+    }
+
+    /// The captured `Bash` says "default 120000, max 600000", and both numbers
+    /// are enforced — but only under a face that says them.
+    #[test]
+    fn the_deadline_follows_the_face_that_declares_one() {
+        let none = json!({"command": "true"});
+        let asked = json!({"command": "true", "timeout": 200});
+        let greedy = json!({"command": "true", "timeout": 9_000_000});
+
+        assert_eq!(deadline_for(&none, false), Ok(None));
+        assert_eq!(
+            deadline_for(&asked, false),
+            Ok(Some(Duration::from_millis(200))),
+            "an explicit timeout is honoured with or without a face"
+        );
+        assert_eq!(
+            deadline_for(&none, true),
+            Ok(Some(Duration::from_millis(120_000))),
+            "the profiled face's default"
+        );
+        assert_eq!(
+            deadline_for(&greedy, true),
+            Ok(Some(Duration::from_millis(600_000))),
+            "the profiled face's maximum: the schema property says (max 600000)"
+        );
+        assert_eq!(
+            deadline_for(&greedy, false),
+            Ok(Some(Duration::from_millis(9_000_000))),
+            "nothing in our own face claims a maximum, so nothing clamps one"
+        );
+        assert!(deadline_for(&json!({"command": "true", "timeout": 0}), true).is_err());
+        assert!(deadline_for(&json!({"command": "true", "timeout": "soon"}), true).is_err());
     }
 
     #[test]

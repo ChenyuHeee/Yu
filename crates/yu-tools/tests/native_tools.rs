@@ -214,3 +214,283 @@ fn the_context_helper_returns_the_event_and_the_view_together() {
     assert!(store.is_empty(), "pass-through writes nothing");
     assert!(matches!(shown.payload, Payload::Inline(_)));
 }
+
+// ---------------------------------------------------------------------------
+// `edit` — the convention is the whole of its value, so it is tested as one
+// ---------------------------------------------------------------------------
+
+use yu_tools::native::Edit;
+
+fn file(dir: &std::path::Path, name: &str, text: &str) {
+    std::fs::write(dir.join(name), text).unwrap();
+}
+
+fn read_back(dir: &std::path::Path, name: &str) -> String {
+    std::fs::read_to_string(dir.join(name)).unwrap()
+}
+
+#[test]
+fn edit_replaces_a_unique_exact_match_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    file(dir.path(), "f.txt", "one\ntwo\nthree\n");
+    let result = Edit.execute(
+        &json!({"file_path": "f.txt", "old_string": "two", "new_string": "TWO"}),
+        &context(dir.path(), 8 * 1024),
+    );
+    assert_eq!(read_back(dir.path(), "f.txt"), "one\nTWO\nthree\n");
+    assert_eq!(result.kind, ResultKind::Diff);
+    assert!(!result.reproducible, "an edit is a side effect");
+    assert!(result.addressable, "the file is on disk");
+    assert_eq!(result.provenance.tool, "edit");
+    assert_eq!(result.provenance.input["file_path"], json!("f.txt"));
+}
+
+#[test]
+fn edit_can_delete_text_by_replacing_it_with_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    file(dir.path(), "f.txt", "keep\ndrop me\nkeep\n");
+    let result = Edit.execute(
+        &json!({"file_path": "f.txt", "old_string": "drop me\n", "new_string": ""}),
+        &context(dir.path(), 8 * 1024),
+    );
+    assert_eq!(read_back(dir.path(), "f.txt"), "keep\nkeep\n");
+    assert!(result.payload.text().unwrap().contains("with 0 bytes"), "{:?}", result.payload.text());
+}
+
+/// The counterexample for *exact*: a match that differs only in whitespace is
+/// not a match, and the refusal leaves the file alone.
+#[test]
+fn an_edit_that_differs_only_in_whitespace_is_not_a_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = "fn main() {\n    let x = 1;\n}\n";
+    file(dir.path(), "f.rs", before);
+    let result = Edit.execute(
+        &json!({"file_path": "f.rs", "old_string": "\tlet x = 1;", "new_string": "\tlet x = 2;"}),
+        &context(dir.path(), 8 * 1024),
+    );
+    let text = result.payload.text().unwrap();
+    assert!(text.starts_with("error: "), "{text}");
+    assert!(text.contains("not found"), "{text}");
+    assert_eq!(
+        read_back(dir.path(), "f.rs"),
+        before,
+        "a refused edit must not touch the file"
+    );
+}
+
+/// The counterexample for *unique*: two matches and no `replace_all` is
+/// undecidable, so nothing happens.
+#[test]
+fn an_edit_that_matches_twice_is_refused_unless_replace_all_is_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = "alpha\nbeta\nalpha\n";
+    file(dir.path(), "f.txt", before);
+
+    let refused = Edit.execute(
+        &json!({"file_path": "f.txt", "old_string": "alpha", "new_string": "gamma"}),
+        &context(dir.path(), 8 * 1024),
+    );
+    let text = refused.payload.text().unwrap();
+    assert!(text.starts_with("error: "), "{text}");
+    assert!(text.contains("2 occurrences"), "{text}");
+    assert_eq!(read_back(dir.path(), "f.txt"), before, "nothing was changed");
+
+    let replaced = Edit.execute(
+        &json!({
+            "file_path": "f.txt",
+            "old_string": "alpha",
+            "new_string": "gamma",
+            "replace_all": true
+        }),
+        &context(dir.path(), 8 * 1024),
+    );
+    assert_eq!(read_back(dir.path(), "f.txt"), "gamma\nbeta\ngamma\n");
+    assert!(
+        replaced.payload.text().unwrap().contains("replaced all 2 occurrences"),
+        "{:?}",
+        replaced.payload.text()
+    );
+}
+
+#[test]
+fn an_edit_that_would_change_nothing_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    file(dir.path(), "f.txt", "same\n");
+    let result = Edit.execute(
+        &json!({"file_path": "f.txt", "old_string": "same", "new_string": "same"}),
+        &context(dir.path(), 8 * 1024),
+    );
+    let text = result.payload.text().unwrap();
+    assert!(text.starts_with("error: "), "{text}");
+    assert!(text.contains("must differ"), "{text}");
+}
+
+#[test]
+fn an_edit_requires_a_non_empty_old_string_and_a_new_string_that_may_be_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    file(dir.path(), "f.txt", "text\n");
+    let empty_old = Edit.execute(
+        &json!({"file_path": "f.txt", "old_string": "", "new_string": "x"}),
+        &context(dir.path(), 8 * 1024),
+    );
+    assert!(empty_old.payload.text().unwrap().starts_with("error: "));
+
+    let missing_new = Edit.execute(
+        &json!({"file_path": "f.txt", "old_string": "text"}),
+        &context(dir.path(), 8 * 1024),
+    );
+    let text = missing_new.payload.text().unwrap();
+    assert!(text.contains("`new_string`"), "{text}");
+    assert_eq!(read_back(dir.path(), "f.txt"), "text\n");
+}
+
+#[test]
+fn an_edit_of_a_file_that_is_not_there_says_what_to_use_instead() {
+    let dir = tempfile::tempdir().unwrap();
+    let result = Edit.execute(
+        &json!({"file_path": "absent.txt", "old_string": "a", "new_string": "b"}),
+        &context(dir.path(), 8 * 1024),
+    );
+    let text = result.payload.text().unwrap();
+    assert!(text.starts_with("error: "), "{text}");
+    assert!(text.contains("write_file"), "{text}");
+}
+
+/// The effect an edit declares, and the world's answer to it.
+///
+/// Both halves matter: the key names the place, both strings and the flag, so a
+/// replay can tell two edits apart; the verdicts are what the crash window is
+/// read from.
+#[test]
+fn an_edit_declares_what_it_will_change_and_where_the_world_stands() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path(), 8 * 1024);
+    let input = json!({"file_path": "f.txt", "old_string": "old", "new_string": "new"});
+    let intent = Edit.effect(&input).expect("an edit is an effect");
+    assert!(intent.key.starts_with("edit:f.txt#sha256:"), "{}", intent.key);
+    assert!(intent.description.contains("`old`"), "{}", intent.description);
+    assert!(intent.description.contains("`new`"), "{}", intent.description);
+    assert_ne!(
+        intent.key,
+        Edit
+            .effect(&json!({
+                "file_path": "f.txt",
+                "old_string": "old",
+                "new_string": "new",
+                "replace_all": true
+            }))
+            .expect("also an effect")
+            .key,
+        "flipping replace_all changes what the effect is"
+    );
+    assert!(
+        !intent.idempotent,
+        "`new_string` may contain `old_string`, so performing the edit twice is not \
+         performing it once — the key must not certify what it cannot see"
+    );
+
+    // The world, in the three states it can be in.
+    file(dir.path(), "f.txt", "old text\n");
+    assert_eq!(Edit.effect_in_place(&input, &ctx), yu_tools::EffectVerdict::NotInPlace);
+    Edit.execute(&input, &ctx);
+    assert_eq!(Edit.effect_in_place(&input, &ctx), yu_tools::EffectVerdict::InPlace);
+    file(dir.path(), "f.txt", "neither of them\n");
+    assert_eq!(
+        Edit.effect_in_place(&input, &ctx),
+        yu_tools::EffectVerdict::Unknown,
+        "neither the text it was to replace nor the text it was to write is in the file"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `exec`'s two new parameters, and `read_file`'s two
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_command_that_overruns_its_timeout_is_killed_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path(), 8 * 1024);
+    let started = std::time::Instant::now();
+    let result = Exec.execute(
+        &json!({"command": "sleep 5; printf 'never printed'", "timeout": 200}),
+        &ctx,
+    );
+    let elapsed = started.elapsed();
+    let text = result.payload.text().unwrap();
+    assert!(elapsed < std::time::Duration::from_secs(4), "it waited {elapsed:?}");
+    assert!(text.contains("was still running after 200 ms and was killed"), "{text}");
+    assert!(
+        text.contains("stdout (0 bytes):"),
+        "the command was killed before it printed anything, so the capture says so rather than \
+         carrying the echo of what it was going to print: {text}"
+    );
+    // The exit marker stays where the format puts it, so the reader of the
+    // result is not fooled about a status the command never produced.
+    assert_eq!(yu_tools::native::parse_exit_code("sleep 5; printf 'never printed'", text), None);
+}
+
+#[test]
+fn a_timeout_that_is_not_a_positive_number_is_refused_rather_than_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path(), 8 * 1024);
+    for bad in [json!(0), json!(-5), json!("soon"), json!(null)] {
+        let result = Exec.execute(&json!({"command": "true", "timeout": bad}), &ctx);
+        let text = result.payload.text().unwrap();
+        if bad == json!(null) {
+            assert!(text.contains("exit: 0"), "null is absent, not invalid: {text}");
+        } else {
+            assert!(text.starts_with("error: "), "`{bad}` must be refused: {text}");
+        }
+    }
+}
+
+#[test]
+fn a_description_the_model_sent_is_carried_into_the_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = context(dir.path(), 8 * 1024);
+    let intent = Exec
+        .effect(&json!({"command": "ls -la", "description": "List files in current directory"}))
+        .expect("a command is an effect");
+    assert!(intent.description.contains("ls -la"), "{}", intent.description);
+    assert!(
+        intent.description.contains("List files in current directory"),
+        "the model's own account of what it ran is the one thing the record cannot \
+         reconstruct afterwards: {}",
+        intent.description
+    );
+    // And a call without one still runs: the captured schema requires `command`
+    // only, so requiring more here would refuse calls its own face allows.
+    let result = Exec.execute(&json!({"command": "printf ok"}), &ctx);
+    assert!(result.payload.text().unwrap().contains("ok"));
+}
+
+#[test]
+fn a_window_into_a_file_is_the_lines_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    file(dir.path(), "f.txt", "l1\nl2\nl3\nl4\n");
+    let ctx = context(dir.path(), 8 * 1024);
+
+    let whole = ReadFile.execute(&json!({"path": "f.txt"}), &ctx);
+    assert_eq!(
+        whole.payload.text(),
+        Some("l1\nl2\nl3\nl4\n"),
+        "without a window the file comes back exactly as it is on disk"
+    );
+
+    let window = ReadFile.execute(&json!({"path": "f.txt", "offset": 2, "limit": 2}), &ctx);
+    assert_eq!(window.payload.text(), Some("l2\nl3"));
+    assert!(window.reproducible, "the file is still there, and the window is a function of it");
+
+    let past_the_end = ReadFile.execute(&json!({"path": "f.txt", "offset": 40}), &ctx);
+    assert_eq!(
+        past_the_end.payload.text(),
+        Some(""),
+        "there are no such lines; nothing failed, so this is not an error"
+    );
+
+    let not_a_line_count = ReadFile.execute(&json!({"path": "f.txt", "limit": 1.5}), &ctx);
+    let text = not_a_line_count.payload.text().unwrap();
+    assert!(text.starts_with("error: "), "{text}");
+    let zero = ReadFile.execute(&json!({"path": "f.txt", "limit": 0}), &ctx);
+    assert!(zero.payload.text().unwrap().starts_with("error: "));
+}

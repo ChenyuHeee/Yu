@@ -26,12 +26,14 @@
 //! 3. Read-back is closed against being re-spilled — the self-loop flower hit.
 
 pub mod native;
+pub mod profile;
 pub mod reduce;
 pub mod result;
 
 pub use native::{
-    EffectIntent, EffectVerdict, Exec, ListDir, ReadFile, Tool, ToolContext, ToolRegistry,
+    Edit, EffectIntent, EffectVerdict, Exec, ListDir, ReadFile, Tool, ToolContext, ToolRegistry,
     WriteFile,
 };
+pub use profile::{ProfileEntry, ProfileError, ToolProfile};
 pub use reduce::{Axes, Budget, Pressure, Reduction, ReductionPath, ReductionTable, Reducer};
 pub use result::{Manifest, Payload, Provenance, ResultKind, ToolResult};

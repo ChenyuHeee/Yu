@@ -771,7 +771,7 @@ impl Agent {
             if slots[index].is_some() {
                 continue;
             }
-            if supports_parallel(&tu.name) {
+            if may_run_concurrently(&self.tools, &tu.name) {
                 concurrent.push(index);
             } else {
                 exclusive.push(index);
@@ -786,7 +786,7 @@ impl Agent {
             let tu = uses[index].clone();
             let gate = self.gate.clone();
             let registry = self.tools.clone();
-            let ctx = self.ctx.clone();
+            let ctx = self.tools.context_for(&tu.name);
             let journal = self.journal.clone();
             let timeline = self.timeline.clone();
             let agent = self.config.id.clone();
@@ -814,7 +814,7 @@ impl Agent {
             let _admission = self.gate.admit(false).await;
             let outcome = run_one(
                 self.tools.clone(),
-                self.ctx.clone(),
+                self.tools.context_for(&tu.name),
                 self.journal.clone(),
                 self.config.id.clone(),
                 tu,
@@ -858,7 +858,11 @@ async fn run_one(
     replay: Arc<Replay>,
 ) -> Result<(ContentBlock, Reduction), yu_wire::WireError> {
     let name = tu.name.clone();
-    let input = tu.input.clone();
+    // The input as the implementation reads it: the wire's parameter names
+    // translated once, here, so that the effect intent, the world's verdict and
+    // the execution itself all see the same object — and so that the record is
+    // in one vocabulary whichever face the call arrived under.
+    let input = registry.input_for(&name, &tu.input);
 
     // What this call is about to change, if anything, and the key the record
     // will hold it under.
@@ -1310,6 +1314,18 @@ fn supports_parallel(name: &str) -> bool {
     matches!(name, "read_file" | "list_dir")
 }
 
+/// Whether a call wearing `name` may run concurrently with its siblings.
+///
+/// Resolved through the registry rather than asked of the name directly, because
+/// the name on the wire is a profile's and the capability is the
+/// implementation's: under a profile a reader arrives as `Read`, and it did not
+/// stop being a reader when it changed its name.
+fn may_run_concurrently(tools: &ToolRegistry, name: &str) -> bool {
+    tools
+        .get(name)
+        .is_some_and(|tool| supports_parallel(tool.name()))
+}
+
 /// The name recorded for a reduction is the path the result actually took.
 ///
 /// Not always the one `choose` proposed: a spill the store refused comes back as
@@ -1614,6 +1630,100 @@ mod tests {
         assert!(!supports_parallel("write_file"));
         assert!(!supports_parallel("exec"));
         assert!(!supports_parallel("some_new_tool_nobody_declared"));
+    }
+
+    /// A face that arrived under a profile keeps the admission its
+    /// implementation declared.
+    ///
+    /// The gate is the thing this can regress silently: a profile renames the
+    /// reader, the name stops matching the free function's list, and reads
+    /// become serial — slower, with nothing in the transcript to say why.
+    #[test]
+    fn a_profiled_reader_keeps_its_parallel_admission() {
+        let profile = yu_tools::ToolProfile::from_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../captures/claude-code/profile/claude-code-2.1.248.json"
+        ))
+        .expect("the committed capture loads");
+        let profiled =
+            ToolRegistry::profiled("/tmp", Arc::new(profile)).expect("every face binds");
+        assert!(may_run_concurrently(&profiled, "Read"), "the reader is still a reader");
+        assert!(!may_run_concurrently(&profiled, "Write"));
+        assert!(!may_run_concurrently(&profiled, "Edit"));
+        assert!(!may_run_concurrently(&profiled, "Bash"));
+        assert!(!may_run_concurrently(&profiled, "nobody_declared_this"));
+
+        let plain = ToolRegistry::native("/tmp");
+        assert!(may_run_concurrently(&plain, "read_file"));
+        assert!(may_run_concurrently(&plain, "list_dir"));
+        assert!(!may_run_concurrently(&plain, "exec"));
+    }
+
+    /// A profiled surface, driven the way a model drives it.
+    ///
+    /// The wire name is what arrives; the implementation is what runs; the
+    /// record is what is left. This is the loop's half of step 3, and it is the
+    /// test that fails if the translation ever moves out of `run_one`: the
+    /// registry would hand `read_file` an input whose only key is `file_path`,
+    /// and the tool would report that it requires `path`.
+    #[tokio::test]
+    async fn a_wire_named_call_reaches_the_implementation_and_is_journalled() {
+        let dir = std::env::temp_dir().join(format!("yu-core-profile-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        std::fs::write(dir.join("hello.txt"), "The blue crumb is under the third stone.\n").unwrap();
+
+        let profile = yu_tools::ToolProfile::from_path(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../captures/claude-code/profile/claude-code-2.1.248.json"
+        ))
+        .expect("the committed capture loads");
+        let registry = ToolRegistry::profiled(&dir, Arc::new(profile)).expect("every face binds");
+
+        let turn = serde_json::json!({
+            "id": "msg-fake",
+            "model": "fake-model",
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "read it", "signature": "sig"},
+                {"type": "tool_use", "id": "call_00_read", "name": "Read",
+                 "input": {"file_path": "hello.txt"}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })
+        .to_string();
+        let fake = test_support::FakeEndpoint::scripted(vec![turn, test_support::final_reply("read")]);
+
+        let journal = Arc::new(Journal::open(&dir, SessionId::new("s")).await.unwrap());
+        let mut agent = Agent::new(
+            fake.client(),
+            journal.clone(),
+            Arc::new(registry),
+            Timeline::new(),
+            AgentConfig::new(AgentId::new("executor"), "fake-model").max_steps(2),
+            dir.clone(),
+        );
+        let outcome = agent.run("read hello.txt").await.expect("the run completes");
+        assert_eq!(outcome.tool_calls, 1, "the call was made and answered");
+
+        let results: Vec<String> = journal
+            .history()
+            .await
+            .expect("the record reads back")
+            .into_iter()
+            .filter_map(|event| match event.body {
+                EventBody::ToolResult { inline, .. } => inline,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            results,
+            vec!["1\tThe blue crumb is under the third stone.\n2\t".to_owned()],
+            "the answer is the face's, and the record holds the implementation's own result"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

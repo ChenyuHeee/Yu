@@ -67,15 +67,27 @@ exec keys=['command'] ×4
 
 `Tool::definition()`(`crates/yu-tools/src/native.rs:135`)是**唯一**产生线上形状的地方。
 
-- [ ] `name()` 保持不变 —— 它是**派发键**(实现身份)
-- [ ] `definition()` 有 profile 就用 profile 的 name / description / schema
-- [ ] registry 构造时建一张 `wire_name → impl` 映射
-- [ ] 没有 profile 时回落到内置那份 —— 与 `Quirks::unknown()` **同一个形状**(没测量就用保守的默认)
+- [x] `name()` 保持不变 —— 它是**派发键**(实现身份)
+- [x] 有 profile 就用 profile 的 name / description / schema
+- [x] registry 构造时建一张 `wire_name → impl` 映射
+- [x] 没有 profile 时回落到内置那份 —— 与 `Quirks::unknown()` **同一个形状**(没测量就用保守的默认)
+
+**实测(2026-10-13)。** 形状来自两处,而且**分开**(`crates/yu-tools/src/profile.rs` 与 `native.rs` 的脸表):
+
+- 快照:`{"tools": […], "system": […]}`。`system` **不读** —— 执行层的 prompt 是另一个决定,把同一个包里的东西顺手拿进来不是"对齐形状"该做的事。装载器不修剪、不重排、不"整理":它一解释,就不再是"发出去过的那份"。
+- 脸表(`FACES`,4 条)只说快照**说不出**的事:哪个实现站在哪张脸后面、它读哪些参数、哪些句子它不肯重复。26 个名字因此收成 4 张能兑现的脸,其余 22 个不出现(约束 4)。
+- `ToolRegistry::profiled(cwd, profile)` / `profiled_read_only(...)` 按**快照的顺序**注册(缓存前缀);dispatch 两个名字都认(线上名 `Read` 与实现名 `read_file` —— 后者是记录里的身份,重跑指令靠它继续有效);输入在 `run_one` 里**翻译一次**,因此 effect / effect_in_place / execute 看到的是同一个对象。
+- 参数是**承诺**:快照里有、实现不读的参数(`pages`、`run_in_background`、`dangerouslyDisableSandbox`)从 schema 里去掉;反过来,实现要读而快照里没有的参数 → **装载失败**。快照改了措辞、把我们拒抄的那句换掉 → 也**装载失败**(否则那句谎话会安安静静地活下来)。
+- `--tool-profile`(`run` 与 `decide`):装载失败就**不启动**,绝不悄悄退回内置脸。
 
 **判据**:
-- 不给 profile 时,发出去的请求与今天**逐字节相同**
-- 给 profile 时,线上形状跟着变
-- **把 profile 加载删掉,测试要失败**
+- 不给 profile 时,发出去的请求与今天**逐字节相同** —— `wire_shape_baseline` 未动、未编辑,仍绿(把内置 schema 加一个参数,它立刻红,已实测)
+- 给 profile 时,线上形状跟着变 —— `crates/yu-tools/tests/profile_shapes.rs`(形状、句子、参数、翻译、结果形状)与 `crates/yu-cli/tests/tool_profile.rs`(真进程、真请求)
+- **把 profile 加载删掉,测试要失败** —— 已实测:让 `definitions()` 不看 profile,`every_face_says_what_was_kept…` 与 `the_schema_is_the_captures…` 两个测试红
+
+**两条读数的注脚,写下来免得下次重新发现:**
+- `input_schema` 内部的**键序**与抓包不同(serde_json 默认 map 排序),字段集合与取值相同 —— 要逐字节同就得开 `preserve_order`,而那会**反过来**移动内置那四份(它们是按排序写的),撞上 `WIRE_SHAPE`。逐字段相同,已经是这条判据的全部。
+- 没被 profile 覆盖的工具(`list_dir`)不进脸表,所以对齐面上没有它 —— 列目录在 Claude Code 的面上是 `Bash`/`Read` 的事。
 
 ---
 
@@ -83,9 +95,20 @@ exec keys=['command'] ×4
 
 按价值排:
 
-- [ ] **`Edit(file_path, old_string, new_string, replace_all)`** —— 价值最高,而且**约定最重**(精确匹配、必须唯一、`replace_all` 的语义)。没有它,每次改动都是整文件重写:既贵又严重偏离分布
+- [x] **`Edit(file_path, old_string, new_string, replace_all)`** —— 价值最高,而且**约定最重**(精确匹配、必须唯一、`replace_all` 的语义)。没有它,每次改动都是整文件重写:既贵又严重偏离分布
 - [ ] ~~**搜索**(`Grep` / `Glob`)~~ —— **前提被证伪,这条不成立**(见下)
-- [ ] **`exec` 补 `description`(必填)与 `timeout`** —— 模型习惯每次都发 `description`
+- [x] **`exec` 补 `description` 与 `timeout`** —— 模型习惯每次都发 `description`
+
+**实测(2026-10-13)。** 三件都做了,但**没有一件是照抄** —— 逐句核对之后有三处必须偏离原文:
+
+1. **`description` 不是必填。** 抓包的 `required` 只有 `["command"]`,而"schema 说可选、工具却报错"是反方向的说谎(模型会收到它没被警告过的失败)。它照常收下,并进**记录**(`EffectIntent.description`):那是事后最想知道、而记录别处补不回来的东西。改的是"脸后面的事",不是脸。
+2. **`timeout` 的 `default 120000 / max 600000` 只在脸的下面成立。** 对齐脸自带这个默认与上限(照着描述实现,句句为真);没有脸的 `exec` 没有 deadline —— 一个跑了十分钟的 `cargo build` 不是挂住,为了一个没人发过的句子去杀它是**改动了未测量的那条路**。显式的 `timeout` 两条路都认。
+3. **读的结果形状也照抄了。** 对齐脸下 `Read` 输出 `{n}\t{line}`(取自抓包自己的 `tool_result`:`"1\tThe blue crumb…\n2\t"`,注意连文件末尾那个空片段都编号 —— 真 `cat -n` 不编,抓包编),`offset`/`limit` 是**行号与行数**(`offset` 从 1 数,0 等价于 1:抓包 schema 的 `minimum: 0` 不允许它是个错误)。没有脸时按原样返回文件字节 —— 同一实现、两张脸的第一处,也是 `Read` 的 `cat -n` 句与 `Edit` 的 strip-the-prefix 句得以保留的原因。
+
+**逐句核对的结果(清单在各工具的 refusal 表里,判据在各测试里):**
+- `Edit` 的 "You must Read the file in this conversation…" **去掉**(本 harness 不记录会话读过哪些文件),`Write` 的 "Overwriting an existing file you haven't Read will fail" 是同一句谎话,同理;`Read` 去掉 "must be an absolute path"、"Reads up to 2000 lines by default"(截断是归约机制的事,带 manifest;阅读器里再来一个静默上限就会藏掉 manifest 没记账的字节)、images/PDF/notebook 那句(连 `pages` 参数一起)、"Reading a directory…system reminder" 那句、"the harness tracks file state for you" 那句。
+- `Read` 的 offset/limit 句与 `cat -n` 句**保留**(都做到了);`Edit` 的精确匹配、唯一性、strip-the-prefix 三句**保留**(前两句是被强制的,第三句正因为我们按抓包编号输出才成立);`Write` 的 "For partial changes, use Edit instead." 保留。
+- `Bash`:avoid-list 句保留(这里确实有 `cat/head/tail/sed/awk/echo` 的专用工具),`timeout` 句保留,# Git 段保留两条(`gh`、只在被要求时提交/推送),**去掉** "Executes a bash command"(这里跑 `sh -c`)、工作目录持久化那段、输出给用户看、`run_in_background`、交互式 flag,以及 Claude Code 自己的署名行与 🤖 标记 —— 后者不是这条工具的行为,是**别的产品的名字**。
 
 **三条前提被实测推翻:**
 
