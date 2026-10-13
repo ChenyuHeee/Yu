@@ -52,10 +52,12 @@ exec keys=['command'] ×4
 
 ## 2 抓真形状
 
-- [ ] 把 Claude Code 指到这个端点(`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 已在环境里),用反代抓一次请求,取出 `tools` 数组
-- [ ] 写一个 capture → profile 的转换(机械活)
+- [x] 把 Claude Code 指到这个端点,用反代抓一次请求,取出 `tools` 数组
+- [x] 写一个 capture → profile 的转换
 
-**这一抓同时解决另一件事**:`system` 字段也在同一个包里,原先"扒 prompt"的计划一次做完。
+**实测(2026-10-13)。** Claude Code 2.1.248,一个真实会话,3 个请求全 200,`Read` 与 `Bash` 真的被调用过。**26 个工具**。抓包在**转发前**记录,`body_sha256_as_received == body_sha256_recorded` 三个请求全等;线上数组与 Claude Code 自己的 `system:init` 事件两个来源对工具列表一致(26/26)。
+
+**抓包推翻了这个 TODO 的三条前提 —— 见下面第 4 步的批注。** 另外两条实测:凭据走 `Authorization: Bearer` 也可以(WIRE-FACTS 之前只测过 `x-api-key`);`system` 是 3 个 block(计费头 / 62 字符 SDK 前言 / ~7.5KB 系统提示,前两块带 `cache_control`),所以"扒 prompt"那份材料也在同一个包里。
 
 **判据**:`yu` 实际发出去的 `tools` 数组与抓包**逐字段相同** —— 一个测试,把 profile 拿掉或改一个字段,它失败。
 
@@ -82,8 +84,16 @@ exec keys=['command'] ×4
 按价值排:
 
 - [ ] **`Edit(file_path, old_string, new_string, replace_all)`** —— 价值最高,而且**约定最重**(精确匹配、必须唯一、`replace_all` 的语义)。没有它,每次改动都是整文件重写:既贵又严重偏离分布
-- [ ] **搜索**(`Grep` / `Glob`)—— 没有它,模型会回落到 `exec grep`,而**被训练的 `Bash` 描述里明确劝阻这件事**
+- [ ] ~~**搜索**(`Grep` / `Glob`)~~ —— **前提被证伪,这条不成立**(见下)
 - [ ] **`exec` 补 `description`(必填)与 `timeout`** —— 模型习惯每次都发 `description`
+
+**三条前提被实测推翻:**
+
+1. **`Grep` / `Glob` 在 2.1.248 的工具面里根本不存在** —— 全 body 零次出现。**没有形状可抄。** 而这条的理由也是错的:TODO 原写"被训练的 `Bash` 描述里明确劝阻这件事",实测 Bash 描述的 avoid-list 是 `cat/head/tail/sed/awk/echo`,**不含 grep**。模型确实去够 `Grep` 了(第 0 步实测),没够到,回落到 `Bash` grep —— 那是**它自己也在摸索**,不是偏离一个明确约定。
+2. **`TodoWrite` 不在默认工具面里。** 被 `Task*` 家族(`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`)取代,只在 `CLAUDE_CODE_ENABLE_TASKS=0` 时出现(两种都测了,那个 flag 用 4 个工具换 1 个,别的没变)。原写"抓包里会有 `TodoWrite`"只在那个 flag 下成立。
+3. **`Task` 是客户端内部名,线上名是 `Agent`。**
+
+**还有一件改变了工序的:描述在与实现不符时会说谎,而已经有实例。** `Read`/`Write`/`Edit` 的描述断言了**这个 harness 不保持的客户端状态** —— *"You must Read the file in this conversation before editing, or the call will fail"*。逐字抄下来就是 DESIGN 说的那件事。所以"把描述抄下来"这一步**必须**接上"逐句问实现做不做得到",而做不到的那句要去掉 —— 这不是保险起见,是已知至少有一句做不到。
 
 **每一件都按同一道工序:把描述抄下来,再逐句问实现做不做得到。**
 
