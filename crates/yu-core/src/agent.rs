@@ -1977,7 +1977,8 @@ mod tests {
         );
         assert!(
             !text.contains("fnv1a64:")
-                && !text.contains("saved as blob")
+                && !text.contains("Full output saved to")
+                && !text.contains("<persisted-output>")
                 && !text.contains("on disk"),
             "a refused spill must not claim an address that does not resolve: {}",
             snippet(&text)

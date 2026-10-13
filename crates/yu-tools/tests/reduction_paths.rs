@@ -257,6 +257,75 @@ fn the_self_loop_is_closed_end_to_end() {
 // Claim 2 — reductions are explicit, and manifests do not lie
 // ---------------------------------------------------------------------------
 
+// The two shapes below are the alignment claim, not the reduction claim: a
+// message in a shape no model was trained on spends the post-training a model
+// has for harness output. Neither test claims more than the arm it checks: the
+// `<persisted-output>` block is Claude Code's verbatim, and its sentence and
+// size rendering are asserted whole; the truncation marker is its scaffold,
+// with this project's unit (bytes) because a dropped payload is measured in
+// bytes. Both assert the prefix this project invented is gone. Revert either
+// rendering arm and these fail.
+
+#[test]
+fn a_truncated_payload_renders_claude_codes_truncation_marker() {
+    let mut result = synthetic(ResultKind::File, 40_000);
+    result.reproducible = true;
+    result.addressable = true;
+    result.provenance = Provenance::new("read_file", json!({"path": "huge.rs"}));
+    let reduction = reducer().choose(&result, Pressure::high());
+    let mut spill = |_: &[u8]| "unused".to_owned();
+    let shown = reducer().apply(result, &reduction, &mut spill);
+
+    let text = shown.render();
+    // Claude Code's marker (`... [N <unit> truncated] ...`; the unit is bytes
+    // here because that is what a dropped payload is measured in).
+    assert!(
+        text.contains("... [40000 bytes truncated] ..."),
+        "the truncation marker must be the known shape: {text}"
+    );
+    assert!(
+        !text.contains("[reduction]"),
+        "the invented prefix must be gone: {text}"
+    );
+    // ...and the shape change did not make the message vaguer: the count, the
+    // absence, and the way back are all still stated.
+    assert!(text.contains("nothing of it is in this message"), "{text}");
+    assert!(text.contains("Re-run `read_file"), "{text}");
+    assert_eq!(shown.present_bytes(), 0);
+    assert_eq!(shown.omitted_bytes(), 40_000);
+}
+
+#[test]
+fn a_spilled_payload_renders_claude_codes_persisted_output_block() {
+    let mut result = synthetic(ResultKind::File, 9_000);
+    result.addressable = true;
+    let reduction = reducer().choose(&result, Pressure::high());
+    let mut spill = |bytes: &[u8]| format!("store:{}", bytes.len());
+    let shown = reducer().apply(result, &reduction, &mut spill);
+
+    let text = shown.render();
+    // Claude Code's block for an output too large to keep: the wrapper, and
+    // its own sentence with its own byte rendering (9000 bytes is `8.8KB`).
+    assert!(
+        text.contains("<persisted-output>") && text.contains("</persisted-output>"),
+        "the block must be the known shape: {text}"
+    );
+    assert!(
+        text.contains("Output too large (8.8KB). Full output saved to: store:9000"),
+        "the size and the address must be Claude Code's sentence: {text}"
+    );
+    assert!(
+        !text.contains("[reduction]"),
+        "the invented prefix must be gone: {text}"
+    );
+    // DESIGN's content requirement is unchanged: the sentence itself carries
+    // the instruction — delegate a reader, do not read the whole file.
+    assert!(text.contains("Do not read the whole blob yourself"), "{text}");
+    assert!(text.contains("Delegate"), "{text}");
+    assert_eq!(shown.present_bytes(), 0);
+    assert_eq!(shown.omitted_bytes(), 9_000);
+}
+
 #[test]
 fn a_dropped_payload_names_what_is_missing_and_never_claims_completeness() {
     let mut result = synthetic(ResultKind::File, 40_000);
@@ -306,12 +375,20 @@ fn a_spilled_payload_carries_the_pointer_and_the_delegation_instruction() {
 }
 
 #[test]
-fn a_reduced_payload_says_it_is_a_reduction() {
+fn a_reduced_payload_says_it_is_not_the_raw_result() {
+    // Claude Code has no form for this one — it never replaces a tool result
+    // with a summary of it — so the note is ours, and the test says so: what is
+    // checked is that the note states the facts and wears no invented marker.
     let result = synthetic(ResultKind::Search, 2_000);
     let shown = reducer().apply_reader_answer(result, "one hit in parser.rs");
     let text = shown.render();
     assert!(text.starts_with("one hit in parser.rs"), "{text}");
-    assert!(text.contains("reduction"), "{text}");
+    assert!(text.contains("not the raw search result"), "{text}");
+    assert!(text.contains("1980 of 2000 bytes are not shown"), "{text}");
+    assert!(
+        !text.contains("[reduction]"),
+        "the invented prefix must be gone: {text}"
+    );
     assert!(text.contains("2000"), "the omitted count: {text}");
     assert!(!shown.is_complete());
 }

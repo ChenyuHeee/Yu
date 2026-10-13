@@ -473,7 +473,7 @@ impl Reducer {
                         // them.
                         rerun: None,
                         note: format!(
-                            "the full {} result is on disk; the pointer above says how to reach it, and the provenance records the call that produced it",
+                            "The full {} result is on disk, and the provenance records the call that produced it",
                             result.kind.as_str()
                         ),
                         blob: Some(stored),
@@ -484,8 +484,14 @@ impl Reducer {
 
             Reduction::DelegateReader { subagent, .. } => {
                 let kind = result.kind;
+                // This text is OURS, not Claude Code's: Claude Code has no form
+                // for a harness-side dispatch notice — its subagent's answer
+                // arrives as the tool result itself, with nothing announcing it.
+                // It is written as plain prose rather than a bracketed tag like
+                // `[delegated]`, because a tag nothing was trained on is the
+                // shape this module is replacing.
                 let text = format!(
-                    "[delegated] the raw {kind} result ({size} bytes) was handed to the `{subagent}` reader and never entered this context.\nQuestion: {question}\nThe reader's answer follows as its own message. Do not read the raw output yourself — avoiding that cost is the whole point of this path.",
+                    "The raw {kind} result ({size} bytes) was handed to the `{subagent}` reader and never entered this context.\nQuestion: {question}\nThe reader's answer follows as its own message. Do not read the raw output yourself — avoiding that cost is the whole point of this path.",
                     kind = kind.as_str(),
                     size = result.size,
                     subagent = subagent,
@@ -509,8 +515,11 @@ impl Reducer {
 
             Reduction::SandboxReduce => {
                 let kind = result.kind;
+                // Ours, for the same reason the reader dispatch above is: no
+                // model was trained on a harness reporting that it sandboxed a
+                // payload, and a bracketed tag would pretend otherwise.
                 let text = format!(
-                    "[sandboxed] the {kind} payload ({size} bytes) was routed to the sandbox; only the reduced result comes back, as its own message.\nRead that result, not the raw data — the raw data is not in this context.",
+                    "The {kind} payload ({size} bytes) was routed to the sandbox; only the reduced result comes back, as its own message.\nRead that result, not the raw data — the raw data is not in this context.",
                     kind = kind.as_str(),
                     size = result.size,
                 );
@@ -671,20 +680,33 @@ pub fn rerun_command(provenance: &Provenance) -> Option<String> {
     Some(format!("{}({input})", provenance.tool))
 }
 
-/// The instruction-carrying pointer. DESIGN borrows the shape from opencode:
-/// "完整输出已存到 `<file>`。用 Task 工具让 explore agent 处理它。不要自己读整个
-/// 文件 —— 委托出去以节省上下文".
+/// The instruction-carrying pointer: where the bytes are, and what to do with
+/// them instead of reading them.
+///
+/// **Ours.** DESIGN's requirement is content, not shape — "隔离必须带指令":
+/// the sentence must carry the address, say to delegate a reader, and say not to
+/// read the whole file. The address line above it is Claude Code's
+/// ("Output too large (…). Full output saved to: …", rendered by
+/// [`ToolResult::render`]), but in Claude Code that address is a path the model
+/// can open with Read, so the block stands alone; a blob digest is not readable
+/// by the executor's tools, and the instruction is the way back in.
+///
+/// [`ToolResult::render`]: crate::result::ToolResult::render
 fn spill_pointer(digest: &str, size: u64) -> String {
     format!(
-        "Complete output ({size} bytes) saved as blob `{digest}`.\n\
-         Do not read the whole blob yourself. Delegate: hand the digest to a reader agent and \
-         ask it your question — the reader returns the answer, not the file. Delegating costs a \
-         few hundred tokens; reading the blob whole costs {size} bytes of the context this path \
-         exists to protect. The bytes are already on disk and will not be spilled again, so \
-         refer to them by `{digest}`."
+        "Do not read the whole blob yourself. Delegate: hand `{digest}` to a reader agent and \
+         ask it your question — the reader returns the answer, not the file. Reading the blob \
+         whole costs {size} bytes of the context this path exists to protect, and the bytes are \
+         already on disk, so they will not be spilled again."
     )
 }
 
+/// The manifest's prose for a dropped payload: what happened to it and what is
+/// not here. The way back — `rerun` or `blob` — is printed by
+/// [`ToolResult::render`] from the manifest's own fields, so this note does not
+/// repeat it; the two together must still name every field the manifest set.
+///
+/// [`ToolResult::render`]: crate::result::ToolResult::render
 fn drop_note(result: &ToolResult, rerun: Option<&str>) -> String {
     let kind = result.kind.as_str();
     match (result.provenance.from_spill.as_deref(), rerun) {
@@ -693,12 +715,11 @@ fn drop_note(result: &ToolResult, rerun: Option<&str>) -> String {
              bytes are already on disk at that digest. Delegate a reader to the blob rather than \
              reading it whole."
         ),
-        (None, Some(rerun)) => format!(
-            "The {kind} result was dropped, not summarised. Re-running `{rerun}` produces it \
-             again; nothing of it is in this message."
+        (None, Some(_)) => format!(
+            "The {kind} result was dropped, not summarised; nothing of it is in this message."
         ),
         (None, None) => format!(
-            "The {kind} result was dropped and no re-run command is known for `{}`. Nothing of it \
+            "The {kind} result was dropped and no re-run command is known for `{}`; nothing of it \
              is in this message.",
             result.provenance.tool
         ),
