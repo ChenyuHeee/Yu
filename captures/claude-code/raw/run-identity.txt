@@ -1,0 +1,3 @@
+claude: 2.1.248 (Claude Code)
+model: deepseek-flash[1m]
+args: -p <prompt.txt> --output-format stream-json --verbose

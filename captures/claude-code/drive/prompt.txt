@@ -1,0 +1,1 @@
+Use the Read tool to read hello.txt in the working directory. Then use the Bash tool to list the files in the working directory. Reply with one short line summarizing what you found.
