@@ -195,3 +195,52 @@ things it already says:
   caching mechanism rather than a hint to it. The probe that reports this now
   sends a breakpoint and compares it against not sending one, instead of
   inferring the answer from the requests that carry none.
+
+## Does the aligned tool surface help? First measurement: no, and it costs more
+
+TODO step 5 asked for the assumption *"形状无所谓"* to be turned into a
+measurement that can fail. It was run, and on this task it failed in the
+direction nobody was arguing for.
+
+One task, two arms, same model, same sandbox, same `--tools full`, the only
+difference being `--tool-profile`:
+
+> In this directory there are exactly three .txt files. Each contains the line
+> 'STATUS: pending'. Change that line to 'STATUS: done' in all three, changing
+> nothing else in any file. Then report which files you changed.
+
+| arm | tool calls | tokens in | out | cache read | steps |
+|---|---|---|---|---|---|
+| **A — aligned** (`claude-code-2.1.248`) | `Read`×6 `Edit`×3 `Bash`×4 = 13 | **3742** | 1728 | **19840** | 8 |
+| **B — original shapes** | `read_file`×4 `list_dir`×2 `exec`×3 = 9 | **1725** | 1464 | 9984 | 7 |
+
+**Both succeeded**, verified outside the harness: 3 of 3 files changed, 104 bytes
+each, zero `pending` left, and arm B's output is byte-identical to arm A's.
+
+**The aligned surface cost about twice the input tokens and half again the tool
+calls.** The cause is not subtle: the captured descriptions are long — Claude
+Code's `Read` and `Bash` descriptions are several hundred words each — and a tool
+description is paid for on **every request**, cached or not. An alignment that
+buys in-distribution phrasing at twice the prefix cost is a trade that has to be
+shown to pay, and this measurement does not show it.
+
+### The reason TODO gave for `Edit` is false at this endpoint
+
+TODO: *"没有它,每次改动都是整文件重写:既贵又严重偏离分布."* Arm B had no `Edit`
+and **did not rewrite any file**. It ran `exec` with `sed`. The executor always
+has `exec`, so a missing dedicated tool does not degrade into an expensive
+rewrite — it degrades into the shell.
+
+That is the same shape as the `Grep` finding from the capture: the model reaches
+for `exec` as the universal fallback. Two separate expectations about what a
+missing tool costs were both wrong for the same reason.
+
+### What this does not say
+
+One task, one run per arm. The task was easy and both arms had a one-line shell
+answer available, so it cannot separate "the aligned surface is better at edit
+semantics" from "this task did not need edit semantics". A task where `Edit`'s
+exactness matters — a target string that occurs more than once, or where
+whitespace is load-bearing — is the measurement that would, and it has not been
+run. Until it is, the honest reading is: **alignment has a measured cost and no
+measured benefit.**
