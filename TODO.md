@@ -38,8 +38,17 @@ exec keys=['command'] ×4
 [reduction] 99 of 99 bytes spilled to blob fnv1a64:…; only the pointer is in this message.
 ```
 
-- [ ] 把截断/落盘两种换成 **Claude Code 的形态** —— 只有它是对齐目标
-- [ ] `Reduced` 的尾注同样处理
+- [x] 把截断/落盘两种换成 **Claude Code 的形态** —— 只有它是对齐目标
+- [x] `Reduced` 的尾注同样处理
+
+**实测。** 形态从装好的 bundle 里取的,带字节偏移:
+- **截断** —— `... [N truncated] ...` 是 Claude Code 的脚手架(`h8t` / `Gut` 两处都在),但**单位是我们的**:它数行或字符,而被丢掉的 payload 没有文本可数,manifest 量的是字节。这一点写在 `render` 的文档注释里。
+- **落盘** —— `<persisted-output>` 块**逐字**采纳(`Lae`,它自己的 `Output too large (…). Full output saved to: …` 和它自己的字节渲染)。两处差异都标明是我们的:没有 `Preview (first 2KB):` 段(一个 `Spilled` 手里没有字节,不能声称有预览),以及那句指令是**我们的**(Claude Code 里地址是模型能直接打开的路径,块本身站得住;而 blob digest 不是执行者工具能读的东西,所以那句指令是回去的路)。
+- **`Reduced`** —— **Claude Code 没有这一格**:它从不把工具结果换成对它的摘要,所以没得抄。括号是它的注释风格,字是我们的,**标明是我们的**。
+
+顺带同一个函数里另外两个自造标签(`[delegated]` / `[sandboxed]`)也去掉了 —— 同一类缺陷。两条测试各一个,**回退渲染即失败**(失败信息是真实的:回退后打印出 `[reduction] dropped 40000 of 40000 bytes…`)。
+
+**两处诚实与形态相抵的地方,都判给了诚实**:没有预览段(有就是声称一个不存在的预览)、单位用字节(抄 `N lines truncated` 就是一个没人量过的数)。
 
 **Claude Code 没有对应形态的那一格,就是我们自己定义的 —— 要标明是我们自己的。** 不要从另一个 harness 借一句读起来像的:借来的措辞不在任何一方的分布里,而且因为熟悉而更难被发现。
 
@@ -96,7 +105,7 @@ exec keys=['command'] ×4
 按价值排:
 
 - [x] **`Edit(file_path, old_string, new_string, replace_all)`** —— 价值最高,而且**约定最重**(精确匹配、必须唯一、`replace_all` 的语义)。没有它,每次改动都是整文件重写:既贵又严重偏离分布
-- [ ] ~~**搜索**(`Grep` / `Glob`)~~ —— **前提被证伪,这条不成立**(见下)
+- [x] ~~**搜索**(`Grep` / `Glob`)~~ —— **不做,前提被证伪**(见下;划线是结论,不是待办)
 - [x] **`exec` 补 `description` 与 `timeout`** —— 模型习惯每次都发 `description`
 
 **实测(2026-10-13)。** 三件都做了,但**没有一件是照抄** —— 逐句核对之后有三处必须偏离原文:
