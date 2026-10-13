@@ -211,22 +211,63 @@ pub fn redact_key_material(message: &str) -> String {
     redact_named_values(&redact_masked_suffix(message))
 }
 
-/// Longest run of characters that can be the preserved tail of a masked key.
+/// How far back to look for the label that makes a mask a credential.
 ///
-/// Measured as four (`****0000`). Asterisks followed by something longer are a
-/// word that happens to follow asterisks, not a key's tail, and are left alone
-/// — redaction that eats prose trades one failure for another.
-const MAX_MASKED_SUFFIX: usize = 8;
+/// Not a parser and not a heuristic about prose: the measured shape is an
+/// endpoint saying `Your api key: ****0000 is invalid`, and the label is what
+/// says the asterisks are a mask rather than punctuation.
+const LABEL_WINDOW: usize = 40;
+
+/// Words that, immediately before a mask, mean the mask is a credential.
+const KEY_LABELS: [&str; 7] = [
+    "key",
+    "token",
+    "secret",
+    "credential",
+    "authorization",
+    "bearer",
+    "auth",
+];
 
 /// The characters a key, or what is left of one, can be made of.
 fn is_key_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-' || c == '_'
 }
 
+/// Whether what precedes this mask says it is a credential.
+///
+/// **This exists because the previous rule destroyed prose, and it was measured
+/// rather than argued.** That rule dropped the key characters after any `**` run
+/// of at most [`MAX_MASKED_SUFFIX`] — and `**no-op**`, `**bold**` and `**rare**`
+/// are all `**` runs of at most eight, so applying it to text rather than to an
+/// error message turned markdown bold into `****`. The comment defending the old
+/// constant said "redaction that eats prose trades one failure for another"; it
+/// did not, because a four-character word and a four-character key tail are the
+/// same shape, and no limit on the length can tell them apart.
+///
+/// The label can. It is also how the real leak arrives: an endpoint that echoes
+/// a credential says which credential it is echoing, because that is what makes
+/// the message useful to the person reading it.
+fn mask_is_labelled(chars: &[char], before_mask: usize) -> bool {
+    let from = before_mask.saturating_sub(LABEL_WINDOW);
+    let window: String = chars[from..before_mask]
+        .iter()
+        .collect::<String>()
+        .to_ascii_lowercase();
+    KEY_LABELS.iter().any(|label| window.contains(label))
+}
+
 /// Drop what a `****` mask preserves from the key behind it.
 ///
 /// `Your api key: ****0000` loses `0000`; the mask itself stays, because the
 /// mask is what says a credential was involved, and it is not key material.
+///
+/// The trade this makes, stated plainly: a mask **without** a label nearby is
+/// left alone, so an endpoint that echoed `****0000` with no word saying what it
+/// was would keep those four characters. Against that: every `**word**` in any
+/// text this function touches would otherwise be destroyed, and the function
+/// touches error bodies — including a gateway's HTML — so the damage would be to
+/// a record that is supposed to be an honest copy of what was said.
 fn redact_masked_suffix(message: &str) -> String {
     let chars: Vec<char> = message.chars().collect();
     let mut out = String::with_capacity(message.len());
@@ -247,7 +288,9 @@ fn redact_masked_suffix(message: &str) -> String {
         while chars.get(end).is_some_and(|c| is_key_char(*c)) {
             end += 1;
         }
-        if end - stars > MAX_MASKED_SUFFIX {
+        if mask_is_labelled(&chars, i) {
+            // Labelled: the run after the mask is a key tail and goes.
+        } else {
             out.extend(chars[stars..end].iter());
         }
         i = end;
@@ -321,6 +364,68 @@ fn starts_with_ascii(lower: &[char], i: usize, needle: &str) -> bool {
         j += 1;
     }
     true
+}
+
+#[cfg(test)]
+mod prose_tests {
+    use super::*;
+
+    /// **Redaction must not eat prose, and this is the measured counterexample.**
+    ///
+    /// The rule before this one dropped the key characters after any run of at
+    /// most eight `*`s. Markdown bold is exactly that shape, so every `**word**`
+    /// in any text the function touched came out as `****`. That is a record
+    /// lying about what was said, in the one function whose job is to make the
+    /// record safe to keep.
+    #[test]
+    fn bold_text_survives_redaction() {
+        for text in [
+            "the tool is a `**no-op**`",
+            "this is **bold** text",
+            "a **rare** case",
+            "**a** and **b**",
+        ] {
+            assert_eq!(
+                redact_key_material(text),
+                text,
+                "redaction changed text that contains no credential: {text}"
+            );
+        }
+    }
+
+    /// And the leak it exists for still closes.
+    #[test]
+    fn a_labelled_mask_still_loses_the_key_characters_it_preserved() {
+        let redacted = redact_key_material("Authentication Fails, Your api key: ****0000 is invalid");
+        assert!(
+            !redacted.contains("0000"),
+            "the key characters the mask preserved survived: {redacted}"
+        );
+        assert!(
+            redacted.contains("****"),
+            "and the mask itself stays — it is what says a credential was involved: {redacted}"
+        );
+        assert!(
+            redacted.contains("Authentication Fails"),
+            "the rest of the message is not collateral: {redacted}"
+        );
+    }
+
+    /// The trade, written down where someone changing this will read it.
+    ///
+    /// An unlabelled mask is left alone. The alternative is destroying every
+    /// `**word**` in every error body — including a gateway's HTML — and the
+    /// damage there is to a record that is supposed to be an honest copy.
+    #[test]
+    fn an_unlabelled_mask_is_left_alone_and_that_is_the_trade() {
+        assert_eq!(
+            redact_key_material("the value ****0000 was rejected"),
+            "the value ****0000 was rejected",
+            "if this ever changes, the bold test above is what will break first — \
+             and a shape that tells a mask from punctuation is what it would take \
+             to have both"
+        );
+    }
 }
 
 #[cfg(test)]
