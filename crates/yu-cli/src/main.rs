@@ -29,7 +29,7 @@ use yu_workflow::handover::{
     Handover, ReaderAngle, WireReader, change_generation, trigger_for,
 };
 use yu_observe::{AgentId, ContextComposition, SpanKind, Timeline};
-use yu_tools::ToolRegistry;
+use yu_tools::{ToolProfile, ToolRegistry};
 use yu_wire::capability::Capabilities;
 use yu_wire::client::{StreamSink, WireClient};
 use yu_wire::types::{Message, MessagesRequest, Thinking, ThinkingDisplay};
@@ -124,6 +124,15 @@ enum Command {
         /// rebuild.
         #[arg(long)]
         policy: Option<PathBuf>,
+        /// A tool-shape profile: the `{tools, system}` snapshot a measured
+        /// client sent, as `captures/to_profile.py` writes it.
+        ///
+        /// Loaded, the executor's tools carry that client's names, descriptions
+        /// and schemas — restricted to the entries this harness can back, and to
+        /// the sentences it can stand behind. Without it, the built-in shapes
+        /// are used, unchanged.
+        #[arg(long)]
+        tool_profile: Option<PathBuf>,
     },
 
     /// Run the decision layer on a charter. The thin vertical slice.
@@ -162,6 +171,11 @@ enum Command {
         /// which is what lets one be changed without rebuilding anything.
         #[arg(long)]
         policy: Option<PathBuf>,
+        /// A tool-shape profile, as `yu run --tool-profile` takes it: the
+        /// executors this session derives are given that client's tool faces
+        /// instead of the built-in ones.
+        #[arg(long)]
+        tool_profile: Option<PathBuf>,
         /// A standing constraint. Repeat for several. These are *injected* into
         /// every executor rather than restated by the decision layer each round,
         /// which is the only way one cannot be dropped on the round nobody
@@ -287,6 +301,7 @@ async fn main() -> ExitCode {
             tools,
             session,
             policy,
+            tool_profile,
         } => {
             cmd_run(
                 &task,
@@ -297,6 +312,7 @@ async fn main() -> ExitCode {
                 tools,
                 session.as_deref(),
                 policy.as_deref(),
+                tool_profile.as_deref(),
             )
             .await
         }
@@ -314,6 +330,7 @@ async fn main() -> ExitCode {
             handover,
             handover_out,
             handover_at_growth,
+            tool_profile,
         } => {
             cmd_decide(
                 charter.as_deref(),
@@ -329,6 +346,7 @@ async fn main() -> ExitCode {
                 handover.as_deref(),
                 handover_out.as_deref(),
                 handover_at_growth,
+                tool_profile.as_deref(),
             )
             .await
         }
@@ -474,6 +492,7 @@ async fn cmd_run(
     tools: ToolSet,
     session: Option<&str>,
     policy_path: Option<&Path>,
+    profile_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let timeline = Timeline::new();
@@ -534,8 +553,15 @@ async fn cmd_run(
         Some(path) => Some(load_policy(path)?),
         None => None,
     };
-    let tools = Arc::new(build_tools(tools, cwd.clone(), policy.as_ref()));
-    eprintln!("--- tool surface: {}", describe_tools(&tools));
+    let profile = match profile_path {
+        Some(path) => Some(load_tool_profile(path)?),
+        None => None,
+    };
+    let tools = Arc::new(build_tools(tools, cwd.clone(), policy.as_ref(), profile.as_ref())?);
+    eprintln!(
+        "--- tool surface: {}",
+        describe_tools(&tools, profile.as_deref())
+    );
     let config = AgentConfig::new(AgentId::new("exec"), model).max_steps(max_steps);
     let mut agent = Agent::new(
         client.clone(),
@@ -610,21 +636,59 @@ async fn cmd_run(
     Ok(())
 }
 
-fn build_tools(set: ToolSet, cwd: PathBuf, policy: Option<&Policy>) -> ToolRegistry {
-    let registry = match set {
-        ToolSet::ReadOnly => ToolRegistry::read_only(cwd),
-        ToolSet::Full => ToolRegistry::native(cwd),
+/// The executor's tool surface, and the policy it reduces under.
+///
+/// Two things decide the surface, and they are separate on purpose: `--tools`
+/// says *what an executor may do* (nothing that changes the world, or anything),
+/// and `--tool-profile` says *what its tools are called and how they are
+/// described*. With a profile the two compose — a read-only profiled run is the
+/// profile's readers, a full one is every face this harness can back — and
+/// without one the answer is exactly what it was before either flag existed.
+fn build_tools(
+    set: ToolSet,
+    cwd: PathBuf,
+    policy: Option<&Policy>,
+    profile: Option<&Arc<ToolProfile>>,
+) -> anyhow::Result<ToolRegistry> {
+    let registry = match profile {
+        Some(profile) => {
+            let profile = profile.clone();
+            match set {
+                ToolSet::ReadOnly => ToolRegistry::profiled_read_only(cwd, profile),
+                ToolSet::Full => ToolRegistry::profiled(cwd, profile),
+            }
+            // Loud, and the run does not start: a profile that failed to load or
+            // to bind must not quietly become the built-in surface, because then
+            // the run would proceed under shapes nobody chose.
+            .map_err(|problem| anyhow::anyhow!("--tool-profile: {problem}"))?
+        }
+        None => match set {
+            ToolSet::ReadOnly => ToolRegistry::read_only(cwd),
+            ToolSet::Full => ToolRegistry::native(cwd),
+        },
     };
     // The policy's `[[reduction]]` rows become the table the tools reduce under.
     // Until this line existed, a policy could declare reduction rules, load them,
     // validate them — and nothing that reduces had ever read one.
-    match policy {
+    Ok(match policy {
         Some(policy) => registry.with_reducer(Arc::new(
             yu_tools::Reducer::new(yu_tools::Budget::default())
                 .with_table(Arc::new(policy.clone())),
         )),
         None => registry,
-    }
+    })
+}
+
+/// Read a tool-shape profile, saying which of its entries are backed here.
+///
+/// The count is printed because the difference between "the surface is the
+/// profile's" and "the surface is the part of the profile this harness can
+/// answer" is the whole of DESIGN 约束 4, and a run that quietly offered four of
+/// 26 tools would look exactly like one that offered all of them.
+fn load_tool_profile(path: &Path) -> anyhow::Result<Arc<ToolProfile>> {
+    let profile = ToolProfile::from_path(path)
+        .map_err(|problem| anyhow::anyhow!("--tool-profile: {problem}"))?;
+    Ok(Arc::new(profile))
 }
 
 /// Read a policy, and say out loud about any rule that can never fire.
@@ -689,11 +753,27 @@ async fn report_unresolved(journal: &yu_journal::Journal) {
 /// State the tool surface rather than leaving it to be inferred from a flag.
 ///
 /// An executor that can run commands and one that cannot produce the same
-/// looking transcript, so the run has to say which it was.
-fn describe_tools(registry: &ToolRegistry) -> String {
-    let mut names = registry.names();
+/// looking transcript, so the run has to say which it was — and now also which
+/// *faces* it was given, because the same capability wearing a measured name is
+/// a different thing to the model reading it.
+///
+/// The names are the wire names, and the profile's entry count is printed beside
+/// the number backed here: a run that offered four of a snapshot's 26 tools must
+/// not look like one that offered all 26.
+fn describe_tools(registry: &ToolRegistry, profile: Option<&ToolProfile>) -> String {
+    let mut names = registry.wire_names();
     names.sort();
-    names.join(", ")
+    match profile {
+        Some(profile) => format!(
+            "{} (profile `{}`: {} of its {} tools are backed here, the rest is not offered — \
+             DESIGN 约束 4, 不提供的,就不要放进去)",
+            names.join(", "),
+            profile.name(),
+            names.len(),
+            profile.entries().len()
+        ),
+        None => names.join(", "),
+    }
 }
 
 /// Report DESIGN's acceptance metric for one layer's context.
@@ -909,6 +989,7 @@ async fn boot_decision(
     policy: Option<&Policy>,
     resume: Option<&Handover>,
     session_name: Option<&str>,
+    profile: Option<&Arc<ToolProfile>>,
 ) -> anyhow::Result<DecisionBoot> {
     let timeline = Timeline::new();
     timeline.enter(AgentId::decision());
@@ -931,7 +1012,7 @@ async fn boot_decision(
         None => Journal::open(dir, session.clone()).await?,
     }
     .with_timeline(timeline.clone()));
-    let tools = Arc::new(build_tools(tool_set, cwd, policy));
+    let tools = Arc::new(build_tools(tool_set, cwd, policy, profile)?);
     init.finish();
 
     Ok(DecisionBoot {
@@ -1011,6 +1092,7 @@ async fn cmd_decide(
     handover_path: Option<&Path>,
     handover_out: Option<&Path>,
     handover_at_growth: Option<u64>,
+    profile_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let cwd = cwd.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
@@ -1060,6 +1142,10 @@ async fn cmd_decide(
         Some(path) => Some(load_policy(path)?),
         None => None,
     };
+    let profile = match profile_path {
+        Some(path) => Some(load_tool_profile(path)?),
+        None => None,
+    };
 
     let DecisionBoot {
         client,
@@ -1076,6 +1162,7 @@ async fn cmd_decide(
         policy.as_ref(),
         resumed.as_ref().map(|(h, _)| h),
         session_name,
+        profile.as_ref(),
     )
     .await?;
 
@@ -1227,7 +1314,7 @@ async fn cmd_decide(
         );
     }
 
-    let surface = describe_tools(&tools);
+    let surface = describe_tools(&tools, profile.as_deref());
     // What the record says the session's executor surface was, against what this
     // invocation built. They can legitimately differ — the operator chooses —
     // but they must not differ *silently*: an executor that lost `exec` or
@@ -1237,7 +1324,10 @@ async fn cmd_decide(
         .as_ref()
         .and_then(|resumed| resumed.tool_surface.as_ref())
     {
-        let mut now: Vec<String> = tools.names();
+        // The wire names on both sides: what the record holds was written from
+        // the same vocabulary, and a profile that renamed a face is exactly the
+        // change this warning exists to make audible.
+        let mut now: Vec<String> = tools.wire_names();
         now.sort();
         if recorded != &now {
             eprintln!(
@@ -1689,9 +1779,18 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("yu-cli-init-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
 
-        let boot = boot_decision(&dir, dir.clone(), None, ToolSet::ReadOnly, None, None, None)
-            .await
-            .expect("the boot sequence");
+        let boot = boot_decision(
+            &dir,
+            dir.clone(),
+            None,
+            ToolSet::ReadOnly,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("the boot sequence");
 
         let init = boot
             .timeline
