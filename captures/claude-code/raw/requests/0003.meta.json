@@ -1,0 +1,43 @@
+{
+  "seq": 3,
+  "received_at": "2026-10-13T02:53:58.224435+00:00",
+  "method": "POST",
+  "path": "/v1/messages?beta=true",
+  "http_version": "HTTP/1.1",
+  "headers": {
+    "Accept": "application/json",
+    "Authorization": "****",
+    "Content-Type": "application/json",
+    "User-Agent": "claude-cli/2.1.248 (external, sdk-cli)",
+    "X-Claude-Code-Session-Id": "bf3ca0bf-1384-4acb-af81-c6b3c819d032",
+    "X-Stainless-Arch": "arm64",
+    "X-Stainless-Lang": "js",
+    "X-Stainless-OS": "MacOS",
+    "X-Stainless-Package-Version": "0.112.1",
+    "X-Stainless-Retry-Count": "0",
+    "X-Stainless-Runtime": "node",
+    "X-Stainless-Runtime-Version": "v26.3.0",
+    "X-Stainless-Timeout": "600",
+    "anthropic-beta": "claude-code-20250219,context-1m-2025-08-07,interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05,mid-conversation-system-2026-04-07,effort-2025-11-24",
+    "anthropic-dangerous-direct-browser-access": "true",
+    "anthropic-version": "2023-06-01",
+    "x-app": "cli",
+    "Connection": "keep-alive",
+    "Host": "127.0.0.1:51195",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
+    "Content-Length": "80991"
+  },
+  "redacted_headers": [
+    "authorization"
+  ],
+  "body_bytes": 80991,
+  "body_sha256_as_received": "ed2b96fb5aff0f8bd20959bbb309f1e7db3e62ed4c37e4f61b22e28af026acb6",
+  "body_sha256_recorded": "ed2b96fb5aff0f8bd20959bbb309f1e7db3e62ed4c37e4f61b22e28af026acb6",
+  "body_redacted": false,
+  "outcome": {
+    "upstream_status": 200,
+    "upstream_request_id": null,
+    "latency_ms": 1472,
+    "error": null
+  }
+}
