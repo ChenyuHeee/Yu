@@ -202,45 +202,85 @@ impl ToolResult {
 
     /// What the model actually sees. Every variant must render as an honest
     /// statement of what is and is not present.
+    ///
+    /// Most of what is here goes in front of a model, and a message in a shape
+    /// no model was trained on spends the post-training it has for harness
+    /// output. Two of the three shapes below are therefore Claude Code's, and
+    /// each arm says which claim it is making, because "copied from Claude
+    /// Code" and "ours" are different claims and only the first can be checked
+    /// against a source. The Claude Code wording cited here is from the 2.1.248
+    /// CLI bundle, the version installed on this machine.
+    ///
+    /// * `Dropped` — **Claude Code's truncation marker**, `... [N <unit>
+    ///   truncated] ...` (`h8t`/`Gut` in that bundle emit `... [N characters
+    ///   truncated] ...` and `... [N lines truncated] ...`). The scaffold is
+    ///   Claude Code's; **the unit is ours** and it is bytes, because the
+    ///   manifest counts bytes and a dropped payload keeps no text to count
+    ///   lines or characters in.
+    /// * `Spilled` — **Claude Code's `<persisted-output>` block**: `Output too
+    ///   large (<size>). Full output saved to: <path>` between
+    ///   `<persisted-output>` and `</persisted-output>` (`Lae`, with its own
+    ///   size formatter `Ht`; the same block appears in this machine's own
+    ///   transcripts as `Output too large (38.5KB). Full output saved to: …`).
+    ///   Two differences, both **ours**: the `Preview (first 2KB):` section is
+    ///   absent because a `Payload::Spilled` holds no bytes to preview and may
+    ///   not claim one, and the instruction after the block is ours because in
+    ///   Claude Code that path is readable with Read and Grep — the block
+    ///   stands alone there — while this address is not readable by the
+    ///   caller's tools, so the delegation is the way back in (DESIGN:
+    ///   "隔离必须带指令").
+    /// * `Reduced` — **ours**. Claude Code has no form for a tool result
+    ///   replaced by a summary of it, because it never replaces one; there was
+    ///   nothing to copy. The note is bracketed because Claude Code's
+    ///   annotations are (`[Truncated. Full output: <path>]`); the words are
+    ///   this project's and they say what the text is not.
     pub fn render(&self) -> String {
         match &self.payload {
             // Everything is present, so there is nothing to disclose and no
             // wrapper to pay for.
             Payload::Inline(text) => text.clone(),
 
+            // Claude Code's marker, used the way it is used there: where the
+            // cut would have been, carrying the count of what is gone. The
+            // manifest's note follows, because a marker alone would be less
+            // than full disclosure here — the whole payload was cut, not a
+            // stretch of it. The way back, when the manifest holds one, is
+            // printed from the manifest itself rather than left to the note:
+            // `rerun` and `blob` are the fields other code reads, and a message
+            // that named neither would be quieter than the structure is.
             Payload::Dropped(manifest) => {
                 let mut out = format!(
-                    "[reduction] dropped {} of {} bytes of the {} result; nothing of it is in this message.\n",
-                    manifest.omitted_bytes,
-                    self.size,
-                    self.kind.as_str()
+                    "... [{} bytes truncated] ...\n\n{}",
+                    manifest.omitted_bytes, manifest.note
                 );
-                out.push_str(&manifest.note);
                 if let Some(rerun) = &manifest.rerun {
-                    out.push_str(&format!("\n[re-run to re-obtain: {rerun}]"));
+                    out.push_str(&format!("\nRe-run `{rerun}` to obtain it."));
                 } else if let Some(blob) = &manifest.blob {
-                    out.push_str(&format!(
-                        "\n[the full bytes are already at blob {blob}; delegate a reader to it — do not read it whole yourself]"
-                    ));
+                    out.push_str(&format!("\nThe full bytes are on disk at blob {blob}."));
                 }
                 out
             }
 
+            // Claude Code's block for an output too large to keep, addressed by
+            // the blob's digest. The instruction that follows is ours.
             Payload::Spilled {
                 digest,
                 pointer,
                 manifest,
             } => format!(
-                "[reduction] {} of {} bytes spilled to blob {digest}; only the pointer is in this message.\n{pointer}\n{}",
-                manifest.omitted_bytes, self.size, manifest.note
+                "<persisted-output>\nOutput too large ({size}). Full output saved to: {digest}\n</persisted-output>\n\n{pointer}\n\n{note}",
+                size = human_bytes(manifest.omitted_bytes),
+                note = manifest.note,
             ),
 
+            // Ours: Claude Code has no form for a result that was replaced by a
+            // summary of it.
             Payload::Reduced { text, manifest } => format!(
-                "{text}\n[reduction] this is a reduction of the {} result, not the result itself: {} of {} bytes are not shown. {}",
-                self.kind.as_str(),
-                manifest.omitted_bytes,
-                self.size,
-                manifest.note
+                "{text}\n\n[not the raw {kind} result: {omitted} of {size} bytes are not shown — {note}]",
+                kind = self.kind.as_str(),
+                omitted = manifest.omitted_bytes,
+                size = self.size,
+                note = manifest.note,
             ),
         }
     }
@@ -287,6 +327,42 @@ impl ToolResult {
     /// says.
     pub fn to_error_block(&self, tool_use_id: &str, message: &str) -> ContentBlock {
         ContentBlock::ToolResult(ToolResultBlock::error(tool_use_id, message))
+    }
+}
+
+/// Bytes the way Claude Code's own formatter renders them.
+///
+/// `Ht` in the 2.1.248 bundle: below 1KB the count in bytes, otherwise one
+/// decimal with a trailing `.0` dropped (`2048` is `2KB`, `9000` is `8.8KB`),
+/// then MB, then GB. The number inside the `<persisted-output>` block is meant
+/// to read the way the same number reads in Claude Code, so this is not "close
+/// enough": `Ht` goes through JavaScript's `toFixed(1)`, which rounds a tie
+/// away from zero — `(1.25).toFixed(1)` is `1.3` — where Rust's `{:.1}` rounds
+/// it to even, `1.2`. The value is exactly `bytes / 2^n`, so the rounding is
+/// done in integers and lands where `toFixed` lands; see [`one_decimal`].
+fn human_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * 1024;
+    const GB: u64 = 1024 * 1024 * 1024;
+    match bytes {
+        b if b < KB => format!("{b} bytes"),
+        b if b < MB => format!("{}KB", one_decimal(b as u128, KB as u128)),
+        b if b < GB => format!("{}MB", one_decimal(b as u128, MB as u128)),
+        b => format!("{}GB", one_decimal(b as u128, GB as u128)),
+    }
+}
+
+/// `numerator / denominator` at one decimal, rounded half away from zero — the
+/// rule JavaScript's `toFixed(1)` uses, computed in integers so no float
+/// rounding can disagree at a tie. `denominator` is a power of two, so
+/// `numerator / denominator` is exact and the integer result is the decimal
+/// `toFixed` would produce.
+fn one_decimal(numerator: u128, denominator: u128) -> String {
+    let tenths = (numerator * 20 + denominator) / (2 * denominator);
+    if tenths % 10 == 0 {
+        format!("{}", tenths / 10)
+    } else {
+        format!("{}.{}", tenths / 10, tenths % 10)
     }
 }
 
@@ -350,11 +426,24 @@ mod tests {
     }
 
     #[test]
+    fn dropped_render_carries_claude_codes_truncation_marker() {
+        let text = dropped(4096, Some("cargo test")).render();
+        assert!(text.contains("... [4096 bytes truncated] ..."), "{text}");
+        assert!(
+            !text.contains("[reduction]"),
+            "a self-invented prefix is a shape no model has seen: {text}"
+        );
+    }
+
+    #[test]
     fn dropped_render_without_a_rerun_does_not_invent_one() {
         let r = dropped(10, None);
         let text = r.render();
         assert!(text.contains("10"), "{text}");
-        assert!(!text.contains("[re-run"), "{text}");
+        assert!(
+            !text.contains("Re-running"),
+            "no re-run key was recorded, so none may be named: {text}"
+        );
     }
 
     #[test]
@@ -384,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn reduced_render_says_it_is_a_reduction() {
+    fn reduced_render_says_it_is_not_the_raw_result() {
         let r = ToolResult {
             payload: Payload::Reduced {
                 text: "three errors, all in parser.rs".to_owned(),
@@ -403,9 +492,30 @@ mod tests {
         };
         let text = r.render();
         assert!(text.starts_with("three errors"), "{text}");
-        assert!(text.contains("5000"), "{text}");
-        assert!(text.contains("reduction"), "{text}");
+        assert!(text.contains("5000 of 5030 bytes are not shown"), "{text}");
+        assert!(text.contains("not the raw log result"), "{text}");
+        assert!(
+            !text.contains("[reduction]"),
+            "the note is ours; it must not wear an invented marker: {text}"
+        );
         assert!(!r.is_complete());
+    }
+
+    #[test]
+    fn human_bytes_matches_claude_codes_formatter() {
+        // `Ht` in the 2.1.248 bundle: bytes below 1KB, one decimal above it
+        // with a trailing `.0` dropped, then MB and GB.
+        assert_eq!(human_bytes(0), "0 bytes");
+        assert_eq!(human_bytes(1023), "1023 bytes");
+        assert_eq!(human_bytes(1024), "1KB");
+        assert_eq!(human_bytes(2048), "2KB");
+        assert_eq!(human_bytes(9000), "8.8KB");
+        assert_eq!(human_bytes(39_480), "38.6KB");
+        assert_eq!(human_bytes(1_258_291), "1.2MB");
+        // 1280 bytes is 1.25KB exactly — a tie. `(1.25).toFixed(1)` is `1.3`
+        // and `{:.1}` on the same `f64` is `1.2`, so this pins the rounding
+        // rule rather than the arithmetic: a float implementation fails here.
+        assert_eq!(human_bytes(1280), "1.3KB");
     }
 
     #[test]
